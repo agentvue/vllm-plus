@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::BTreeSet;
 use std::sync::Once;
 use std::time::Duration;
@@ -12,15 +9,13 @@ use uuid::Uuid;
 use vllm_engine_core_client::protocol::logprobs::{
     Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob,
 };
-use vllm_engine_core_client::protocol::output::{
-    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
-    EngineCoreOutputs, RequestBatchOutputs,
-};
-use vllm_engine_core_client::protocol::request::EngineCoreRequest;
-use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::{
+    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    EngineCoreOutputs, EngineCoreRequest, EngineCoreSamplingParams,
+};
 use vllm_engine_core_client::test_utils::{IpcNamespace, spawn_mock_engine_task};
-use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, EngineId};
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
 use vllm_llm::{
     Error, FinishReason, GenerateOutputStreamExt as _, GeneratePromptInfo, GenerateRequest, Llm,
 };
@@ -54,7 +49,6 @@ fn request_output_with_events(
         stop_reason: None,
         events,
         kv_transfer_params: None,
-        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
@@ -79,7 +73,6 @@ fn request_output_with_logprobs(
         stop_reason: None,
         events: None,
         kv_transfer_params: None,
-        ec_transfer_params: None,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
@@ -94,7 +87,6 @@ fn request_output_with_logprobs_and_kv(
     new_logprobs: Option<Logprobs>,
     prompt_logprobs: Option<Logprobs>,
     kv_transfer_params: Option<serde_json::Value>,
-    ec_transfer_params: Option<serde_json::Value>,
 ) -> EngineCoreOutput {
     EngineCoreOutput {
         request_id: request_id.to_string(),
@@ -106,7 +98,6 @@ fn request_output_with_logprobs_and_kv(
         stop_reason: None,
         events: None,
         kv_transfer_params,
-        ec_transfer_params,
         trace_headers: None,
         prefill_stats: None,
         routed_experts: None,
@@ -188,7 +179,7 @@ fn sample_generate_request(request_id: &str, max_tokens: u32) -> GenerateRequest
         trace_headers: None,
         priority: 0,
         data_parallel_rank: None,
-        reasoning_parser_kwargs: None,
+        reasoning_ended: None,
         lora_request: None,
     }
 }
@@ -258,7 +249,7 @@ async fn generate_streams_outputs() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![
                             request_output_with_logprobs(
                                 &request.request_id,
@@ -277,8 +268,7 @@ async fn generate_streams_outputs() {
                         ],
                         finished_requests: Some(BTreeSet::from([request.request_id.clone()])),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
             })
@@ -339,7 +329,8 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
+                        engine_index: 0,
                         outputs: vec![
                             EngineCoreOutput {
                                 prefill_stats: Some(PrefillStats {
@@ -363,12 +354,15 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
                                 Some(logprobs_for_position(44, -0.3, 1, 88, -0.4)),
                                 None,
                                 Some(serde_json::json!({"connector": "x"})),
-                                None,
                             ),
                         ],
-                        ..Default::default()
-                    }
-                    .into(),
+                        scheduler_stats: None,
+                        timestamp: 0.0,
+                        utility_output: None,
+                        finished_requests: None,
+                        wave_complete: None,
+                        start_wave: None,
+                    },
                 )
                 .await;
             })
@@ -416,12 +410,10 @@ async fn generate_propagates_unexpected_close_errors() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
-                        outputs: Vec::new(),
+                    EngineCoreOutputs {
                         finished_requests: Some(BTreeSet::from([request.request_id])),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
             })
@@ -465,11 +457,10 @@ async fn dropping_a_live_generate_stream_triggers_abort() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![request_output(&request.request_id, vec![99], None)],
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 
@@ -520,7 +511,7 @@ async fn duplicate_external_request_ids_are_randomized_before_reaching_engine_co
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![request_output(
                             &request_1.request_id,
                             vec![],
@@ -528,14 +519,13 @@ async fn duplicate_external_request_ids_are_randomized_before_reaching_engine_co
                         )],
                         finished_requests: Some(BTreeSet::from([request_1.request_id.clone()])),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![request_output(
                             &request_2.request_id,
                             vec![],
@@ -543,8 +533,7 @@ async fn duplicate_external_request_ids_are_randomized_before_reaching_engine_co
                         )],
                         finished_requests: Some(BTreeSet::from([request_2.request_id])),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
             })
@@ -585,11 +574,10 @@ async fn abort_resolves_external_request_id_to_internal_before_reaching_engine()
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![request_output(&request.request_id, vec![7], None)],
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 
@@ -653,14 +641,13 @@ async fn abort_by_external_id_aborts_all_internal_requests() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         outputs: vec![
                             request_output(&request_1.request_id, vec![7], None),
                             request_output(&request_2.request_id, vec![8], None),
                         ],
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 
@@ -707,7 +694,7 @@ async fn abort_by_external_id_aborts_all_internal_requests() {
 async fn generate_records_request_metrics_in_prometheus_output() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = EngineId::from_engine_index(4);
+    let engine_id = b"engine-metrics".to_vec();
     let model_name = request_metrics_model_name("metrics-model");
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
@@ -721,7 +708,7 @@ async fn generate_records_request_metrics_in_prometheus_output() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         engine_index: 4,
                         timestamp: 10.0,
                         outputs: vec![EngineCoreOutput {
@@ -747,14 +734,13 @@ async fn generate_records_request_metrics_in_prometheus_output() {
                             )
                         }],
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         engine_index: 4,
                         timestamp: 11.5,
                         outputs: vec![request_output_with_events(
@@ -768,8 +754,7 @@ async fn generate_records_request_metrics_in_prometheus_output() {
                         )],
                         finished_requests: Some(BTreeSet::from([request.request_id])),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
             })
@@ -840,7 +825,7 @@ async fn generate_records_request_metrics_in_prometheus_output() {
 async fn dropping_stream_records_abort_terminal_request_metrics() {
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
-    let engine_id = EngineId::from_engine_index(5);
+    let engine_id = b"engine-metrics-drop".to_vec();
     let model_name = request_metrics_model_name("metrics-drop-model");
 
     let (shutdown_tx, engine_task) = spawn_mock_engine_task(
@@ -856,7 +841,7 @@ async fn dropping_stream_records_abort_terminal_request_metrics() {
 
                 send_outputs(
                     push,
-                    RequestBatchOutputs {
+                    EngineCoreOutputs {
                         engine_index: 5,
                         timestamp: 10.0,
                         outputs: vec![request_output_with_events(
@@ -875,8 +860,7 @@ async fn dropping_stream_records_abort_terminal_request_metrics() {
                             ]),
                         )],
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 )
                 .await;
 

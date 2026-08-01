@@ -43,7 +43,7 @@ from vllm.distributed import (
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -238,10 +238,10 @@ class HunYuanAttention(nn.Module):
         ori_k = k
         if self.use_qk_norm:
             q = self.query_layernorm(
-                q.view(-1, self.num_heads, self.head_dim),
+                q.view(-1, self.num_heads, self.head_dim).contiguous()
             )
             k = self.key_layernorm(
-                k.view(-1, self.num_kv_heads, self.head_dim),
+                k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
             )
 
         attn_output = self.attn(q, k, v)
@@ -346,10 +346,10 @@ class HunYuanCrossAttention(nn.Module):
         q, _ = self.rotary_emb(positions, q, k_tmp)
         if self.use_qk_norm:
             q = self.query_layernorm(
-                q.view(-1, self.num_heads, self.head_dim),
+                q.view(-1, self.num_heads, self.head_dim).contiguous()
             )
             k = self.key_layernorm(
-                k.view(-1, self.num_kv_heads, self.head_dim),
+                k.view(-1, self.num_kv_heads, self.head_dim).contiguous()
             )
 
         attn_output = self.attn(q, k, v)
@@ -441,7 +441,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
             top_k=top_k,
@@ -991,6 +991,7 @@ class HunYuanMoEV1Base(HunyuanV1ModelBase, MixtureOfExperts):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         # Set MoE hyperparameters
+        self.expert_weights = []
         self.num_expert_groups = 1
         self.moe_layers = []
         example_layer = None

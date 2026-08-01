@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 //! `POST /tokenize` and `POST /detokenize` (root paths, matching Python).
 //!
 //! Encode/decode runs entirely in-process via [`DynTokenizer`]; the inference

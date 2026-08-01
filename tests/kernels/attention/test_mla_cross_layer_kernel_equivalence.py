@@ -442,9 +442,7 @@ def test_flashmla_dense_fp8_decode_unified_slot_view():
     n_layers = 3
     layer = 1
 
-    # With a quantized KV cache the decode query is quantized to fp8 as well;
-    # the fp8 dense MLA kernel requires q already in fp8.
-    q = (torch.randn(bs, 1, h_q, head_dim, device=dev) * 0.1).to(torch.float8_e4m3fn)
+    q = torch.randn(bs, 1, h_q, head_dim, device=dev, dtype=torch.bfloat16) * 0.1
     kv_data = (torch.randn(num_blocks, page, head_dim, device=dev) * 0.1).to(
         torch.float8_e4m3fn
     )

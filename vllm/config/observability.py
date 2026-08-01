@@ -76,11 +76,8 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
-    jit_monitor_mode: Literal["warn", "error"] = "warn"
-    """How to handle post-warmup JIT compilation events."""
-
     jit_monitor_verbose: bool = False
-    """Log every monitored JIT compile with runtime details. This can emit many
+    """Log every Triton JIT compile with its dispatch key. This can emit many
     logs and add overhead, so it is intended for debugging."""
 
     @cached_property

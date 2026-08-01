@@ -368,9 +368,8 @@ def test_embeddings(
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("vocab_size", [64000, 256512, 258048])
 @pytest.mark.parametrize("stage", STAGES)
-@pytest.mark.parametrize("head_dtype", [None, torch.float32])
 def test_lm_head_logits_processor(
-    default_vllm_config, dist_init, num_loras, device, vocab_size, stage, head_dtype
+    default_vllm_config, dist_init, num_loras, device, vocab_size, stage
 ) -> None:
     if current_platform.is_cuda_alike() or current_platform.is_xpu():
         torch.accelerator.set_device_index(device)
@@ -392,8 +391,6 @@ def test_lm_head_logits_processor(
         linear.weight.data = torch.rand_like(linear.weight.data)
         linear.weight.data[:, vocab_size:] = 0
         logits_processor = LogitsProcessor(vocab_size)
-        # Exercise an fp32 lm_head (head_dtype) on the LoRA path.
-        logits_processor.head_dtype = head_dtype
         lora_logits_processor = LogitsProcessorWithLoRA(
             logits_processor, 1024, linear.weight.dtype, linear.weight.device, None
         )

@@ -26,7 +26,6 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
-from vllm.exceptions import VLLMValidationError
 from vllm.renderers.hf import (
     _PROMPT_EMBEDS_PLACEHOLDER_SPAN_MISMATCH_ERROR,
     _build_mixed_prompt_embeds,
@@ -41,7 +40,7 @@ from vllm.renderers.hf import (
 #   Qwen2TokenizerFast (SentencePiece BPE variant)
 #   BertTokenizerFast  (WordPiece)
 TOKENIZER_IDS: Final[list[str]] = [
-    "openai-community/gpt2",
+    "gpt2",
     "Qwen/Qwen2.5-1.5B-Instruct",
     "bert-base-uncased",
 ]
@@ -265,7 +264,7 @@ def test_parse_chat_messages_requires_flag():
             "content": [{"type": "prompt_embeds", "data": b64}],
         }
     ]
-    with pytest.raises(VLLMValidationError, match=_ENABLE_PROMPT_EMBEDS_ERROR):
+    with pytest.raises(ValueError, match=_ENABLE_PROMPT_EMBEDS_ERROR):
         parse_chat_messages(
             messages,
             mc,
@@ -284,7 +283,7 @@ def test_parse_chat_messages_rejects_missing_data():
             "content": [{"type": "prompt_embeds"}],  # no `data`
         }
     ]
-    with pytest.raises(VLLMValidationError, match=_PROMPT_EMBEDS_MISSING_DATA_ERROR):
+    with pytest.raises(ValueError, match=_PROMPT_EMBEDS_MISSING_DATA_ERROR):
         parse_chat_messages(
             messages,
             mc,
@@ -316,7 +315,7 @@ _PLACEHOLDER_ERROR_PATTERN: Final[str] = re.sub(
 def test_parse_chat_messages_rejects_placeholder_in_user_text(content):
     mc = _make_mock_model_config()  # enable_prompt_embeds=True by default
     messages = [{"role": "user", "content": content}]
-    with pytest.raises(VLLMValidationError, match=_PLACEHOLDER_ERROR_PATTERN):
+    with pytest.raises(ValueError, match=_PLACEHOLDER_ERROR_PATTERN):
         parse_chat_messages(messages, mc, content_format="openai")
 
 

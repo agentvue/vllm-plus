@@ -1,8 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-use bytemuck::{Pod, cast_slice};
-use bytes::Bytes;
+use bytemuck::allocation::pod_collect_to_vec;
 use enum_as_inner::EnumAsInner;
 use half::{bf16, f16};
 use rmpv::Value;
@@ -14,36 +10,6 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/5a0a8fc1ea7542394ff315138bd5677b7b53bca1/vllm/v1/serial_utils.py#L41-L43>
 const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
-
-#[derive(Serialize)]
-#[serde(rename = "_ExtStruct")]
-struct MsgpackExtRef<'a>((i8, ByteSlice<'a>));
-
-struct ByteSlice<'a>(&'a [u8]);
-
-struct PodVec<T: Pod>(Vec<T>);
-
-impl<T: Pod> AsRef<[u8]> for PodVec<T> {
-    fn as_ref(&self) -> &[u8] {
-        cast_slice(&self.0)
-    }
-}
-
-fn bytes_from_pod_vec<T>(data: Vec<T>) -> Bytes
-where
-    T: Pod + Send + 'static,
-{
-    Bytes::from_owner(PodVec(data))
-}
-
-impl Serialize for ByteSlice<'_> {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(self.0)
-    }
-}
 
 #[easy_ext::ext(ShapeExt)]
 impl [usize] {
@@ -71,63 +37,53 @@ pub struct WireNdArray {
 
 impl WireNdArray {
     /// Build a float32 tensor/ndarray backed by native-endian raw-view bytes.
-    ///
-    /// Takes ownership of the backing buffer without copying its data.
     pub fn from_f32(shape: Vec<usize>, data: Vec<f32>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
-        Ok(Self::from_raw_bytes(
-            "float32",
+        Ok(Self {
+            dtype: "float32".to_string(),
             shape,
-            bytes_from_pod_vec(data),
-        ))
+            data: WireArrayData::RawView(pod_collect_to_vec::<f32, u8>(&data)),
+        })
     }
 
     /// Build a float16 tensor/ndarray backed by native-endian raw-view bytes.
-    ///
-    /// Takes ownership of the backing buffer without copying its data.
     pub fn from_f16(shape: Vec<usize>, data: Vec<f16>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
-        Ok(Self::from_raw_bytes(
-            "float16",
+        Ok(Self {
+            dtype: "float16".to_string(),
             shape,
-            bytes_from_pod_vec(data),
-        ))
+            data: WireArrayData::RawView(pod_collect_to_vec::<f16, u8>(&data)),
+        })
     }
 
     /// Build a bfloat16 tensor/ndarray backed by native-endian raw-view bytes.
-    ///
-    /// Takes ownership of the backing buffer without copying its data.
     pub fn from_bf16(shape: Vec<usize>, data: Vec<bf16>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
-        Ok(Self::from_raw_bytes(
-            "bfloat16",
+        Ok(Self {
+            dtype: "bfloat16".to_string(),
             shape,
-            bytes_from_pod_vec(data),
-        ))
+            data: WireArrayData::RawView(pod_collect_to_vec::<bf16, u8>(&data)),
+        })
     }
 
     /// Build an int64 tensor/ndarray backed by native-endian raw-view bytes.
-    ///
-    /// Takes ownership of the backing buffer without copying its data.
     pub fn from_i64(shape: Vec<usize>, data: Vec<i64>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
-        Ok(Self::from_raw_bytes(
-            "int64",
+        Ok(Self {
+            dtype: "int64".to_string(),
             shape,
-            bytes_from_pod_vec(data),
-        ))
+            data: WireArrayData::RawView(pod_collect_to_vec::<i64, u8>(&data)),
+        })
     }
 
     /// Build a uint32 tensor/ndarray backed by native-endian raw-view bytes.
-    ///
-    /// Takes ownership of the backing buffer without copying its data.
     pub fn from_u32(shape: Vec<usize>, data: Vec<u32>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
-        Ok(Self::from_raw_bytes(
-            "uint32",
+        Ok(Self {
+            dtype: "uint32".to_string(),
             shape,
-            bytes_from_pod_vec(data),
-        ))
+            data: WireArrayData::RawView(pod_collect_to_vec::<u32, u8>(&data)),
+        })
     }
 
     /// Build a bool tensor/ndarray backed by raw-view bytes.
@@ -139,9 +95,7 @@ impl WireNdArray {
         Ok(Self {
             dtype: "bool".to_string(),
             shape,
-            data: WireArrayData::RawView(Bytes::from(
-                data.into_iter().map(u8::from).collect::<Vec<_>>(),
-            )),
+            data: WireArrayData::RawView(data.iter().map(|value| u8::from(*value)).collect()),
         })
     }
 
@@ -150,21 +104,11 @@ impl WireNdArray {
     /// Use this as an escape hatch when the caller already owns bytes that
     /// match the requested `dtype` and `shape`.
     pub fn from_raw(dtype: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) -> Self {
-        Self::from_raw_bytes(dtype, shape, Bytes::from(data))
-    }
-
-    /// Build a tensor/ndarray from an owned immutable raw-view buffer.
-    pub fn from_raw_bytes(dtype: impl Into<String>, shape: Vec<usize>, data: Bytes) -> Self {
         Self {
             dtype: dtype.into(),
             shape,
             data: WireArrayData::RawView(data),
         }
-    }
-
-    /// Move a sufficiently large inline buffer into the ordered auxiliary-frame list.
-    pub(crate) fn extract_aux_frame(&mut self, aux_frames: &mut Vec<Bytes>, threshold: usize) {
-        self.data.extract_aux_frame(aux_frames, threshold);
     }
 }
 
@@ -203,25 +147,7 @@ pub enum WireArrayData {
     /// stored.
     AuxIndex(usize),
     /// The raw bytes of this array/tensor.
-    RawView(Bytes),
-}
-
-impl WireArrayData {
-    /// Replace a sufficiently large raw view with its one-based auxiliary-frame index.
-    fn extract_aux_frame(&mut self, aux_frames: &mut Vec<Bytes>, threshold: usize) {
-        let Self::RawView(bytes) = self else {
-            return;
-        };
-        if bytes.len() < threshold {
-            return;
-        }
-
-        let index = aux_frames.len() + 1;
-        let bytes = std::mem::replace(self, Self::AuxIndex(index))
-            .into_raw_view()
-            .expect("raw view was matched above");
-        aux_frames.push(bytes);
-    }
+    RawView(Vec<u8>),
 }
 
 impl<'de> Deserialize<'de> for WireArrayData {
@@ -231,9 +157,7 @@ impl<'de> Deserialize<'de> for WireArrayData {
     {
         let value = Value::deserialize(deserializer)?;
         match value {
-            Value::Ext(tag, bytes) if tag == CUSTOM_TYPE_RAW_VIEW => {
-                Ok(Self::RawView(Bytes::from(bytes)))
-            }
+            Value::Ext(tag, bytes) if tag == CUSTOM_TYPE_RAW_VIEW => Ok(Self::RawView(bytes)),
             Value::Ext(tag, _) => Err(serde::de::Error::custom(format!(
                 "unsupported extension type code {tag}"
             ))),
@@ -254,10 +178,13 @@ impl Serialize for WireArrayData {
     where
         S: Serializer,
     {
+        // TODO: outbound request serialization currently only supports inline
+        // raw-view bytes. Emitting aux frames needs transport-level plumbing;
+        // serializing `AuxIndex` here only preserves an already-built reference.
         match self {
             Self::AuxIndex(index) => serializer.serialize_u64(*index as u64),
             Self::RawView(bytes) => {
-                MsgpackExtRef((CUSTOM_TYPE_RAW_VIEW, ByteSlice(bytes))).serialize(serializer)
+                Value::Ext(CUSTOM_TYPE_RAW_VIEW, bytes.clone()).serialize(serializer)
             }
         }
     }
@@ -268,31 +195,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_view_serializes_as_msgpack_ext() {
-        let bytes = vec![1, 2, 3, 4];
-        let encoded =
-            rmp_serde::to_vec_named(&WireArrayData::RawView(bytes.clone().into())).expect("encode");
-        let expected = rmp_serde::to_vec_named(&Value::Ext(CUSTOM_TYPE_RAW_VIEW, bytes.clone()))
-            .expect("encode expected");
-
-        assert_eq!(encoded, expected);
-        assert_eq!(
-            rmpv::decode::read_value(&mut std::io::Cursor::new(encoded)).expect("decode"),
-            Value::Ext(CUSTOM_TYPE_RAW_VIEW, bytes)
-        );
-    }
-
-    #[test]
     fn constructors_build_raw_view_tensors() {
-        let f32_data = vec![1.0, 2.5];
-        let f32_data_ptr = f32_data.as_ptr().cast::<u8>();
-        let f32_tensor = WireNdArray::from_f32(vec![2], f32_data).unwrap();
+        let f32_tensor = WireNdArray::from_f32(vec![2], vec![1.0, 2.5]).unwrap();
         assert_eq!(f32_tensor.dtype, "float32");
         assert_eq!(f32_tensor.shape, vec![2]);
-        let f32_raw_view = f32_tensor.data.into_raw_view().expect("raw view");
-        assert_eq!(f32_raw_view.as_ptr(), f32_data_ptr);
         assert_eq!(
-            f32_raw_view,
+            f32_tensor.data.into_raw_view().expect("raw view"),
             [1.0_f32, 2.5].into_iter().flat_map(f32::to_ne_bytes).collect::<Vec<_>>()
         );
 
@@ -312,15 +220,15 @@ mod tests {
         let i64_tensor = WireNdArray::from_i64(vec![1], vec![-7]).unwrap();
         assert_eq!(i64_tensor.dtype, "int64");
         assert_eq!(
-            i64_tensor.data.into_raw_view().expect("raw view").as_ref(),
-            (-7_i64).to_ne_bytes().as_ref()
+            i64_tensor.data.into_raw_view().expect("raw view"),
+            (-7_i64).to_ne_bytes()
         );
 
         let u32_tensor = WireNdArray::from_u32(vec![1], vec![42]).unwrap();
         assert_eq!(u32_tensor.dtype, "uint32");
         assert_eq!(
-            u32_tensor.data.into_raw_view().expect("raw view").as_ref(),
-            42_u32.to_ne_bytes().as_ref()
+            u32_tensor.data.into_raw_view().expect("raw view"),
+            42_u32.to_ne_bytes()
         );
 
         let bool_tensor = WireNdArray::from_bool(vec![2], vec![false, true]).unwrap();

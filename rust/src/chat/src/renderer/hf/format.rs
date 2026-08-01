@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -236,10 +233,9 @@ fn has_content_item_loop(root: &Stmt<'_>) -> bool {
 
     loops.into_iter().any(|loop_ast| {
         matches!(loop_ast.target, Expr::Var(_))
-            && (is_var_access(&loop_ast.iter, "content")
-                || message_varnames.iter().any(|varname| {
-                    is_var_or_elems_access(&loop_ast.iter, varname, Some("content"))
-                }))
+            && message_varnames
+                .iter()
+                .any(|varname| is_var_or_elems_access(&loop_ast.iter, varname, Some("content")))
     })
 }
 
@@ -317,16 +313,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_openai_template_with_content_parameter_loop() {
-        assert_eq!(
-            detect(
-                "{% macro render(content) %}{% for item in content %}{{ item }}{% endfor %}{% endmacro %}{% for message in messages %}{{ render(message.content) }}{% endfor %}"
-            ),
-            ChatTemplateContentFormat::OpenAi
-        );
-    }
-
-    #[test]
     fn detects_openai_template_with_messages_alias() {
         assert_eq!(
             detect(
@@ -375,6 +361,7 @@ mod tests {
 
         expect![[r#"
             template_alpaca.jinja                              => String
+            template_baichuan.jinja                            => String
             template_chatglm.jinja                             => String
             template_chatglm2.jinja                            => String
             template_chatml.jinja                              => String

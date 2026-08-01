@@ -40,7 +40,6 @@ docker buildx ls
 echo "--- :mag: Checking if image already exists"
 if docker manifest inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   echo "Image found: $IMAGE_TAG — skipping build"
-  .buildkite/scripts/annotate-image-build.sh "$IMAGE_TAG"
   exit 0
 fi
 echo "Image not found, proceeding with build..."
@@ -67,5 +66,3 @@ docker buildx build --file docker/Dockerfile \
   --progress plain .
 
 echo "--- :white_check_mark: Torch nightly image build complete: $IMAGE_TAG"
-
-.buildkite/scripts/annotate-image-build.sh "$IMAGE_TAG"

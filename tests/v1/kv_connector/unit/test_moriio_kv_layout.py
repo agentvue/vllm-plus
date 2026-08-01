@@ -36,7 +36,6 @@ msgpack = importlib.import_module("msgpack")
 
 ROLE = moriio_common.ROLE
 MoRIIOError = moriio_common.MoRIIOError
-MoRIIOTransferAck = moriio_common.MoRIIOTransferAck
 RemoteAllocInfo = moriio_common.RemoteAllocInfo
 WriteTask = moriio_common.WriteTask
 set_role = moriio_common.set_role
@@ -441,16 +440,9 @@ def test_write_completion_notifies_once_after_all_sealed_writes_finish():
         def _mark_transfer_terminal_locked(self, transfer_id):
             self._terminal_transfer_ids[transfer_id] = None
 
-        def send_notify(
-            self,
-            transfer_id,
-            remote_ip,
-            remote_port,
-            message_type=None,
-            message_fields=None,
-        ):
+        def send_notify(self, transfer_id, remote_ip, remote_port, message_type=None):
             self.notifications.append(
-                (transfer_id, remote_ip, remote_port, message_type, message_fields)
+                (transfer_id, remote_ip, remote_port, message_type)
             )
 
     wrapper = FakeWrapper()
@@ -472,8 +464,8 @@ def test_write_completion_notifies_once_after_all_sealed_writes_finish():
     writer._mark_write_done("xfer", request_info)
     writer._finalize_if_complete("xfer", request_info)
 
-    assert wrapper.notifications == [("xfer", "127.0.0.1", 7002, "write_done", None)]
-    assert wrapper.done_req_ids == [MoRIIOTransferAck("xfer")]
+    assert wrapper.notifications == [("xfer", "127.0.0.1", 7002, "write_done")]
+    assert wrapper.done_req_ids == ["xfer"]
     assert wrapper.done_remote_allocate_req_dict == {}
     assert wrapper.wait_count == 1
     assert wrapper.waited_statuses == [["status-a", "status-b"]]
@@ -517,7 +509,7 @@ def test_write_failure_marks_terminal_and_clears_scheduled_state():
 
     writer._mark_request_done("xfer")
 
-    assert wrapper.done_req_ids == [MoRIIOTransferAck("xfer")]
+    assert wrapper.done_req_ids == ["xfer"]
     assert wrapper.done_remote_allocate_req_dict == {}
     assert wrapper._is_transfer_terminal_locked("xfer")
     assert "xfer" not in writer._scheduled_writes
@@ -589,20 +581,8 @@ def test_late_remote_blocks_message_is_ignored_after_transfer_done():
         pytest.param(
             ROLE.PRODUCER,
             msgpack.dumps({"type": "release", "transfer_id": "xfer"}),
-            MoRIIOTransferAck("xfer"),
+            "release",
             id="release",
-        ),
-        pytest.param(
-            ROLE.PRODUCER,
-            msgpack.dumps(
-                {
-                    "type": "release",
-                    "transfer_id": "xfer",
-                    "consumer_tp_size": 8,
-                }
-            ),
-            MoRIIOTransferAck("xfer", 8),
-            id="release-consumer-tp-size",
         ),
         pytest.param(None, b"xfer", "plain", id="plain-string"),
     ],
@@ -623,11 +603,11 @@ def test_moriio_wrapper_routes_valid_messages(role, payload, expected):
         assert request_info.decode_dp_rank == 3
     elif expected == "write_done":
         assert wrapper.done_write_cache_req_ids == ["xfer"]
-    elif expected == "plain":
-        assert completions == ["xfer"]
-    else:
-        assert wrapper.done_req_ids == [expected]
+    elif expected == "release":
+        assert wrapper.done_req_ids == ["xfer"]
         assert wrapper._is_transfer_terminal_locked("xfer")
+    else:
+        assert completions == ["xfer"]
 
 
 @pytest.mark.parametrize(
@@ -670,23 +650,14 @@ def test_moriio_wrapper_rejects_invalid_messages(role, payload, match):
         wrapper._handle_message(payload)
 
 
-def test_local_block_ids_longer_than_remote_raises_value_error():
+def test_block_id_length_mismatch_raises_value_error():
     cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
     worker = _worker({"layer": cache}, {"layer": _full_spec()})
 
-    with pytest.raises(ValueError, match="longer than remote_block_ids"):
+    with pytest.raises(ValueError, match="must have the same length"):
         moriio_layout.compute_block_transfer_offsets(
             "layer", cache, worker.layer_to_spec, [1, 3], [4], _remote_meta().num_blocks
         )
-
-
-def test_empty_local_block_ids_is_free_only_noop():
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
-
-    assert moriio_layout.compute_block_transfer_offsets(
-        "layer", cache, worker.layer_to_spec, [], [4, 5], _remote_meta().num_blocks
-    ) == ([], [], [])
 
 
 def test_registration_regions_do_not_split_interleaved_or_mla_cache():

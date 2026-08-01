@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.exceptions import VLLMServerError
-
-
-class EngineGenerateError(VLLMServerError):
+class EngineGenerateError(Exception):
     """Raised when a AsyncLLM.generate() fails. Recoverable."""
 
     pass
 
 
-class EngineDeadError(VLLMServerError):
+class EngineDeadError(Exception):
     """Raised when the EngineCore dies. Unrecoverable."""
 
     def __init__(self, *args, suppress_context: bool = False, **kwargs):

@@ -17,7 +17,6 @@ The weight transfer system follows a **four-phase protocol** with a pluggable ba
 | ------- | --------- | -------- |
 | [NCCL](nccl.md) | NCCL broadcast | Separate GPUs for training and inference |
 | [IPC](ipc.md) | CUDA IPC handles | Colocated training and inference on same GPU |
-| [sparse_nccl](nccl.md#sparse-nccl) | NCCL broadcast | Sparse flat-index weight patches (TP=1/PP=1) |
 
 ## Configuration
 
@@ -42,7 +41,7 @@ vllm serve my-model \
     --weight-transfer-config '{"backend": "nccl"}'
 ```
 
-The `backend` field accepts `"nccl"` (default), `"ipc"`, or `"sparse_nccl"`.
+The `backend` field accepts `"nccl"` (default) or `"ipc"`.
 
 ## API Endpoints
 
@@ -53,9 +52,7 @@ When running vLLM as an HTTP server, the following endpoints are available for w
 | `/init_weight_transfer_engine` | POST | Initialize the weight transfer engine with backend-specific info |
 | `/start_weight_update` | POST | Start a weight update |
 | `/update_weights` | POST | Transfer a batch of weights with backend-specific metadata |
-| `/finish_weight_update` | POST | Finish the update and optionally commit its `weight_version` |
-| `/update_weight_version` | POST | Update `weight_version` without changing model weights |
-| `/weight_info` | GET | Get the latest committed weight version |
+| `/finish_weight_update` | POST | Finish the weight update and run post-processing |
 | `/pause` | POST | Pause generation before weight sync to handle inflight requests |
 | `/resume` | POST | Resume generation after weight sync |
 | `/get_world_size` | GET | Get the number of inference workers (useful for NCCL world size calculation) |
@@ -72,7 +69,7 @@ Both backends provide static methods that the trainer calls to send weights. The
 EngineClass.trainer_init(init_info)
 
 # 2. Start weight update on inference side
-llm.start_weight_update()
+llm.start_weight_update(is_checkpoint_format=True)
 
 # 3. Send weights to inference workers
 EngineClass.trainer_send_weights(
@@ -81,7 +78,7 @@ EngineClass.trainer_send_weights(
 )
 
 # 4. Finish weight update on inference side
-llm.finish_weight_update(weight_version="step-42")
+llm.finish_weight_update()
 ```
 
 See the [NCCL](nccl.md) and [IPC](ipc.md) pages for backend-specific trainer APIs and full examples.

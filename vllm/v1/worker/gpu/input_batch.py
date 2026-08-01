@@ -22,7 +22,6 @@ class InputBuffers:
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
-        self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
         self.query_start_loc = torch.zeros(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
@@ -84,8 +83,6 @@ class InputBatch:
     input_ids: torch.Tensor
     # [num_tokens_after_padding]
     positions: torch.Tensor
-    # [num_tokens_after_padding]
-    is_padding: torch.Tensor
 
     # [total_num_logits]
     logits_indices: torch.Tensor
@@ -95,9 +92,6 @@ class InputBatch:
 
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
-
-    # [num_reqs] per-request prompt length, only populated for R-SWA.
-    prompt_lens: torch.Tensor | None
 
     @classmethod
     def make_dummy(
@@ -115,18 +109,13 @@ class InputBatch:
         expanded_idx_mapping = idx_mapping
         expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
-        # Distribute the remainder evenly so that no dummy request exceeds
-        # ceil(num_tokens / num_reqs) <= max_model_len tokens.
-        base_tokens = num_tokens // num_reqs
-        num_extra = num_tokens % num_reqs
-        num_scheduled_tokens = np.full(num_reqs, base_tokens, dtype=np.int32)
-        if num_extra > 0:
-            num_scheduled_tokens[-num_extra:] += 1
+        num_scheduled_tokens = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+        num_scheduled_tokens[-1] += num_tokens % num_reqs
         assert int(num_scheduled_tokens.sum()) == num_tokens
 
         # seq_len equals to query_len
-        input_buffers.seq_lens[: num_reqs - num_extra] = base_tokens
-        input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
+        input_buffers.seq_lens[:num_reqs] = num_tokens // num_reqs
+        input_buffers.seq_lens[num_reqs - 1] += num_tokens % num_reqs
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
@@ -144,9 +133,6 @@ class InputBatch:
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
-
-        input_buffers.is_padding[:num_tokens].fill_(True)
-        is_padding = input_buffers.is_padding[:num_tokens]
 
         logits_indices = query_start_loc[1:] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
@@ -178,12 +164,10 @@ class InputBatch:
             max_seq_len_np=None,
             input_ids=input_ids,
             positions=positions,
-            is_padding=is_padding,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=False,
-            prompt_lens=None,
         )
 
 
@@ -191,8 +175,6 @@ class InputBatch:
 def _prepare_prefill_inputs_kernel(
     input_ids_ptr,
     next_prefill_tokens_ptr,
-    next_prefill_tokens_stride,
-    num_lookahead,
     idx_mapping_ptr,
     query_start_loc_ptr,
     all_token_ids_ptr,
@@ -200,7 +182,6 @@ def _prepare_prefill_inputs_kernel(
     prefill_lens_ptr,
     num_computed_tokens_ptr,
     BLOCK_SIZE: tl.constexpr,
-    LOOKAHEAD_BLOCK: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -221,20 +202,10 @@ def _prepare_prefill_inputs_kernel(
         tokens = tl.load(request_ptr + num_computed + block, mask=mask)
         tl.store(input_ids_ptr + query_start + block, tokens, mask=mask)
 
-    # Store the next num_lookahead prefill tokens.
-    lookahead = tl.arange(0, LOOKAHEAD_BLOCK)
-    pos = num_computed + query_len + lookahead
-    in_lookahead = lookahead < num_lookahead
-    tokens = tl.load(
-        request_ptr + pos, mask=in_lookahead & (pos < prefill_len), other=0
-    )
-    tl.store(
-        next_prefill_tokens_ptr
-        + lookahead * next_prefill_tokens_stride
-        + req_state_idx,
-        tokens,
-        mask=in_lookahead,
-    )
+    next_pos = num_computed + query_len
+    if next_pos < prefill_len:
+        next_token = tl.load(request_ptr + next_pos)
+        tl.store(next_prefill_tokens_ptr + req_state_idx, next_token)
 
 
 def prepare_prefill_inputs(
@@ -247,12 +218,9 @@ def prepare_prefill_inputs(
     num_computed_tokens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
-    num_lookahead = next_prefill_tokens.shape[0]
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         input_ids,
         next_prefill_tokens,
-        next_prefill_tokens.stride(0),
-        num_lookahead,
         idx_mapping,
         query_start_loc,
         all_token_ids,
@@ -260,7 +228,6 @@ def prepare_prefill_inputs(
         prefill_len,
         num_computed_tokens,
         BLOCK_SIZE=1024,
-        LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
     )
 
 
@@ -362,12 +329,10 @@ def _combine_sampled_and_draft_tokens_kernel(
         # Handling prefill tokens. No sampled or draft tokens.
         return
 
-    # Keep prompt-tail slots intact; only rewrite generated-token slots.
-    first_logit_seq_pos = seq_len - num_logits
-    if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
+    if NUM_NEW_SAMPLED_TOKENS > 0:
         # Write the last sampled token ID to input_ids.
         last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
-        tl.store(input_ids_ptr + logits_start, last_token_id)
+        tl.store(input_ids_ptr + query_end - num_logits, last_token_id)
 
     # Write the draft tokens (if any) to input_ids.
     if num_draft_tokens > 0:

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility functions for Helion kernel management."""
 
-import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -63,7 +62,7 @@ def canonicalize_gpu_name(name: str) -> str:
     """
     Canonicalize GPU name for use as a platform identifier.
 
-    Converts to lowercase, replaces separators with underscores,
+    Converts to lowercase, replaces spaces and hyphens with underscores,
     and maps known variant names to their canonical form via _GPU_NAME_ALIASES.
     e.g., "NVIDIA H100 80GB HBM3" -> "nvidia_h100"
           "NVIDIA A100-SXM4-80GB" -> "nvidia_a100"
@@ -71,7 +70,9 @@ def canonicalize_gpu_name(name: str) -> str:
     """
     if not name or not name.strip():
         raise ValueError("GPU name cannot be empty")
-    name = re.sub(r"[\s/-]+", "_", name.lower())
+    name = name.lower()
+    name = name.replace(" ", "_")
+    name = name.replace("-", "_")
     if name in _GPU_NAME_ALIASES:
         return _GPU_NAME_ALIASES[name]
     return name

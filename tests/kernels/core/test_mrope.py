@@ -38,7 +38,6 @@ def generate_test_data(
 
 class MRoPETestInfo(NamedTuple):
     model_name: str
-    is_neox_style: bool = True
     # https://github.com/pytorch/pytorch/blob/main/torch/testing/_comparison.py#L1317
     atol: float = 1e-2
     rtol: float = 1.6e-2
@@ -46,10 +45,7 @@ class MRoPETestInfo(NamedTuple):
 
 
 MODELS_TO_TEST = [
-    MRoPETestInfo(
-        model_name="zai-org/GLM-4.1V-9B-Thinking",
-        is_neox_style=False,
-    ),
+    MRoPETestInfo(model_name="zai-org/GLM-4.1V-9B-Thinking"),
     MRoPETestInfo(model_name="Qwen/Qwen2-VL-7B-Instruct"),
     MRoPETestInfo(model_name="Qwen/Qwen2-VL-72B-Instruct"),
     MRoPETestInfo(model_name="Qwen/Qwen2.5-VL-72B-Instruct"),
@@ -96,7 +92,7 @@ def test_mrope(
         if hasattr(config, "head_dim")
         else config.hidden_size // total_num_heads
     )
-    is_neox_style = model_info.is_neox_style
+    is_neox_style = True
 
     max_position = config.max_position_embeddings
 
@@ -166,7 +162,7 @@ def test_mrope_torch_compile_tracing(
         if hasattr(config, "head_dim")
         else config.hidden_size // total_num_heads
     )
-    is_neox_style = model_info.is_neox_style
+    is_neox_style = True
     max_position = config.max_position_embeddings
 
     mrope_helper_class = get_rope(

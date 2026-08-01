@@ -192,12 +192,6 @@ def main():
         help="Use multimodal prompts (default: use text-only for quick testing)",
     )
 
-    parser.add_argument(
-        "--skip_two_image_prompt",
-        action="store_true",
-        help="Skip the two-image multimodal prompt",
-    )
-
     args = parser.parse_args()
 
     print(f"Service URL: {args.service_url}")
@@ -227,9 +221,7 @@ def main():
 
     # Select prompts to use
     if args.use_mm_prompts:
-        test_prompts = (
-            SAMPLE_PROMPTS_MM[:1] if args.skip_two_image_prompt else SAMPLE_PROMPTS_MM
-        )
+        test_prompts = SAMPLE_PROMPTS_MM
         print("Using multimodal prompts")
     else:
         test_prompts = SAMPLE_PROMPTS_TEXT

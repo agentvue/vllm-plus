@@ -6,8 +6,6 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
 
@@ -22,11 +20,16 @@ class DummyPlatform(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         vllm_config.compilation_config.custom_ops = ["all"]
 
-    @classmethod
     def get_attn_backend_cls(
-        cls,
-        selected_backend: "AttentionBackendEnum",
-        attn_selector_config: "AttentionSelectorConfig",
-        num_heads: int | None = None,
-    ) -> str:
+        self,
+        backend_name,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+    ):
         return "vllm_add_dummy_platform.dummy_attention_backend.DummyAttentionBackend"  # noqa E501

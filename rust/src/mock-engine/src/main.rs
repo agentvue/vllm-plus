@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use anyhow::{Context, Result};
 use clap::Parser as _;
 use tokio_util::sync::CancellationToken;

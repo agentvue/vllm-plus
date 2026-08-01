@@ -6,7 +6,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
-from vllm.v1.kv_offload.base import LoadStoreSpec
+from vllm.v1.kv_offload.worker.worker import TransferSpec
 
 ReqId = str
 
@@ -60,8 +60,7 @@ class TransferJob:
     """
 
     req_id: ReqId
-    src_spec: LoadStoreSpec
-    dst_spec: LoadStoreSpec
+    transfer_spec: TransferSpec
 
 
 @dataclass

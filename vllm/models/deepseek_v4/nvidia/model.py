@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
 import regex as re
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -17,17 +16,15 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
     mhc_post_tilelang,
-    mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import (
@@ -49,12 +46,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import (
-    EagleModelMixin,
-    MixtureOfExperts,
-    SupportsEagle3,
-    SupportsPP,
-)
+from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -66,7 +58,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
@@ -77,7 +68,6 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 
 class DeepseekV4MLP(nn.Module):
@@ -452,11 +442,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
         symm_buffer = self.get_symm_buffer()
         num_tokens = hidden_states.shape[0]
-        is_padding = None
-        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-            is_padding = get_forward_context().is_padding
-            if is_padding is not None:
-                is_padding = is_padding[:num_tokens]
 
         # EPLB: map logical expert IDs to physical replicas and record load.
         eplb_state = self.eplb_state
@@ -464,19 +449,12 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             assert eplb_state.expert_load_view is not None
             assert eplb_state.logical_replica_count is not None
             assert eplb_state.should_record_tensor is not None
-            if is_padding is not None:
-                topk_ids = torch.where(is_padding.unsqueeze(1), -1, topk_ids)
             topk_ids = eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
                 expert_load_view=eplb_state.expert_load_view,
                 logical_to_physical_map=eplb_state.logical_to_physical_map,
                 logical_replica_count=eplb_state.logical_replica_count,
                 record_enabled=eplb_state.should_record_tensor,
-                num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
-                    dbo_current_ubatch_id()
-                ]
-                if eplb_state.num_unpadded_tokens_tensors is not None
-                else None,
             )
 
         prepare_megamoe_inputs(
@@ -487,7 +465,6 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.x_sf[:num_tokens],
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
-            is_padding=is_padding,
         )
 
         # This method must have been already called during the weight loading phase.
@@ -671,7 +648,7 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -737,7 +714,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
         if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the MoERunner class
+            # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
@@ -799,7 +776,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
-        eager_scratch_pool: DeepseekV4EagerScratchPool | None = None,
     ):
         super().__init__()
 
@@ -812,7 +788,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
-            eager_scratch_pool=eager_scratch_pool,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -831,7 +806,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.hc_attn_fn_broadcast: torch.Tensor | None = None
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
@@ -881,37 +855,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
             # Run standalone mhc_pre on first layer
-            if x.dim() == 2:
-                assert self.hc_attn_fn_broadcast is not None
-                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                    fn_broadcast=self.hc_attn_fn_broadcast,
-                )
-            else:
-                residual = x
-                post_mix, res_mix, x = mhc_pre_tilelang(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    norm_weight=attn_norm_weight,
-                    norm_eps=attn_norm_eps,
-                )
+            residual = x
+            post_mix, res_mix, x = mhc_pre_tilelang(
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+            )
         else:
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                 x,
@@ -960,7 +917,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-class DeepseekV4Model(nn.Module, EagleModelMixin):
+class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -989,22 +946,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
-        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(
-            config.num_attention_heads // get_tensor_model_parallel_world_size()
-        )
-        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
-        if not vllm_config.parallel_config.use_ubatching:
-            # TODO: support dbo if needed
-            # this requires the buffer to have ubatch dim
-            self.eager_scratch_pool = DeepseekV4EagerScratchPool(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                padded_heads,
-                config.head_dim,
-                config.index_n_heads,
-                config.index_head_dim,
-                config.index_topk,
-                current_platform.device_type,
-            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
@@ -1030,7 +971,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
-                eager_scratch_pool=self.eager_scratch_pool,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1059,11 +999,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             torch.empty(1, dtype=torch.float32),
             requires_grad=False,
         )
-        spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+        # Pre-hc_head residual stream buffer for the MTP draft. Stable
+        # address (outside the cudagraph pool) so the copy_ in forward()
+        # refreshes it correctly across captured shapes.
+        # refreshes it correctly across captured shapes. Only allocated on
+        # the last PP rank — that's where MTP target hidden states are
+        # produced.
+        if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1107,6 +1049,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1115,12 +1058,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        aux_hidden_states: list[torch.Tensor] = []
-        final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1129,28 +1067,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
-            if idx + 1 in self.aux_hidden_state_layers:
-                # Reconstruct the aux hidden state for draft models
-                aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
-                aux_hidden_states.append(aux_recon.mean(dim=1))
-                final_aux_recon = aux_recon
         if layer is not None:
-            # Reuse if the last layer was captured as an aux hidden state
-            if self.end_layer in self.aux_hidden_state_layers:
-                hidden_states = final_aux_recon
-            else:
-                hidden_states = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
-                )
+            hidden_states = mhc_post_tilelang(
+                hidden_states, residual, post_mix, res_mix
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self._mtp_hidden_buffer is not None:
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        num_tokens = hidden_states.shape[0]
+        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,
@@ -1161,8 +1088,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
-        if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1199,9 +1124,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         for name, loaded_weight in weights:
             if pad_shared_expert and ".shared_experts." in name:
-                loaded_weight = self._pad_shared_expert_weight(
-                    self.quant_config, name, loaded_weight
-                )
+                loaded_weight = self._pad_shared_expert_weight(name, loaded_weight)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1276,18 +1199,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         return loaded_params
 
-    @staticmethod
     def _pad_shared_expert_weight(
-        quant_config: QuantizationConfig | None,
-        name: str,
-        loaded_weight: torch.Tensor,
+        self, name: str, loaded_weight: torch.Tensor
     ) -> torch.Tensor:
         """Zero-pad a block-FP8 shared-expert weight/scale on its intermediate
         axis so the standard TP loaders split it into even, block-aligned shards
         (trailing ranks get the zero pad). gate (w1)/up (w3) [I, H] pad dim 0;
         down (w2 -> down_proj) [H, I] pads dim 1.
         """
-        block_size = getattr(quant_config, "weight_block_size", None)
+        block_size = getattr(self.quant_config, "weight_block_size", None)
         assert block_size is not None
         # Round the intermediate axis up to a whole number of TP shards. The axis
         # is in elements for weights (step = block) and in blocks for scales.
@@ -1318,17 +1238,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
-
-    def finalize_mhc_broadcast_weights(self) -> None:
-        if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
-            return
-        layer = self.layers[self.start_layer]
-        if isinstance(layer, DeepseekV4DecoderLayer):
-            layer.hc_attn_fn_broadcast = (
-                layer.hc_attn_fn.detach()
-                .view(-1, layer.hc_mult, layer.hidden_size)
-                .sum(dim=1)
-            )
 
 
 def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
@@ -1405,9 +1314,7 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class DeepseekV4ForCausalLM(
-    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
-):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
@@ -1442,6 +1349,7 @@ class DeepseekV4ForCausalLM(
         self.set_moe_parameters()
 
     def set_moe_parameters(self) -> None:
+        self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
         self.num_expert_groups = getattr(self.config, "n_group", 1)
         self.num_moe_layers = self.config.num_hidden_layers
         self.moe_layers: list[nn.Module] = []
@@ -1492,7 +1400,6 @@ class DeepseekV4ForCausalLM(
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self.model.finalize_mega_moe_weights()
-        self.model.finalize_mhc_broadcast_weights()
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

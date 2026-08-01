@@ -70,9 +70,6 @@ class EagleMiniCPMDecoderLayer(nn.Module):
         self.quant_config = quant_config
         self.hidden_size = config.hidden_size
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.mup_denominator = getattr(
-            config, "mup_denominator", config.num_hidden_layers
-        )
         self.prefix = prefix
         self._init_attn_block()
         self._init_ffn_block()
@@ -128,7 +125,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
         hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.mup_denominator)
+            self.config.scale_depth / math.sqrt(self.config.mup_denominator)
         )
 
         # Fully Connected
@@ -136,7 +133,7 @@ class EagleMiniCPMDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.mup_denominator)
+            self.config.scale_depth / math.sqrt(self.config.mup_denominator)
         )
 
         return hidden_states, None
@@ -363,12 +360,7 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if inputs_embeds is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support multimodal inputs yet."
-            )
         hidden_states, hidden_states2 = self.model(input_ids, positions, hidden_states)
         hidden_states = hidden_states / self.scale_width
         hidden_states2 = hidden_states2 / self.scale_width

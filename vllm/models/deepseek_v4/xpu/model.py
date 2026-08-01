@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -18,7 +19,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
@@ -43,11 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import (
-    EagleModelMixin,
-    SupportsEagle3,
-    SupportsPP,
-)
+from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -729,7 +726,7 @@ class DeepseekV4MoE(nn.Module):
         self.n_local_experts = config.n_routed_experts // self.tp_size
         self.experts_start_idx = self.tp_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -977,7 +974,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-class DeepseekV4Model(nn.Module, EagleModelMixin):
+@support_torch_compile
+class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1057,11 +1055,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         self.hc_head_op = HCHeadOp()
-        spec_config = vllm_config.speculative_config
-        needs_mtp_hidden_states = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
-        )
-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+        # Pre-hc_head residual stream buffer for the MTP draft. Stable
+        # address so the copy_ in forward() refreshes it correctly across
+        # captured shapes. Only allocated on the last PP rank — that's
+        # where MTP target hidden states are produced.
+        if get_pp_group().is_last_rank:
             self._mtp_hidden_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
@@ -1115,11 +1113,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        aux_hidden_states: list[torch.Tensor] = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1128,9 +1122,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
-            if idx + 1 in self.aux_hidden_state_layers:
-                aux_recon = layer.hc_post(hidden_states, residual, post_mix, res_mix)
-                aux_hidden_states.append(aux_recon.mean(dim=1))
         # The fused path defers the final hc_post to the next layer's
         # fused_post_pre. After the last layer we must apply it explicitly.
         if layer is not None:
@@ -1139,9 +1130,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self._mtp_hidden_buffer is not None:
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        num_tokens = hidden_states.shape[0]
+        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
         hidden_states = self.hc_head_op(
             hidden_states,
@@ -1152,8 +1143,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
-        if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1311,7 +1300,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.

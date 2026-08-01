@@ -39,8 +39,7 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
 
         nd = main_md.num_decode_tokens
         num_tokens = main_md.num_actual_tokens
-        # Indexer top-k from the shared token-major buffer [total_q, H, MK]; the
-        # kernels want [H, tokens, MK], so slice tokens on dim 0 then transpose.
+        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
         topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
         assert topk is not None
         hd = self.head_size
@@ -49,8 +48,6 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
         kv_cache = (
             kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
         )
-        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
-        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
         # Decode [:nd]: Triton split-K placeholder (no MSA decode yet).
         if main_md.num_decodes > 0:
@@ -59,15 +56,13 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
             minimax_m3_sparse_attn_decode(
                 q[:nd],
                 kv_cache,
-                topk[:nd].transpose(0, 1),
+                topk[:, :nd, :],
                 d.block_table,
                 d.seq_lens,
                 self.num_kv_heads,
                 self.scale,
                 out[:nd],
                 d.decode_query_len,
-                k_scale=k_scale,
-                v_scale=v_scale,
             )
 
         # Prefill [nd:]: MSA sparse FMHA over the selected blocks.
@@ -79,11 +74,10 @@ class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):
 
             p = main_md.prefill
             assert p is not None
-            # [H, prefill, MK] transposed view; build_k2q_csr consumes the
-            # strided view directly (topK stays innermost-contiguous).
-            prefill_topk = topk[nd:num_tokens].transpose(0, 1)
+            prefill_topk = topk[:, nd:num_tokens, :]
             qp = q[nd:]
-            k_cache, v_cache = kv_cache.split(self.head_size, dim=-1)
+            k_cache = kv_cache[:, 0].transpose(1, 2)
+            v_cache = kv_cache[:, 1].transpose(1, 2)
             k2q_row_ptr, k2q_q_indices, schedule = build_k2q_csr(
                 prefill_topk,
                 p.cu_seqlens_q,

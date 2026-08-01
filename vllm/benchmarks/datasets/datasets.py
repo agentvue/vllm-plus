@@ -81,7 +81,7 @@ class SampleRequest:
 
     prompt: str | list[str] | list[dict]
     prompt_len: int
-    expected_output_len: int = 0
+    expected_output_len: int | None
     multi_modal_data: MultiModalDataDict | dict | list[dict] | None = None
     lora_request: LoRARequest | None = None
     request_id: str | None = None
@@ -634,7 +634,7 @@ class RandomDataset(BenchmarkDataset):
         # Generate prefix once
         prefix_token_ids = self.get_prefix(tokenizer, allowed_tokens, prefix_len)
 
-        requests: list[SampleRequest] = []
+        requests = []
         token_mismatch_total = 0
         for i in range(num_requests):
             prompt, total_input_len, token_mismatch = self.generate_token_sequence(  # noqa: E501
@@ -665,14 +665,15 @@ class RandomDataset(BenchmarkDataset):
             )
         # only used for embeddings benchmark.
         if batchsize > 1:
-            batch_requests: list[SampleRequest] = []
+            batch_requests = []
             # Create batched requests
             for i in range(0, num_requests, batchsize):
                 batch = requests[i : i + batchsize]
                 batch_requests.append(
                     SampleRequest(
-                        prompt=[req.prompt for req in batch],  # type: ignore[arg-type]
+                        prompt=[req.prompt for req in batch],
                         prompt_len=sum(req.prompt_len for req in batch),
+                        expected_output_len=0,
                         request_id=request_id_prefix + str(i // batchsize),
                     )
                 )
@@ -796,9 +797,6 @@ class RandomDatasetForReranking(RandomDataset):
         input_len: int = RandomDataset.DEFAULT_INPUT_LEN,
         output_len: int = RandomDataset.DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
-        max_loras: int | None = None,
-        lora_path: str | None = None,
-        lora_assignment: str = "random",
         is_reranker: bool = True,
         **kwargs,
     ) -> list[SampleRequest]:
@@ -1209,9 +1207,6 @@ class RandomMultiModalDataset(RandomDataset):
         input_len: int = RandomDataset.DEFAULT_INPUT_LEN,
         output_len: int = RandomDataset.DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
-        max_loras: int | None = None,
-        lora_path: str | None = None,
-        lora_assignment: str = "random",
         limit_mm_per_prompt: dict[str, int] = DEFAULT_LIMIT_MM_PER_PROMPT,
         base_items_per_request: int = DEFAULT_BASE_ITEMS_PER_REQUEST,
         num_mm_items_range_ratio: float = DEFAULT_NUM_MM_ITEMS_RANGE_RATIO,
@@ -1256,7 +1251,6 @@ class RandomMultiModalDataset(RandomDataset):
             # We want to exclude placeholder tokens and all
             # tokens that indicate start/end of image as it
             # may break prompt replacement logic.
-            assert hasattr(tokenizer, "added_tokens_decoder")
             prohibited_tokens = list(
                 tok_id
                 for tok_id, token in tokenizer.added_tokens_decoder.items()
@@ -1382,7 +1376,6 @@ class ShareGPTDataset(BenchmarkDataset):
         lora_assignment: str = "random",
         **kwargs,
     ) -> list[SampleRequest]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         samples: list[SampleRequest] = []
         ind = 0
         for entry in self.data:
@@ -1461,7 +1454,7 @@ class TimedTrace(BenchmarkDataset):
             f'label_output_length: "{self.label_output_length}", '
             f'label_hash_ids: "{self.label_hash_ids}"'
         )
-        self._expanded_generated_prompts: dict[str, Any] = {}
+        self._expanded_generated_prompts = {}
         self.load_data()
 
     def load_data(self) -> None:
@@ -1536,12 +1529,10 @@ class TimedTrace(BenchmarkDataset):
         tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
-        no_oversample: bool = False,
         **kwargs,
-    ) -> list[SampleRequest]:
-        samples: list[SampleRequest] = []
+    ) -> list:
+        samples: list = []
         assert tokenizer is not None, "Tokenizer must be provided, now is Null"
-        assert self.data is not None, "Data must be loaded before sampling"
 
         for ind, entry in enumerate(self.data):
             if len(samples) >= num_requests:
@@ -2091,7 +2082,7 @@ def _parse_range_ratio(value: str) -> RangeRatio:
         return json.loads(value)
 
 
-def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
+def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
     if not hasattr(args, "request_id_prefix"):
         args.request_id_prefix = ""
 
@@ -2148,15 +2139,12 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
         )
 
     elif args.dataset_name == "sonnet":
-        assert tokenizer is not None, (
-            "Tokenizer must be initialized for the 'sonnet' dataset."
-        )
-        sonnet_dataset = SonnetDataset(
+        dataset = SonnetDataset(
             dataset_path=args.dataset_path, disable_shuffle=args.disable_shuffle
         )
         # For the "sonnet" dataset, formatting depends on the backend.
         if args.backend == "openai-chat":
-            input_requests = sonnet_dataset.sample(
+            input_requests = dataset.sample(
                 num_requests=args.num_prompts,
                 input_len=args.sonnet_input_len,
                 output_len=args.sonnet_output_len,
@@ -2167,13 +2155,10 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
                 no_oversample=args.no_oversample,
             )
         else:
-            assert (
-                hasattr(tokenizer, "chat_template") and tokenizer.chat_template
-            ) or (
-                hasattr(tokenizer, "default_chat_template")
-                and tokenizer.default_chat_template
-            ), "Tokenizer/model must have chat template for sonnet dataset."
-            input_requests = sonnet_dataset.sample(
+            assert tokenizer.chat_template or tokenizer.default_chat_template, (
+                "Tokenizer/model must have chat template for sonnet dataset."
+            )
+            input_requests = dataset.sample(
                 num_requests=args.num_prompts,
                 input_len=args.sonnet_input_len,
                 output_len=args.sonnet_output_len,
@@ -2188,7 +2173,6 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
         # all following datasets are implemented from the
         # HuggingFaceDataset base class
         hf_kwargs = {}
-        dataset_class: type[BenchmarkDataset]
         if (
             args.dataset_path in VisionArenaDataset.SUPPORTED_DATASET_PATHS
             or args.hf_name in VisionArenaDataset.SUPPORTED_DATASET_PATHS
@@ -2320,9 +2304,6 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
                 "Multi-modal content is only supported on 'openai-chat' and "
                 "'openai-audio' backends."
             )
-        assert tokenizer is not None, (
-            "Tokenizer must be initialized for the 'hf' dataset."
-        )
         input_requests = dataset_class(
             dataset_path=args.dataset_path,
             dataset_subset=args.hf_subset,
@@ -2344,9 +2325,6 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
         )
 
     elif args.dataset_name == "timed_trace":
-        assert tokenizer is not None, (
-            "Tokenizer must be initialized for the 'timed_trace' dataset."
-        )
         dataloader = TimedTrace(**vars(args))
         input_requests = dataloader.sample(
             num_requests=args.num_prompts,
@@ -2356,9 +2334,6 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
 
     else:
         # For datasets that follow a similar structure, use a mapping.
-        assert tokenizer is not None, (
-            f"Tokenizer must be initialized for the '{args.dataset_name}' dataset."
-        )
         dataset_mapping = {
             "spec_bench": lambda: SpecBench(
                 dataset_path=args.dataset_path,
@@ -2464,7 +2439,6 @@ def get_samples(args, tokenizer: TokenizerLike | None) -> list[SampleRequest]:
                 num_requests=args.num_prompts,
                 tokenizer=tokenizer,
                 output_len=args.speed_bench_output_len,
-                skip_chat_template=args.skip_chat_template,
                 chat_template_kwargs=getattr(args, "chat_template_kwargs", None),
                 enable_multimodal_chat=args.enable_multimodal_chat,
                 request_id_prefix=args.request_id_prefix,
@@ -2544,7 +2518,7 @@ class CustomDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: TokenizerLike | None,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
@@ -2574,23 +2548,23 @@ class CustomDataset(BenchmarkDataset):
 
             if tokenizer is None:
                 new_output_len = 1
-            elif output_len is None or output_len == -1:
-                # check that the request has an 'output_tokens' field
-                if "output_tokens" not in item:
-                    raise ValueError(
-                        "If no output length is provided the "
-                        "custom dataset must contain an 'output_tokens' field."
-                    )
-                # Use number of output tokens from the request data
-                try:
-                    new_output_len = int(item["output_tokens"])
-                except (ValueError, TypeError) as e:
-                    raise ValueError(
-                        f"Invalid value for 'output_tokens' in custom dataset: "
-                        f"'{item['output_tokens']}'. Must be an integer."
-                    ) from e
             else:
                 new_output_len = output_len
+                if output_len is None or output_len == -1:
+                    # check that the request has an 'output_tokens' field
+                    if "output_tokens" not in item:
+                        raise ValueError(
+                            "If no output length is provided the "
+                            "custom dataset must contain an 'output_tokens' field."
+                        )
+                    # Use number of output tokens from the request data
+                    try:
+                        new_output_len = int(item["output_tokens"])
+                    except (ValueError, TypeError) as e:
+                        raise ValueError(
+                            f"Invalid value for 'output_tokens' in custom dataset: "
+                            f"'{item['output_tokens']}'. Must be an integer."
+                        ) from e
 
             if tokenizer is None:
                 prompt_len = 1
@@ -2821,17 +2795,13 @@ class CustomImageDataset(CustomDataset):
 
     def sample(
         self,
-        tokenizer: TokenizerLike | None,
+        tokenizer: TokenizerLike,
         num_requests: int,
-        request_id_prefix: str = "",
-        no_oversample: bool = False,
-        lora_path: str | None = None,
-        max_loras: int | None = None,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
-        skip_chat_template: bool = False,
-        chat_template_kwargs: dict | None = None,
         ensure_client_side_data: bool = False,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
         # load all data if needed
@@ -2844,7 +2814,7 @@ class CustomImageDataset(CustomDataset):
                 num_requests,
             )
 
-        sampled_requests: list[SampleRequest] = []
+        sampled_requests = []
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
@@ -2867,7 +2837,7 @@ class CustomImageDataset(CustomDataset):
                     SampleRequest(
                         prompt=prompt,
                         prompt_len=prompt_len,
-                        expected_output_len=output_len or 0,
+                        expected_output_len=output_len,
                         multi_modal_data=None,
                         request_id=request_id_prefix + str(i),
                     )
@@ -2893,7 +2863,7 @@ class CustomImageDataset(CustomDataset):
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
-                    expected_output_len=output_len or 0,
+                    expected_output_len=output_len,
                     multi_modal_data=mm_content,
                     request_id=request_id_prefix + str(i),
                 )
@@ -2919,31 +2889,26 @@ class CustomAudioDataset(CustomDataset):
 
     def sample(
         self,
-        tokenizer: TokenizerLike | None,
+        tokenizer: TokenizerLike,
         num_requests: int,
+        output_len: int | None = None,
         request_id_prefix: str = "",
         no_oversample: bool = False,
-        lora_path: str | None = None,
-        max_loras: int | None = None,
-        output_len: int | None = None,
-        enable_multimodal_chat: bool = False,
         skip_chat_template: bool = False,
-        chat_template_kwargs: dict | None = None,
+        enable_multimodal_chat: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
         self.num_available_samples = len(self.data)
         if num_requests <= 0:
             num_requests = self.num_available_samples
-        sampled_requests: list[SampleRequest] = []
+        sampled_requests = []
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
             prompt = item.get("prompt", "")
             if tokenizer is None:
                 prompt_len = 1
-                new_output_len = (
-                    output_len if (output_len is not None and output_len != -1) else 256
-                )
+                new_output_len = output_len if output_len not in (None, -1) else 256
                 mm_content = None
             else:
                 use_chat_template = (
@@ -2985,6 +2950,7 @@ class CustomAudioDataset(CustomDataset):
                 prompt_len = (
                     len(tokenizer(prompt).input_ids) if isinstance(prompt, str) else 1
                 )
+                new_output_len = output_len
                 if output_len is None or output_len == -1:
                     if "output_tokens" not in item:
                         raise ValueError(
@@ -2992,9 +2958,6 @@ class CustomAudioDataset(CustomDataset):
                             "custom dataset must contain an 'output_tokens' field."
                         )
                     new_output_len = int(item["output_tokens"])
-                else:
-                    assert output_len is not None
-                    new_output_len = output_len
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
@@ -3052,30 +3015,10 @@ class SpecBench(CustomDataset):
 
     def sample(
         self,
-        tokenizer: TokenizerLike | None,
-        num_requests: int,
-        request_id_prefix: str = "",
-        no_oversample: bool = False,
-        lora_path: str | None = None,
-        max_loras: int | None = None,
-        output_len: int | None = None,
-        enable_multimodal_chat: bool = False,
-        skip_chat_template: bool = False,
-        chat_template_kwargs: dict | None = None,
         **kwargs,
     ) -> list[SampleRequest]:
         # leverage CustomDataset sample
         return super().sample(
-            tokenizer=tokenizer,
-            num_requests=num_requests,
-            request_id_prefix=request_id_prefix,
-            no_oversample=no_oversample,
-            lora_path=lora_path,
-            max_loras=max_loras,
-            output_len=output_len,
-            enable_multimodal_chat=enable_multimodal_chat,
-            skip_chat_template=skip_chat_template,
-            chat_template_kwargs=chat_template_kwargs,
             **kwargs,
         )
 
@@ -3124,21 +3067,16 @@ class SonnetDataset(BenchmarkDataset):
         return_prompt_formatted: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
-        poem_lines = self.data
-        assert poem_lines is not None
         # Calculate average token length for a poem line.
-        tokenized_lines = [tokenizer(line).input_ids for line in poem_lines]
+        tokenized_lines = [tokenizer(line).input_ids for line in self.data]
         avg_len = sum(len(tokens) for tokens in tokenized_lines) / len(tokenized_lines)
 
         # Build the base prompt.
         base_prompt = "Pick as many lines as you can from these poem lines:\n"
         base_msg = [{"role": "user", "content": base_prompt}]
         base_fmt = tokenizer.apply_chat_template(
-            base_msg,  # type: ignore[arg-type]
-            add_generation_prompt=True,
-            tokenize=False,
+            base_msg, add_generation_prompt=True, tokenize=False
         )
-        assert isinstance(base_fmt, str)
         base_offset = len(tokenizer(base_fmt).input_ids)
         if input_len <= base_offset:
             raise ValueError(
@@ -3147,31 +3085,26 @@ class SonnetDataset(BenchmarkDataset):
             )
 
         # Determine how many poem lines to use.
-        num_input_lines = max(round((input_len - base_offset) / avg_len), 1)
+        num_input_lines = round((input_len - base_offset) / avg_len)
         num_prefix_lines = max(round((prefix_len - base_offset) / avg_len), 0)
-        prefix_lines = poem_lines[:num_prefix_lines]
+        prefix_lines = self.data[:num_prefix_lines]
 
         samples: list[SampleRequest] = []
         ind = 0
         while len(samples) < num_requests:
             extra_lines = random.choices(
-                poem_lines, k=num_input_lines - num_prefix_lines
+                self.data, k=num_input_lines - num_prefix_lines
             )
             prompt = f"{base_prompt}{''.join(prefix_lines + extra_lines)}"
             msg = [{"role": "user", "content": prompt}]
             prompt_formatted = tokenizer.apply_chat_template(
-                msg,  # type: ignore[arg-type]
-                add_generation_prompt=True,
-                tokenize=False,
+                msg, add_generation_prompt=True, tokenize=False
             )
-            assert isinstance(prompt_formatted, str)
             prompt_len = len(tokenizer(prompt_formatted).input_ids)
             if prompt_len <= input_len:
                 samples.append(
                     SampleRequest(
-                        prompt=(
-                            prompt_formatted if return_prompt_formatted else prompt
-                        ),
+                        prompt=prompt_formatted if return_prompt_formatted else prompt,
                         prompt_len=prompt_len,
                         expected_output_len=output_len,
                         request_id=request_id_prefix + str(ind),
@@ -3212,7 +3145,6 @@ class BurstGPTDataset(BenchmarkDataset):
         self.data = gpt4_df
 
     def _sample_loaded_data(self, num_requests: int) -> list:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         if num_requests <= len(self.data):
             data = self.data.sample(n=num_requests, random_state=self.random_seed)
         else:
@@ -3326,7 +3258,6 @@ class ConversationDataset(HuggingFaceDataset):
         enable_multimodal_chat: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         # Filter examples with at least 2 conversations
         filtered_data = self.data.filter(lambda x: len(x["conversations"]) >= 2)
         sampled_requests: list[SampleRequest] = []
@@ -3387,7 +3318,6 @@ class MultiModalConversationDataset(HuggingFaceDataset):
         enable_multimodal_chat: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         # Filter examples with at least 2 conversations
         filtered_data = self.data.filter(lambda x: len(x["conversations"]) >= 2)
         sampled_requests: list[SampleRequest] = []
@@ -3463,8 +3393,7 @@ class VisionArenaDataset(HuggingFaceDataset):
 
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
 
-        assert self.data is not None, "Dataset must be loaded before sampling"
-        sampled_requests: list[SampleRequest] = []
+        sampled_requests = []
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
@@ -3536,8 +3465,7 @@ class MMVUDataset(HuggingFaceDataset):
 
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
 
-        assert self.data is not None, "Dataset must be loaded before sampling"
-        sampled_requests: list[SampleRequest] = []
+        sampled_requests = []
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
@@ -3603,21 +3531,18 @@ class InstructCoderDataset(HuggingFaceDataset):
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
         sampled_requests: list[SampleRequest] = []
         for i, prompt in enumerate(self.sample_prompts(n=num_requests)):
-            prompt_text = prompt
             # apply template
             if not skip_chat_template:
-                prompt_text_result = tokenizer.apply_chat_template(
+                prompt = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
                     add_generation_prompt=True,
                     tokenize=False,
                 )
-                assert isinstance(prompt_text_result, str)
-                prompt_text = prompt_text_result
 
-            prompt_len = len(tokenizer(prompt_text).input_ids)
+            prompt_len = len(tokenizer(prompt).input_ids)
             sampled_requests.append(
                 SampleRequest(
-                    prompt=prompt_text,
+                    prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
                     request_id=request_id_prefix + str(i),
@@ -3629,7 +3554,6 @@ class InstructCoderDataset(HuggingFaceDataset):
         return sampled_requests
 
     def sample_prompts(self, n: int) -> Iterator[str]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         for item in self.data.take(n):
             prompt = (
                 f"{item['input']}\n\n{item['instruction']} Just output "
@@ -3670,7 +3594,6 @@ class MTBenchDataset(HuggingFaceDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        assert self.data is not None, "Dataset must be loaded before sampling"
         sampled_requests: list[SampleRequest] = []
 
         for i, item in enumerate(self.data):
@@ -3731,8 +3654,7 @@ class HumanEvalDataset(HuggingFaceDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        sampled_requests: list[SampleRequest] = []
-        assert self.data is not None, "Data must be loaded before sampling"
+        sampled_requests = []
 
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
@@ -3792,8 +3714,7 @@ class GSM8KDataset(HuggingFaceDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        sampled_requests: list[SampleRequest] = []
-        assert self.data is not None, "Data must be loaded before sampling"
+        sampled_requests = []
 
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
@@ -3851,18 +3772,17 @@ class BlazeditDataset(HuggingFaceDataset):
         self,
         tokenizer: TokenizerLike,
         num_requests: int,
-        request_id_prefix: str = "",
-        no_oversample: bool = False,
         output_len: int | None = None,
         skip_chat_template: bool = False,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
         min_distance: float = 0.0,
         max_distance: float = 1.0,
         **kwargs,
     ) -> list[SampleRequest]:
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        sampled_requests: list[SampleRequest] = []
+        sampled_requests = []
 
-        assert self.data is not None, "Dataset must be loaded before sampling"
         for i, item in enumerate(self.data):
             if len(sampled_requests) >= num_requests:
                 break
@@ -3890,13 +3810,11 @@ Please generate the new code file in the "New file" section below."""  # noqa: E
 
             # apply template
             if not skip_chat_template:
-                prompt_result = tokenizer.apply_chat_template(
+                prompt = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
                     add_generation_prompt=True,
                     tokenize=False,
                 )
-                assert isinstance(prompt_result, str)
-                prompt = prompt_result
 
             prompt_len = len(tokenizer(prompt).input_ids)
 
@@ -3940,7 +3858,6 @@ class AIMODataset(HuggingFaceDataset):
         output_len: int | None = None,
         **kwargs,
     ) -> list[SampleRequest]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
         sampled_requests: list[SampleRequest] = []
         ind = 0
         dynamic_output = output_len is None
@@ -4053,7 +3970,6 @@ class NextEditPredictionDataset(HuggingFaceDataset):
         formatting_prompt_func = self.MAPPING_PROMPT_FUNCS.get(self.hf_name)
         if formatting_prompt_func is None:
             raise ValueError(f"Unsupported dataset path: {self.hf_name}")
-        assert self.data is not None, "Dataset must be loaded before sampling"
         samples = []
         for i, sample in enumerate(self.data):
             sample = formatting_prompt_func(sample)
@@ -4105,10 +4021,9 @@ class ASRDataset(HuggingFaceDataset):
     EARNINGS22_TINY_FILTERED_DATASET = (
         "D4nt3/esb-datasets-earnings22-validation-tiny-filtered"
     )
-    LIBRISPEECH_DATASET = "openslr/librispeech_asr"
 
     SUPPORTED_DATASET_PATHS = {
-        LIBRISPEECH_DATASET,
+        "openslr/librispeech_asr",
         "facebook/voxpopuli",
         "LIUM/tedlium",
         "edinburghcstr/ami",
@@ -4136,10 +4051,7 @@ class ASRDataset(HuggingFaceDataset):
                 self.data = self.data.shuffle(seed=self.random_seed)
             self._materialize_local_audio_column()
             return
-        if self.hf_name in (
-            self.EARNINGS22_TINY_FILTERED_DATASET,
-            self.LIBRISPEECH_DATASET,
-        ):
+        if self.hf_name == self.EARNINGS22_TINY_FILTERED_DATASET:
             super().load_data()
             self._disable_audio_decode()
             return
@@ -4149,14 +4061,12 @@ class ASRDataset(HuggingFaceDataset):
     def _disable_audio_decode(self) -> None:
         from datasets import Audio
 
-        assert self.data is not None, "Dataset must be loaded before sampling"
         self.data = self.data.cast_column("audio", Audio(decode=False))
 
     def _materialize_local_audio_column(self) -> None:
         local_path_root = Path(
             hf_api().snapshot_download(self.hf_name, repo_type="dataset")
         )
-        assert self.data is not None, "Dataset must be loaded before sampling"
         self.data = self.data.map(
             lambda item: {
                 "audio": str(local_path_root / item["url"]),
@@ -4175,37 +4085,20 @@ class ASRDataset(HuggingFaceDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        name_or_path = getattr(tokenizer, "name_or_path", "")
-        tok_class = type(tokenizer).__name__
-        if "openai" in name_or_path:
+        if "openai" in getattr(tokenizer, "name_or_path", ""):
             prompt = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
-        elif tok_class == "CohereAsrTokenizer" or "cohere" in name_or_path.lower():
-            # CohereAsrTokenizer does not inject a decoder start token, so the
-            # decoder prompt must supply the full control-token sequence.
-            # Token order: context boundary, transcript start, emotion (default
-            # undefined), language (en), transcription directive (en), punctuation
-            # enabled, no ITN, no timestamp, no diarization.
-            prompt = (
-                "<|startofcontext|><|startoftranscript|>"
-                "<|emo:undefined|><|en|><|en|><|pnc|><|noitn|>"
-                "<|notimestamp|><|nodiarize|>"
-            )
         else:
             prompt = ""
         prompt_len = len(tokenizer(prompt).input_ids)
-        assert self.data is not None, "Dataset must be loaded before sampling"
         sampled_requests: list[SampleRequest] = []
         ind = 0
         skipped = 0
-        asr_min_audio_len_sec: float = float(kwargs.get("asr_min_audio_len_sec") or 0.0)
-        asr_max_audio_len_sec: float = float(
-            kwargs.get("asr_max_audio_len_sec") or float("inf")
-        )
+        asr_min_audio_len_sec = kwargs.get("asr_min_audio_len_sec")
+        asr_max_audio_len_sec = kwargs.get("asr_max_audio_len_sec")
         durations = []
         for item in self.data:
             if len(sampled_requests) >= num_requests:
                 break
-            mm_content: dict[str, Any]
             audio = item["audio"]
             if (
                 isinstance(audio, dict)
@@ -4218,14 +4111,14 @@ class ASRDataset(HuggingFaceDataset):
             elif isinstance(audio, str):
                 duration_s = sf.info(audio).duration
                 mm_content = {"audio_path": audio}
+            elif isinstance(audio, dict) and audio.get("path"):
+                duration_s = sf.info(audio["path"]).duration
+                mm_content = {"audio_path": audio["path"]}
             elif isinstance(audio, dict) and audio.get("bytes") is not None:
                 with BytesIO(audio["bytes"]) as audio_buffer:
                     y, sr = sf.read(audio_buffer, dtype="float32")
                 duration_s = get_audio_duration(y=y, sr=sr)
                 mm_content = {"audio": (y, sr)}
-            elif isinstance(audio, dict) and audio.get("path"):
-                duration_s = sf.info(audio["path"]).duration
-                mm_content = {"audio_path": audio["path"]}
             else:
                 raise ValueError(
                     "ASR samples must provide decoded audio arrays, "
@@ -4310,7 +4203,8 @@ class MLPerfDataset(HuggingFaceDataset):
         output_len: int | None = None,
         **kwargs,
     ) -> list[SampleRequest]:
-        assert self.data is not None, "Dataset must be loaded before sampling"
+        # Force dynamic output length based on reference completion.
+        dynamic_output = output_len is None
         sampled_requests: list[SampleRequest] = []
         ind = 0
 
@@ -4328,18 +4222,15 @@ class MLPerfDataset(HuggingFaceDataset):
                 {"role": "user", "content": question},
             ]
             prompt_formatted = tokenizer.apply_chat_template(
-                messages,  # type: ignore[arg-type]
-                add_generation_prompt=True,
-                tokenize=False,
+                messages, add_generation_prompt=True, tokenize=False
             )
-            assert isinstance(prompt_formatted, str)
             prompt_len = len(tokenizer(prompt_formatted).input_ids)
 
             # Determine output length from reference answer tokens.
             ref_out_len = len(
                 tokenizer(reference_answer, add_special_tokens=False).input_ids
             )
-            expected_output_len = ref_out_len if output_len is None else output_len
+            expected_output_len = ref_out_len if dynamic_output else output_len
 
             # Validate sequence lengths.
             if not is_valid_sequence(prompt_len, expected_output_len):
@@ -4480,7 +4371,6 @@ class MMStarDataset(HuggingFaceDataset):
     ) -> list[SampleRequest]:
         # If --hf-output-len is not set, use the default output length.
         output_len = output_len if output_len is not None else self.DEFAULT_OUTPUT_LEN
-        assert self.data is not None, "Dataset must be loaded before sampling"
         sampled_requests: list[SampleRequest] = []
 
         for ind, item in enumerate(self.data):
@@ -4713,7 +4603,7 @@ class BFCLDataset(HuggingFaceDataset):
                     exc_info=True,
                 )
                 rendered = None
-            if rendered is not None and isinstance(rendered, str):
+            if rendered is not None:
                 prompt_len = len(tokenizer(rendered).input_ids)
             else:
                 text = "\n".join(m.get("content", "") for m in messages)

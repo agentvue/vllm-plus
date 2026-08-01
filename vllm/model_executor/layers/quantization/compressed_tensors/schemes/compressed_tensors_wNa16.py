@@ -1,14 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from collections.abc import Callable
-from fractions import Fraction
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
-from vllm.distributed.utils import verify_group_size_divides_partition
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinLinearKernel,
@@ -35,15 +32,7 @@ from vllm.scalar_type import scalar_types
 logger = init_logger(__name__)
 
 __all__ = ["CompressedTensorsWNA16"]
-WNA16_SUPPORTED_TYPES_MAP = {
-    2: scalar_types.uint2b2,
-    3: scalar_types.uint3b4,
-    4: scalar_types.uint4b8,
-    5: scalar_types.uint5b16,
-    6: scalar_types.uint6b32,
-    7: scalar_types.uint7b64,
-    8: scalar_types.uint8b128,
-}
+WNA16_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4b8, 8: scalar_types.uint8b128}
 WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
 
@@ -60,8 +49,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         actorder: ActivationOrdering | None = None,
         layer_name: str | None = None,
     ):
-        self.num_bits = num_bits
-        self.pack_factor = Fraction(32, num_bits)
+        self.pack_factor = 32 // num_bits
         self.strategy = strategy
         self.symmetric = symmetric
         self.group_size = -1 if group_size is None else group_size
@@ -70,22 +58,15 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
         if self.group_size == -1 and self.strategy != "channel":
             raise ValueError(
-                "Pack-quantized format requires group quantization "
-                "or channelwise quantization, but found no group "
+                "Marlin kernels require group quantization or "
+                "channelwise quantization, but found no group "
                 "size and strategy is not channelwise."
             )
 
         if num_bits not in WNA16_SUPPORTED_TYPES_MAP:
             raise ValueError(
                 f"Unsupported num_bits = {num_bits}. "
-                f"Supported num_bits = {list(WNA16_SUPPORTED_TYPES_MAP)}"
-            )
-
-        if not self.symmetric and num_bits not in WNA16_ZP_SUPPORTED_TYPES_MAP:
-            raise ValueError(
-                f"Asymmetric quantization not supported for "
-                f"num_bits = {num_bits}. Supported: "
-                f"{list(WNA16_ZP_SUPPORTED_TYPES_MAP)}"
+                f"Supported num_bits = {WNA16_SUPPORTED_TYPES_MAP.keys()}"
             )
 
         self.quant_type = (
@@ -111,12 +92,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.output_partition_sizes = output_partition_sizes
-        layer.params_dtype = params_dtype
-        if not hasattr(layer, "has_bias"):
-            layer.has_bias = False
 
         mp_linear_kernel_config = MPLinearLayerConfig(
             full_weight_shape=(input_size, output_size),
@@ -152,12 +127,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         scales_and_zp_size = input_size // group_size
 
         if partition_scales:
-            verify_group_size_divides_partition(
-                input_size_per_partition, group_size, self.layer_name
-            )
+            assert input_size_per_partition % group_size == 0
             scales_and_zp_size = input_size_per_partition // group_size
 
-        packed_input_dim = math.ceil(input_size_per_partition * self.num_bits / 32)
         weight = PackedvLLMParameter(
             input_dim=1,
             output_dim=0,
@@ -166,7 +138,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             packed_dim=1,
             data=torch.empty(
                 output_size_per_partition,
-                packed_input_dim,
+                input_size_per_partition // self.pack_factor,
                 dtype=torch.int32,
             ),
         )
@@ -180,11 +152,10 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             ),
         }
 
-        packed_output_dim = math.ceil(output_size_per_partition * self.num_bits / 32)
         zeros_args = {
             "weight_loader": weight_loader,
             "data": torch.zeros(
-                packed_output_dim,
+                output_size_per_partition // self.pack_factor,
                 scales_and_zp_size,
                 dtype=torch.int32,
             ),

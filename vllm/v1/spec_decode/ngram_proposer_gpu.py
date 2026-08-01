@@ -91,8 +91,7 @@ class NgramGPUKernel(nn.Module):
             suffix_indices = suffix_starts.unsqueeze(1) + torch.arange(
                 ngram_len, device=device
             )
-            suffix_indices.clamp_(min=0)
-            suffix = torch.gather(token_ids, 1, suffix_indices)
+            suffix = torch.gather(token_ids, 1, suffix_indices.clamp(min=0))
 
             # Window matches for each sequence.
             matches = (search_windows == suffix.unsqueeze(1)).all(dim=-1)
@@ -135,7 +134,7 @@ class NgramGPUKernel(nn.Module):
         draft_indices = draft_start.unsqueeze(1) + torch.arange(
             num_draft_tokens, device=device
         )
-        draft_indices.clamp_(min=0, max=max_seq_len - 1)
+        draft_indices = draft_indices.clamp(min=0, max=max_seq_len - 1)
 
         # Extract draft tokens; gather always runs.
         draft_tokens = torch.gather(token_ids, 1, draft_indices)
@@ -358,8 +357,7 @@ class NgramProposerGPU:
             valid_write_mask & (valid_sampled_token_ids_gpu != -1) & in_bounds
         )
 
-        write_positions.clamp_(max=max_seq_len - 1)
-        write_positions_long = write_positions.long()
+        write_positions_long = write_positions.clamp(max=max_seq_len - 1).long()
         existing_values = token_ids_gpu.gather(1, write_positions_long)
 
         tokens_cast = valid_sampled_token_ids_gpu.to(token_ids_gpu.dtype)
@@ -429,9 +427,7 @@ class NgramProposerGPU:
         )
 
         # Backup last valid token before speculative tokens.
-        backup_indices = num_tokens_no_spec[:num_reqs] - 1
-        backup_indices.clamp_(min=0)
-        backup_indices = backup_indices.long()
+        backup_indices = (num_tokens_no_spec[:num_reqs] - 1).clamp(min=0).long()
         backup_next_token_ids = torch.gather(
             token_ids_gpu[:num_reqs], dim=1, index=backup_indices.unsqueeze(1)
         ).squeeze(1)
@@ -451,17 +447,16 @@ class NgramProposerGPU:
 
         # Rightmost valid index per row.
         last_valid_indices = valid_sampled_tokens_count - 1
-        has_valid_sample = last_valid_indices >= 0
-        last_valid_indices.clamp_(min=0)
+        last_valid_indices_safe = torch.clamp(last_valid_indices, min=0)
 
         # Last valid token from each row; undefined if none.
         selected_tokens = torch.gather(
-            valid_sampled_token_ids_gpu, 1, last_valid_indices.unsqueeze(1)
+            valid_sampled_token_ids_gpu, 1, last_valid_indices_safe.unsqueeze(1)
         ).squeeze(1)
 
         # Use last token if valid; otherwise fallback to backup.
         next_token_ids = torch.where(
-            has_valid_sample,
+            last_valid_indices != -1,
             selected_tokens,
             backup_next_token_ids,
         )

@@ -10,12 +10,11 @@ import numpy as np
 import regex as re
 import torch
 import torch.nn as nn
-from mistral_common.audio import mel_filter_bank
-from mistral_common.protocol.instruct.chunk import AudioChunk, TextChunk
+from mistral_common.audio import Audio, mel_filter_bank
+from mistral_common.protocol.instruct.chunk import AudioChunk, RawAudio, TextChunk
 from mistral_common.protocol.instruct.messages import UserMessage
 from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from mistral_common.protocol.transcription.request import TranscriptionRequest
-from mistral_common.tokens.tokenizers.audio import Audio
 from transformers import BatchFeature, WhisperConfig
 
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
@@ -183,7 +182,7 @@ class VoxtralDummyInputsBuilder(BaseDummyInputsBuilder[VoxtralProcessingInfo]):
                 sampling_rate=feature_extractor.sampling_rate,
                 format=format,
             )
-            chunk = AudioChunk.from_audio(audio_item)
+            chunk = AudioChunk(input_audio=RawAudio.from_audio(audio_item))
             audio_chunks.append(chunk)
 
         request = ChatCompletionRequest(
@@ -463,7 +462,7 @@ class VoxtralForConditionalGeneration(
         audio = Audio(audio, int(stt_config.sample_rate), format="wav")  # lossless
         req = TranscriptionRequest(
             model=model_config.model,
-            audio=audio.to_base64(audio.format),
+            audio=RawAudio.from_audio(audio),
             language=language,
         )
 

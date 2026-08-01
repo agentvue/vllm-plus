@@ -83,9 +83,3 @@ ECConnectorFactory.register_connector(
     "vllm.distributed.ec_transfer.ec_connector.example_connector",
     "ECExampleConnector",
 )
-
-ECConnectorFactory.register_connector(
-    "ECCPUConnector",
-    "vllm.distributed.ec_transfer.ec_connector.cpu.connector",
-    "ECCPUConnector",
-)

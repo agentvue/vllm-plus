@@ -67,8 +67,9 @@ void cp_gather_and_upconvert_fp8_kv_cache(
     torch::Tensor const& src_cache,         // [NUM_BLOCKS, BLOCK_SIZE, 656]
     torch::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
+    torch::Tensor const& seq_lens,          // [BATCH]
     torch::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size, std::optional<torch::Tensor> seq_starts = std::nullopt);
+    int64_t batch_size);
 
 // Indexer K quantization and cache function
 void indexer_k_quant_and_cache(

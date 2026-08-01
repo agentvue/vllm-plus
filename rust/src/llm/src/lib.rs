@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use tracing::Span;
 use vllm_engine_core_client::EngineCoreClient;
 
@@ -17,7 +14,6 @@ pub use output::{
     GenerateOutputStreamExt, GeneratePromptInfo, TokenUsage,
 };
 pub use request::GenerateRequest;
-pub use request_metrics::current_unix_timestamp_secs;
 pub use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
 
 use crate::inflight::InflightRequests;
@@ -55,7 +51,7 @@ impl Llm {
         if enabled {
             let stats_logger = StatsLogger::start(
                 self.client.model_name().to_string(),
-                self.client.engine_indices(),
+                self.client.engine_count(),
             );
             self.stats_logger = Some(stats_logger);
         } else {
@@ -92,21 +88,14 @@ impl Llm {
         // Record internal engine-core request ID in the current tracing span.
         Span::current().record("engine_request_id", &internal_request_id);
 
-        let arrival_time = prepared.engine_request.arrival_time;
-        let max_tokens_param =
-            (prepared.engine_request.sampling_params.as_ref()).map(|p| p.max_tokens);
-        let prompt_len = prepared.prompt_token_ids().len() as u32;
-
-        let stream = self.client.call(prepared.engine_request).await?;
-
         let request_metrics = RequestMetricsTracker::new(
             self.client.model_name().to_string(),
-            stream.engine_index(),
-            arrival_time,
-            prompt_len,
-            max_tokens_param,
+            prepared.engine_request.arrival_time,
+            prepared.prompt_token_ids().len() as u32,
+            (prepared.engine_request.sampling_params.as_ref()).map(|p| p.max_tokens),
             1,
         );
+        let stream = self.client.call(prepared.engine_request).await?;
         let guard = self.inflight.track(external_request_id, internal_request_id);
 
         Ok(GenerateOutputStream::new(
@@ -125,12 +114,7 @@ impl Llm {
     /// tracking entries themselves are removed when the corresponding output
     /// streams are dropped, not here.
     pub async fn abort(&self, external_ids: &[String]) -> Result<()> {
-        // Empty `external_ids` means abort every in-flight request.
-        let internal_ids = if external_ids.is_empty() {
-            self.inflight.all_internal_ids()
-        } else {
-            self.inflight.resolve(external_ids)
-        };
+        let internal_ids = self.inflight.resolve(external_ids);
         if internal_ids.is_empty() {
             return Ok(());
         }

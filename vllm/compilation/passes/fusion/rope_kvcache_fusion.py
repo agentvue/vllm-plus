@@ -74,7 +74,7 @@ def fused_rope_and_unified_kv_cache_update_impl(
             layer_slot_mapping,
         )
 
-    return query.new_empty(0)
+    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
 
 def fused_rope_and_unified_kv_cache_update_fake(

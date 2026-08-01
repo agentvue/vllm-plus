@@ -7,7 +7,6 @@ import time
 import numpy as np
 import torch
 
-from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed
 
@@ -15,15 +14,17 @@ from vllm.utils.torch_utils import set_random_seed
 try:
     from vllm._custom_ops import cpu_fused_moe, cpu_prepack_moe_weight
 except (ImportError, AttributeError) as e:
+    print("ERROR: CPU fused MoE operations are not available on this platform.")
+    print("This benchmark requires x86 CPU with proper vLLM CPU extensions compiled.")
+    print(
+        "The cpu_fused_moe kernel is typically available on Linux x86_64 "
+        "with AVX2/AVX512."
+    )
     print(f"Import error: {e}")
     sys.exit(1)
 
 # ISA selection following test_cpu_fused_moe.py pattern
-ISA_CHOICES = ["vec"]
-if torch.cpu._is_amx_tile_supported():
-    ISA_CHOICES.append("amx")
-if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
-    ISA_CHOICES.append("neon")
+ISA_CHOICES = ["amx", "vec"] if torch.cpu._is_amx_tile_supported() else ["vec"]
 
 
 @torch.inference_mode()
@@ -144,7 +145,7 @@ if __name__ == "__main__":
         "--isa",
         type=str,
         choices=ISA_CHOICES,
-        default="vec",
+        default=ISA_CHOICES[0],
         help=f"ISA to use (available: {ISA_CHOICES})",
     )
     parser.add_argument("--seed", type=int, default=0)

@@ -18,7 +18,6 @@
 # Environment variables:
 #   MODEL_NAMES              - model to test (default: Qwen/Qwen3-0.6B)
 #   GPU_MEMORY_UTILIZATION   - GPU memory fraction (default: 0.6)
-#   ATTENTION_BACKEND        - optional attention backend for vllm serve
 #   VLLM_SERVE_EXTRA_ARGS    - comma-separated extra args for vllm serve
 #   SKIP_CROSS_LAYERS        - set to 1 to skip the cross-layer layout test
 #   SKIP_NORMAL_LAYOUT       - set to 1 to skip the normal layout test
@@ -35,11 +34,9 @@ fi
 
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
 BLOCK_SIZE=${BLOCK_SIZE:-128}
-ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
 VLLM_SERVE_EXTRA_ARGS=${VLLM_SERVE_EXTRA_ARGS:-}
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-GIT_ROOT="${GIT_ROOT:-$(cd -- "${SCRIPT_DIR}/../../../.." && pwd -P)}"
+GIT_ROOT=$(git rev-parse --show-toplevel)
 SMI_BIN=$(which nvidia-smi || which rocm-smi || echo "")
 
 # ── KV transfer configs ─────────────────────────────────────────────────
@@ -142,9 +139,6 @@ run_tests_for_model() {
       BASE_CMD="${BASE_CMD} $arg"
     done
   fi
-  if [[ -n "$ATTENTION_BACKEND" ]]; then
-    BASE_CMD="${BASE_CMD} --attention-backend $ATTENTION_BACKEND"
-  fi
   eval "$BASE_CMD &"
 
   # ── Start decode instance ──
@@ -166,9 +160,6 @@ run_tests_for_model() {
     for arg in "${extra_args[@]}"; do
       BASE_CMD="${BASE_CMD} $arg"
     done
-  fi
-  if [[ -n "$ATTENTION_BACKEND" ]]; then
-    BASE_CMD="${BASE_CMD} --attention-backend $ATTENTION_BACKEND"
   fi
   eval "$BASE_CMD &"
 

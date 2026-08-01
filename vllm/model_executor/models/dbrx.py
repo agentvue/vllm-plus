@@ -16,7 +16,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     RoutedExperts,
 )
 from vllm.model_executor.layers.linear import (
@@ -159,7 +159,7 @@ class DbrxMoE(nn.Module):
 
         self.router = DbrxRouter(config, self.params_dtype)
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             num_experts=config.ffn_config.moe_num_experts,
             top_k=config.ffn_config.moe_top_k,
             hidden_size=config.d_model,

@@ -429,6 +429,7 @@ def rocm_fp8_paged_mqa_logits(
             (out_logits,) = current_workspace_manager().get_simultaneous(
                 ((batch_size * next_n, max_model_len), torch.float32),
             )
+            out_logits.fill_(float("-inf"))
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -442,7 +443,6 @@ def rocm_fp8_paged_mqa_logits(
                 KVBlockSize=block_size,
                 WavePerEU=2,
             )
-            out_logits.nan_to_num_(float("-inf"))
             return out_logits
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
@@ -592,6 +592,37 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
+def _topk_indices_torch(
+    logits: torch.Tensor,
+    topk_tokens: int,
+    row_starts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    k = min(topk_tokens, logits.shape[-1])
+    values, indices = torch.topk(logits, k=k, dim=-1)
+    indices = indices.to(torch.int32)
+    indices = torch.where(
+        values == float("-inf"),
+        torch.full_like(indices, -1, dtype=torch.int32),
+        indices,
+    )
+    if row_starts is not None:
+        # Match the CUDA top_k_per_row_prefill contract: indices are local to
+        # each row's valid [row_start, row_end) range, not columns in the
+        # concatenated chunk logits matrix.
+        starts = row_starts.to(dtype=torch.int32).view(-1, 1)
+        indices = torch.where(indices < 0, indices, indices - starts)
+    if k == topk_tokens:
+        return indices
+    padded = torch.full(
+        (logits.shape[0], topk_tokens),
+        -1,
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    padded[:, :k] = indices
+    return padded
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -715,6 +746,7 @@ def rocm_aiter_sparse_attn_indexer(
             scale_fmt,
         )
 
+    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
@@ -1155,12 +1187,10 @@ def _sparse_attn_prefill_ragged_kernel(
     kv_len = kv_end - kv_start
 
     k_offsets = tl.arange(0, BLOCK_K)
-    slot = tl.load(
-        kv_indices_ptr + kv_start + k_offsets, mask=k_offsets < kv_len, other=-1
-    )
     for k_start in tl.range(0, kv_len, BLOCK_K):
         k_pos = k_start + k_offsets
         in_range = k_pos < kv_len
+        slot = tl.load(kv_indices_ptr + kv_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < num_kv)
         safe_slot = tl.where(valid, slot, 0)
 
@@ -1171,11 +1201,7 @@ def _sparse_attn_prefill_ragged_kernel(
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )
-
-        next_k_pos = k_start + BLOCK_K + k_offsets
-        slot = tl.load(
-            kv_indices_ptr + kv_start + next_k_pos, mask=next_k_pos < kv_len, other=-1
-        )
+        kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
 
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
@@ -1839,7 +1865,6 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
-    num_warps = 4
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
@@ -1864,7 +1889,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        num_warps=num_warps,
+        num_warps=8,
     )
     return out
 
@@ -2072,7 +2097,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    if not _ON_GFX950:  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2173,7 +2198,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_warps=4,
     )
 
-    _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
+    _sparse_attn_decode_reduce_kernel[(num_queries, heads_blocks)](
         part_m,
         part_l,
         part_acc,
@@ -2189,7 +2214,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         num_heads,
         HAS_ATTN_SINK=has_attn_sink,
         COMB_DIM=comb_dim,
-        BLOCK_H=1,
+        BLOCK_H=block_h,
         NUM_SPLITS=num_splits,
         SPLITS_PAD=triton.next_power_of_2(num_splits),
         num_warps=4,

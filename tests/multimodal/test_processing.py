@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from vllm.config import ModelConfig
-from vllm.exceptions import VLLMValidationError
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.processing.context import InputProcessingContext
 from vllm.multimodal.processing.processor import (
@@ -932,11 +931,7 @@ def test_limit_mm_per_prompt_apply(model_id, num_images, limit, is_valid):
     else:
         mm_data = {"image": [image] * num_images}
 
-    exc_ctx = (
-        nullcontext()
-        if is_valid
-        else pytest.raises(VLLMValidationError, match="At most")
-    )
+    exc_ctx = nullcontext() if is_valid else pytest.raises(ValueError, match="At most")
 
     with exc_ctx:
         processor(

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash as _, Hasher as _};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,13 +11,11 @@ use tokio::sync::mpsc;
 use tokio::task::yield_now;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use vllm_engine_core_client::protocol::output::{
-    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-    UtilityCallOutput,
-};
-use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::utility::{
     EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
+};
+use vllm_engine_core_client::protocol::{
+    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
 };
 
 use super::Opt;
@@ -65,14 +60,13 @@ fn empty_finish_outputs(
     let output = request_output(request_id, Vec::new(), Some(finish_reason));
     let finished_requests = BTreeSet::from([output.request_id.clone()]);
 
-    RequestBatchOutputs {
+    EngineCoreOutputs {
         engine_index,
         outputs: vec![output],
         timestamp: now_secs(),
         finished_requests: Some(finished_requests),
         ..Default::default()
     }
-    .into()
 }
 
 /// Encode a utility result into the protocol's msgpack value envelope.
@@ -103,16 +97,16 @@ fn utility_response(
         _ => utility_envelope(Value::Nil),
     }?;
 
-    Ok(UtilityCallOutput {
+    Ok(EngineCoreOutputs {
         engine_index,
-        timestamp: now_secs(),
-        output: UtilityOutput {
+        utility_output: Some(UtilityOutput {
             call_id: request.call_id,
             failure_message: None,
             result: Some(result),
-        },
-    }
-    .into())
+        }),
+        timestamp: now_secs(),
+        ..Default::default()
+    })
 }
 
 /// Message sent from the frontend to the mock engine task to drive the engine loop.
@@ -275,14 +269,13 @@ impl Engine {
                 }
                 for (client_index, (client_outputs, finished_requests)) in outputs_by_client {
                     outputs.push({
-                        let outputs = RequestBatchOutputs {
+                        let outputs = EngineCoreOutputs {
                             engine_index: self.engine_index,
                             outputs: client_outputs,
                             timestamp: now_secs(),
                             finished_requests: Some(finished_requests),
                             ..Default::default()
-                        }
-                        .into();
+                        };
                         EngineOutput {
                             client_index,
                             outputs,
@@ -364,15 +357,14 @@ impl Engine {
             .filter_map(|(client_index, (outputs, finished_requests))| {
                 (!outputs.is_empty()).then(|| EngineOutput {
                     client_index,
-                    outputs: RequestBatchOutputs {
+                    outputs: EngineCoreOutputs {
                         engine_index: self.engine_index,
                         outputs,
                         timestamp: now_secs(),
                         finished_requests: (!finished_requests.is_empty())
                             .then_some(finished_requests),
                         ..Default::default()
-                    }
-                    .into(),
+                    },
                 })
             })
             .collect()

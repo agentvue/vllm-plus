@@ -158,6 +158,13 @@ class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
             input_dtype=dtype,
         )
 
+        if not current_platform.is_fp8_fnuz():
+            kernel = self.w8a8_block_fp8_linear.kernel
+            orig_quant = kernel.quant_fp8
+            kernel.quant_fp8 = lambda *a, use_triton=False, **kw: orig_quant(
+                *a, use_triton=True, **kw
+            )
+
         self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
 
     def forward(self, x):
@@ -168,7 +175,9 @@ class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
     def ops_in_model_before(self):
         return [
             SILU_MUL_OP if self.enable_silu_mul_custom_op else torch.ops.aten.mul,
-            rocm_aiter_ops.get_group_quant_op(),
+            rocm_aiter_ops.get_group_quant_op()
+            if current_platform.is_fp8_fnuz()
+            else torch.ops.vllm.triton_per_token_group_quant_fp8.default,
         ]
 
     def ops_in_model_after(self):

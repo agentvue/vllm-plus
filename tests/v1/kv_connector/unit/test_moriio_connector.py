@@ -195,14 +195,7 @@ class FakeMoRIIOWrapper:
     def _handle_completion_message(self, msg: str):
         pass
 
-    def send_notify(
-        self,
-        req_ids,
-        remote_ip,
-        remote_port,
-        message_type=None,
-        message_fields=None,
-    ):
+    def send_notify(self, req_ids, remote_ip, remote_port, message_type=None):
         pass
 
     def pop_finished_req_ids(self):

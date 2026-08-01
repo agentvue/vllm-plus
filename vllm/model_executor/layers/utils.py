@@ -122,7 +122,7 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -164,11 +164,7 @@ def rocm_unquantized_gemm_impl(
     if use_skinny_reduce_counting:
         return ops.wvSplitKrc(x, weight, cu_count, bias)
 
-    # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
-    # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
-    # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
-    # hidden), so skip aiter there and fall back to the torch GEMM path below.
-    if use_aiter_triton_gemm(n, m, k, x.dtype) and not (on_gfx1250() and k % 256 != 0):
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)
@@ -176,8 +172,6 @@ def rocm_unquantized_gemm_impl(
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
         and (on_gfx9() or on_gfx1x())
-        # build (gfx9/gfx11 ISA); fall back to torch GEMM there.
-        # TODO GFX1250: Include once skinny GEMM is supported on gfx1250
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
     )
@@ -240,27 +234,17 @@ def dispatch_cpu_unquantized_gemm(
         layer.cpu_linear = torch.nn.functional.linear
         return
 
-    # Skip CPU GEMM dispatch for non-2D weights (e.g. MoE 3D expert weights).
-    # These layers are handled by their own specialized methods.
     if layer.weight.ndim != 2:
         # this is not a linear layer
-        # For now it should be a causal_conv1d op or MoE 3D expert weights
-        if torch.cpu._is_amx_tile_supported() and hasattr(
-            ops, "causal_conv1d_weight_pack"
-        ):
+        # For now it should be a causal_conv1d op
+        if torch.cpu._is_amx_tile_supported():
             # prepack conv weight
-            unpacked = (
+            layer.weight.data = ops.causal_conv1d_weight_pack(
                 layer.weight.view(
                     layer.weight.size(0),
                     layer.weight.size(2),
                 )
-                .contiguous()
-                .clone()
             )
-            # Stash the un-packed (dim, width) weight so the speculative-decode
-            # GDN path (which uses torch conv, not the AMX kernel) can use it.
-            layer._cpu_unpacked_conv_weight = unpacked
-            layer.weight.data = ops.causal_conv1d_weight_pack(unpacked)
         return
 
     N, K = layer.weight.size()

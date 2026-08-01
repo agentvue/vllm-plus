@@ -11,17 +11,11 @@ TieringOffloadingManager without requiring actual storage or network backends.
 
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 from typing_extensions import override
 
-from vllm.v1.kv_offload.base import (
-    LookupResult,
-    Medium,
-    OffloadKey,
-    ReqContext,
-    RequestOffloadingContext,
-)
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, RequestOffloadingContext
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     JobResult,
@@ -42,8 +36,6 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
     - Stores blocks in a dictionary (key -> True)
     - Completes transfers immediately (synchronous)
     """
-
-    medium: ClassVar[Medium] = Medium.CPU
 
     def __init__(
         self,
@@ -75,7 +67,7 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
         self.completed_jobs: list[JobResult] = []
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
         """
         Check whether a block exists in this secondary tier.
 
@@ -84,9 +76,9 @@ class ExampleSecondaryTierManager(SecondaryTierManager):
             req_context: Per-request context.
 
         Returns:
-            HIT if the block is present, MISS if not found.
+            True if the block is present, False if not found.
         """
-        return LookupResult.HIT if key in self.blocks else LookupResult.MISS
+        return key in self.blocks
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:

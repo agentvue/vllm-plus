@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +8,7 @@ use futures::stream::FusedStream;
 use futures::{Stream, StreamExt as _, pin_mut};
 use serde::{Deserialize, Serialize};
 use vllm_engine_core_client::protocol::logprobs::Logprobs;
-use vllm_engine_core_client::protocol::output::{EngineCoreFinishReason, StopReason};
+use vllm_engine_core_client::protocol::{EngineCoreFinishReason, StopReason};
 use vllm_engine_core_client::{AbortCause, EngineCoreOutputStream};
 
 use crate::error::Result;
@@ -41,9 +38,6 @@ pub struct CollectedGenerateOutput {
     pub usage: TokenUsage,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
-    /// Connector-specific encoder cache transfer parameters for disaggregated
-    /// serving.
-    pub ec_transfer_params: Option<serde_json::Value>,
 }
 
 /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
@@ -75,7 +69,7 @@ pub enum FinishReason {
     /// A retryable request-level internal error occurred.
     Error,
     /// A repetitive token pattern was detected.
-    Repetition(Option<StopReason>),
+    Repetition,
 }
 
 impl FinishReason {
@@ -93,7 +87,7 @@ impl FinishReason {
             Self::Length => "length",
             Self::Abort => "abort",
             Self::Error => "error",
-            Self::Repetition(_) => "repetition",
+            Self::Repetition => "repetition",
         }
     }
 
@@ -102,7 +96,6 @@ impl FinishReason {
     pub fn as_stop_reason(&self) -> Option<&StopReason> {
         match self {
             Self::Stop(stop_reason) => stop_reason.as_ref(),
-            Self::Repetition(stop_reason) => stop_reason.as_ref(),
             _ => None,
         }
     }
@@ -112,7 +105,6 @@ impl FinishReason {
     pub fn into_stop_reason(self) -> Option<StopReason> {
         match self {
             Self::Stop(stop_reason) => stop_reason,
-            Self::Repetition(stop_reason) => stop_reason,
             _ => None,
         }
     }
@@ -127,7 +119,7 @@ fn finish_reason_from_engine(
         EngineCoreFinishReason::Length => FinishReason::Length,
         EngineCoreFinishReason::Abort => FinishReason::Abort,
         EngineCoreFinishReason::Error => FinishReason::Error,
-        EngineCoreFinishReason::Repetition => FinishReason::Repetition(stop_reason),
+        EngineCoreFinishReason::Repetition => FinishReason::Repetition,
     })
 }
 
@@ -152,9 +144,6 @@ pub struct GenerateOutput {
     pub cached_token_count: usize,
     /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
-    /// Connector-specific encoder cache transfer parameters for disaggregated
-    /// serving.
-    pub ec_transfer_params: Option<serde_json::Value>,
 }
 
 impl GenerateOutput {
@@ -201,7 +190,6 @@ impl GenerateOutput {
             finish_reason,
             cached_token_count: 0,
             kv_transfer_params: None,
-            ec_transfer_params: None,
         }
     }
 }
@@ -258,7 +246,12 @@ impl Stream for GenerateOutputStream {
         };
 
         let received_at = current_unix_timestamp_secs();
-        self.request_metrics.observe_output(raw.timestamp, received_at, &raw.output);
+        self.request_metrics.observe_output(
+            raw.engine_index,
+            raw.timestamp,
+            received_at,
+            &raw.output,
+        );
 
         let raw = raw.output;
 
@@ -290,7 +283,6 @@ impl Stream for GenerateOutputStream {
             finish_reason,
             cached_token_count,
             kv_transfer_params: raw.kv_transfer_params,
-            ec_transfer_params: raw.ec_transfer_params,
         };
 
         Poll::Ready(Some(Ok(output)))
@@ -373,7 +365,6 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                             cached_token_count,
                         },
                         kv_transfer_params: None,
-                        ec_transfer_params: None,
                     });
                 }
 
@@ -386,7 +377,6 @@ impl<T: Stream<Item = Result<GenerateOutput>> + Send> T {
                         cached_token_count,
                     };
                     collected.kv_transfer_params = output.kv_transfer_params;
-                    collected.ec_transfer_params = output.ec_transfer_params;
                     return Ok(collected);
                 }
             }

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "machete_prepack_kernel.cuh"
-#include "libtorch_stable/cutlass_extensions/torch_utils.hpp"
+#include "cutlass_extensions/torch_utils.hpp"
 #include "core/scalar_type.hpp"
 #include "libtorch_stable/torch_utils.h"
 

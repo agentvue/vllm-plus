@@ -40,5 +40,4 @@ async def test_show_version(server: RemoteOpenAIServer):
     response = client.get(server.url_for("version"))
     response.raise_for_status()
 
-    # Tolerate additive fields (e.g. the Rust frontend reports its own version).
-    assert response.json()["version"] == VLLM_VERSION
+    assert response.json() == {"version": VLLM_VERSION}

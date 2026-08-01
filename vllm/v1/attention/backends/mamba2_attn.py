@@ -16,7 +16,7 @@ from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadata,
     BaseMambaAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 def compute_varlen_chunk_metadata(
@@ -118,7 +118,7 @@ class Mamba2AttentionMetadataBuilder(
 
     def __init__(
         self,
-        kv_cache_spec: MambaSpec,
+        kv_cache_spec: AttentionSpec,
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::collections::HashMap;
 use std::slice;
 
@@ -94,23 +91,7 @@ pub enum ContentPart {
         uuid: Option<String>,
     },
     #[serde(rename = "video_url")]
-    VideoUrl {
-        video_url: VideoUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        uuid: Option<String>,
-    },
-    #[serde(rename = "audio_url")]
-    AudioUrl {
-        audio_url: AudioUrl,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        uuid: Option<String>,
-    },
-    #[serde(rename = "input_audio")]
-    InputAudio {
-        input_audio: InputAudio,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        uuid: Option<String>,
-    },
+    VideoUrl { video_url: VideoUrl },
 }
 
 #[serde_with::skip_serializing_none]
@@ -123,19 +104,6 @@ pub struct ImageUrl {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct VideoUrl {
     pub url: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct AudioUrl {
-    pub url: String,
-}
-
-/// Base64-encoded audio bytes in OpenAI `input_audio` form.
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct InputAudio {
-    pub data: String,
-    pub format: Option<String>,
 }
 
 // ============================================================================
@@ -343,9 +311,7 @@ pub enum MessageContent {
 // ============================================================================
 
 /// Mirrors the Python vLLM `UsageInfo` class.
-///
-/// Do not skip serializing `None` fields here: non-streaming response types
-/// should serialize `None` as explicit `null`.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
@@ -436,12 +402,14 @@ pub struct LogProbs {
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProbs` class.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbs {
     pub content: Option<Vec<ChatLogProbsContent>>,
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProbsContent` class.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbsContent {
     pub token: String,
@@ -451,6 +419,7 @@ pub struct ChatLogProbsContent {
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProb` class.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLogProb {
     pub token: String,
@@ -467,6 +436,7 @@ pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorDetail {
     pub message: String,

@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.logits_process import LogitsProcessor as RequestLogitsProcessor
 from vllm.sampling_params import SamplingParams
@@ -229,12 +228,7 @@ def validate_logits_processors_parameters(
         tuple(logits_processors) if logits_processors is not None else None
     )
     for logits_procs in cached_load_custom_logitsprocs(logits_processors):
-        try:
-            logits_procs.validate_params(sampling_params)
-        except ValueError as e:
-            # Legacy custom logitsprocs may still raise ValueError from
-            # validate_params; convert for backward compatibility.
-            raise VLLMValidationError(str(e)) from e
+        logits_procs.validate_params(sampling_params)
 
 
 class AdapterLogitsProcessor(LogitsProcessor):

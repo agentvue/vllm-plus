@@ -194,6 +194,11 @@ def _get_gcn_arch() -> str:
         return _query_gcn_arch_from_amdsmi()
     except Exception as e:
         logger.debug("Failed to get GCN arch via amdsmi: %s", e)
+        logger.warning_once(
+            "Failed to get GCN arch via amdsmi, falling back to torch.cuda. "
+            "This will initialize CUDA and may cause "
+            "issues if CUDA_VISIBLE_DEVICES is not set yet."
+        )
     # Ultimate fallback: use torch.cuda (will initialize CUDA)
     return torch.cuda.get_device_properties("cuda").gcnArchName
 
@@ -213,11 +218,6 @@ _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
-_ON_GFX1250 = "gfx1250" in _GCN_ARCH
-
-_ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
-# RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
-_ON_RDNA = _ON_GFX1X and not _ON_CDNA
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -292,7 +292,7 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 
 def on_gfx1x() -> bool:
-    return _ON_GFX1X and not _ON_CDNA
+    return _ON_GFX1X
 
 
 def on_gfx11() -> bool:
@@ -308,11 +308,7 @@ def on_gfx1151() -> bool:
 
 
 def on_gfx12x() -> bool:
-    return _ON_GFX12X and not _ON_CDNA
-
-
-def on_gfx1250() -> bool:
-    return _ON_GFX1250
+    return _ON_GFX12X
 
 
 def on_mi3xx() -> bool:
@@ -335,33 +331,13 @@ def on_gfx950() -> bool:
     return _ON_GFX950
 
 
-def on_cdna() -> bool:
-    return _ON_CDNA
-
-
-def on_rdna() -> bool:
-    return _ON_RDNA
-
-
-def get_cdna_version() -> int:
-    if on_gfx90a():
-        return 2
-    if on_gfx942():
-        return 3
-    if on_gfx950():
-        return 4
-    if on_gfx1250():
-        return 5
-    return 0
-
-
 # Enable HIP online tuning early, before hipBLASLt initializes.
 # Turn on hipBLASLt online tuning if use AITER hipBLASLt GEMM.
 if (
     envs.VLLM_ROCM_USE_AITER
     and envs.VLLM_ROCM_USE_AITER_LINEAR
     and envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
-    and get_cdna_version() > 2
+    and on_mi3xx()
 ):
     os.environ["HIP_ONLINE_TUNING"] = "1"
 
@@ -380,7 +356,7 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
-    if on_cdna():
+    if _ON_GFX9:
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
@@ -413,21 +389,9 @@ def flash_attn_triton_available() -> bool:
     try:
         from importlib.util import find_spec
 
-        # Locate the Triton-AMD kernels. Older ROCm/flash-attention (pre
-        # 2026-03) shipped them as the flash_attn.flash_attn_triton_amd
-        # subpackage. The main_perf migration commit 3f94643 moved them
-        # into aiter at aiter.ops.triton._triton_kernels.flash_attn_triton_amd,
-        # so accept either location.
-        def _has_spec(name: str) -> bool:
-            try:
-                return find_spec(name) is not None
-            except (ImportError, ValueError):
-                return False
-
-        if not (
-            _has_spec("flash_attn.flash_attn_triton_amd")
-            or _has_spec("aiter.ops.triton._triton_kernels.flash_attn_triton_amd")
-        ):
+        if find_spec("flash_attn") is None:
+            return False
+        if find_spec("flash_attn.flash_attn_triton_amd") is None:
             return False
         if os.environ.get("FLASH_ATTENTION_TRITON_AMD_ENABLE") != "TRUE":
             logger.info_once(
@@ -463,8 +427,8 @@ def _get_backend_priorities(
             ]
 
     backends = []
-    # Keep ROCM_ATTN disabled for KV connectors until connector transfer
-    # semantics are validated for its asymmetric native K/V cache views.
+    # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
+    # incompatible with KV connectors that require blocks-first layout.
     if not use_kv_connector:
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
@@ -497,6 +461,7 @@ class RocmPlatform(Platform):
         "auto_awq",
         "awq_marlin",  # will be overwritten with awq
         "gptq",
+        "gptq_marlin",
         "auto_gptq",
         "fp8",
         "deepseek_v4_fp8",
@@ -547,20 +512,6 @@ class RocmPlatform(Platform):
             attn_selector_config.use_sparse,
             attn_selector_config.use_kv_connector,
         )
-        from vllm.config import get_current_vllm_config_or_none
-
-        vllm_config = get_current_vllm_config_or_none()
-        is_encoder_decoder = (
-            getattr(getattr(vllm_config, "model_config", None), "attn_type", None)
-            == "encoder_decoder"
-        )
-        # ROCM_ATTN still uses a legacy attention layout (KV is the outer
-        # dimension) that is incompatible with the encoder backend layouts. The
-        # encoder and decoder need the layouts to match. This is currently
-        # enforced implicitly.
-        # TODO: Make this explicit in the selector in a future PR.
-        if is_encoder_decoder and AttentionBackendEnum.ROCM_ATTN in backend_priorities:
-            backend_priorities.remove(AttentionBackendEnum.ROCM_ATTN)
         for priority, backend in enumerate(backend_priorities):
             try:
                 backend_class = backend.get_class()
@@ -693,12 +644,12 @@ class RocmPlatform(Platform):
 
         from vllm._aiter_ops import rocm_aiter_ops
 
-        if rocm_aiter_ops.is_mha_enabled() and on_cdna():
+        if rocm_aiter_ops.is_enabled() and on_gfx9():
             logger.info_once("Using AITER Flash Attention backend for ViT model.")
             return AttentionBackendEnum.ROCM_AITER_FA
 
         if (
-            on_cdna()
+            on_gfx9()
             and find_spec("flash_attn") is not None
             and (dtype == torch.float16 or dtype == torch.bfloat16)
         ):
@@ -914,11 +865,11 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_mx(cls) -> bool:
-        return any(gfx in _GCN_ARCH for gfx in ["gfx95", "gfx1250"])
+        return any(gfx in _GCN_ARCH for gfx in ["gfx95"])
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_gfx12x()
+        return on_gfx9() or on_gfx12x()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:

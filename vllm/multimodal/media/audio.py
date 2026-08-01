@@ -14,7 +14,6 @@ from vllm.logger import init_logger
 from vllm.multimodal.audio import resample_audio_pyav
 from vllm.utils.import_utils import PlaceholderModule
 from vllm.utils.serial_utils import tensor2base64
-from vllm.utils.sparse_utils import check_sparse_tensor_invariants_threadsafe
 
 from .base import MediaIO
 
@@ -283,7 +282,9 @@ class AudioEmbeddingMediaIO(MediaIO[torch.Tensor]):
 
     def load_bytes(self, data: bytes) -> torch.Tensor:
         buffer = BytesIO(data)
-        with check_sparse_tensor_invariants_threadsafe():
+        # Enable sparse tensor integrity checks to prevent out-of-bounds
+        # writes from maliciously crafted tensors
+        with torch.sparse.check_sparse_tensor_invariants():
             tensor = torch.load(buffer, weights_only=True)
             return tensor.to_dense()
 
@@ -291,7 +292,9 @@ class AudioEmbeddingMediaIO(MediaIO[torch.Tensor]):
         return self.load_bytes(pybase64.b64decode(data, validate=True))
 
     def load_file(self, filepath: Path) -> torch.Tensor:
-        with check_sparse_tensor_invariants_threadsafe():
+        # Enable sparse tensor integrity checks to prevent out-of-bounds
+        # writes from maliciously crafted tensors
+        with torch.sparse.check_sparse_tensor_invariants():
             tensor = torch.load(filepath, weights_only=True)
             return tensor.to_dense()
 

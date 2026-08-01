@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Mamba conv-state sub-projection decomposition for NIXL transfer.
+"""Mamba conv-state sub-projection decomposition for the 3-read transfer.
 
 With DS conv state layout (dim, state_len), sub-projections are
-contiguous in memory.  Each D rank reads its slices via separate
+contiguous in memory.  Each D rank reads its slices via 3 separate
 RDMA transfers — no P-side permutation needed.
 
 Supported model types:
-  - Mamba1: conv = [x], temporal = (intermediate_size, state_size)
   - Mamba2: conv = [x, B, C], temporal = (num_heads, head_dim)
   - GDN (Gated Delta Net): conv = [Q, K, V] (dim(Q)==dim(K)),
     temporal = (num_v_heads, v_dim, k_dim)
@@ -25,21 +24,18 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 @dataclass(frozen=True)
 class MambaConvSplitInfo:
-    """Per-rank byte sizes of the conv sub-projections.
+    """Per-rank byte sizes of the 3 conv sub-projections.
 
     Used by both P and D sides for NIXL descriptor registration.
     All fields are LOCAL to this engine's TP (already divided by TP size).
 
     DS memory layout within one page (contiguous):
-      Mamba1: |---- x ----|  (single sub-projection, no decomposition)
       Mamba2: |-- x --|- B -|- C -|  (B == C)
       GDN:    |- Q -|- K -|-- V --|  (dim(Q)==dim(K), V may differ)
     """
 
     conv_rows: int  # conv_kernel - 1 (typically 3)
-    # Per-rank column counts per sub-projection:
-    # 1 entry for Mamba1, 3 for Mamba2/GDN.
-    local_proj_dims: tuple[int, ...]
+    local_proj_dims: tuple[int, int, int]  # per-rank column counts per sub-proj
     conv_dtype_size: int  # bytes per element (e.g. 2 for float16)
     ssm_sizes: tuple[int, int]  # (conv_state_bytes, ssm_state_bytes)
 
@@ -49,10 +45,10 @@ class MambaConvSplitInfo:
         return sum(self.local_proj_dims)
 
     @property
-    def proj_bytes(self) -> tuple[int, ...]:
-        """Byte sizes of the sub-projections for one rank."""
+    def proj_bytes(self) -> tuple[int, int, int]:
+        """Byte sizes of the 3 sub-projections for one rank."""
         row_bytes = self.conv_rows * self.conv_dtype_size
-        return tuple(d * row_bytes for d in self.local_proj_dims)
+        return tuple(d * row_bytes for d in self.local_proj_dims)  # type: ignore[return-value]
 
     @property
     def local_conv_offsets(self) -> list[tuple[int, int]]:
@@ -61,12 +57,8 @@ class MambaConvSplitInfo:
 
         Used by both P and D for local descriptor registration.
         """
-        offsets: list[tuple[int, int]] = []
-        offset = 0
-        for size in self.proj_bytes:
-            offsets.append((offset, size))
-            offset += size
-        return offsets
+        conv0, conv1, conv2 = self.proj_bytes
+        return [(0, conv0), (conv0, conv1), (conv0 + conv1, conv2)]
 
     def remote_conv_offsets(
         self, local_rank_offset: int, tp_ratio: int
@@ -84,23 +76,28 @@ class MambaConvSplitInfo:
                        P page.  Local dims are scaled down by |tp_ratio|
                        to get P-sized offsets.
         """
-        offsets: list[tuple[int, int]] = []
+        conv0, conv1, conv2 = self.proj_bytes
         if tp_ratio >= 1:
-            remote_base = 0
-            for size in self.proj_bytes:
-                offsets.append((remote_base + local_rank_offset * size, size))
-                remote_base += size * tp_ratio
+            remote_conv0 = conv0 * tp_ratio
+            remote_conv1 = conv1 * tp_ratio
+            return [
+                (local_rank_offset * conv0, conv0),
+                (remote_conv0 + local_rank_offset * conv1, conv1),
+                (remote_conv0 + remote_conv1 + local_rank_offset * conv2, conv2),
+            ]
         else:
             # NOTE (ZhanqiuHu): tp_ratio < 0 means P_TP > D_TP, so P pages
             # are smaller than D's. Local dims are D-sized, but we need
             # P-sized offsets. Scale down by |tp_ratio|.
             abs_ratio = -tp_ratio
-            remote_base = 0
-            for size in self.proj_bytes:
-                remote_size = size // abs_ratio
-                offsets.append((remote_base, remote_size))
-                remote_base += remote_size
-        return offsets
+            remote_conv0 = conv0 // abs_ratio
+            remote_conv1 = conv1 // abs_ratio
+            remote_conv2 = conv2 // abs_ratio
+            return [
+                (0, remote_conv0),
+                (remote_conv0, remote_conv1),
+                (remote_conv0 + remote_conv1, remote_conv2),
+            ]
 
 
 def derive_mamba_conv_split(
@@ -123,13 +120,12 @@ def derive_mamba_conv_split(
         conv_dtype_size, and ssm_sizes (conv_state_bytes, ssm_state_bytes).
     """
     _supported = (
-        MambaAttentionBackendEnum.MAMBA1,
         MambaAttentionBackendEnum.MAMBA2,
         MambaAttentionBackendEnum.GDN_ATTN,
     )
     if mamba_spec.mamba_type not in _supported:
         raise NotImplementedError(
-            f"Conv transfer only supports Mamba1, Mamba2 and GDN models, "
+            f"3-read conv transfer only supports Mamba2 and GDN models, "
             f"got mamba_type={mamba_spec.mamba_type!r}."
         )
 
@@ -153,18 +149,7 @@ def derive_mamba_conv_split(
     conv_state_bytes = torch.Size(mamba_spec.shapes[0]).numel() * conv_dtype_size
     ssm_state_bytes = torch.Size(mamba_spec.shapes[1]).numel() * ssm_dtype_size
 
-    local_proj_dims: tuple[int, ...]
-    if mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA1:
-        # Mamba1 conv state holds only x (no B/C), so it's a single
-        # contiguous TP shard with no sub-projection decomposition.
-        temporal_shape = mamba_spec.shapes[1]
-        assert temporal_shape[0] == local_conv_dim, (
-            f"Mamba1 temporal state dim ({temporal_shape[0]}) doesn't match "
-            f"conv dim ({local_conv_dim}); both should be "
-            f"intermediate_size/TP."
-        )
-        local_proj_dims = (local_conv_dim,)
-    elif mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA2:
+    if mamba_spec.mamba_type == MambaAttentionBackendEnum.MAMBA2:
         # NOTE (ZhanqiuHu): intermediate_size (= global x dim) is not stored
         # in MambaSpec, so we reconstruct it from the SSM temporal state shape:
         #   shapes[1] = (local_num_heads, head_dim), already divided by TP.

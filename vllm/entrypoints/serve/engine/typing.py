@@ -15,14 +15,7 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponse,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
-    DerenderChatRequest,
-    DerenderChatStreamRequest,
-    DerenderCompletionRequest,
-    DerenderCompletionStreamRequest,
-    GenerateRequest,
-    GenerateResponse,
-)
+from vllm.entrypoints.serve.disagg.protocol import GenerateRequest, GenerateResponse
 from vllm.entrypoints.serve.tokenize.protocol import (
     DetokenizeRequest,
     TokenizeChatRequest,
@@ -52,19 +45,11 @@ class RendererChatRequest(RendererRequest, Protocol):
 
 
 CompletionLikeRequest: TypeAlias = (
-    CompletionRequest
-    | TokenizeCompletionRequest
-    | DetokenizeRequest
-    | DerenderCompletionRequest
-    | DerenderCompletionStreamRequest
+    CompletionRequest | TokenizeCompletionRequest | DetokenizeRequest
 )
 
 ChatLikeRequest: TypeAlias = (
-    ChatCompletionRequest
-    | BatchChatCompletionRequest
-    | TokenizeChatRequest
-    | DerenderChatRequest
-    | DerenderChatStreamRequest
+    ChatCompletionRequest | BatchChatCompletionRequest | TokenizeChatRequest
 )
 
 SpeechToTextRequest: TypeAlias = TranscriptionRequest | TranslationRequest

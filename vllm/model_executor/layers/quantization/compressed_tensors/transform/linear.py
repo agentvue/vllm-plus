@@ -25,7 +25,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.transform.module
 from vllm.model_executor.layers.quantization.compressed_tensors.transform.utils import (  # noqa: E501
     TransformTuple,
 )
-from vllm.platforms import current_platform
 
 
 class CompressedTensorsLinearTransformMethod(LinearMethodBase):
@@ -49,12 +48,11 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
 
         assert input_tfms or output_tfms
 
-        if is_qutlass_fp4_scheme(
-            quant_scheme, input_tfms
-        ) and current_platform.has_device_capability(100):
+        if is_qutlass_fp4_scheme(quant_scheme, input_tfms):
             return QutlassNvFP4LinearMethod(quant_method, input_tfms, output_tfms)
 
         # hadacore or dense gemm is selected by Transform module
+
         return cls(quant_method, input_tfms, output_tfms)
 
     def __init__(

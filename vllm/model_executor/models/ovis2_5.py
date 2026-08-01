@@ -402,11 +402,12 @@ class Ovis2_5MultiModalProcessor(BaseMultiModalProcessor[Ovis2_5ProcessingInfo])
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> list[PromptReplacement]:
-        hf_processor = self.info.get_hf_processor()
+        tokenizer = self.info.get_tokenizer()
+        vocab = tokenizer.get_vocab()
 
         placeholder = {
-            "image": hf_processor.get_token_value("image_token"),
-            "video": hf_processor.get_token_value("video_token"),
+            "image": vocab[IMAGE_TOKEN],
+            "video": vocab[VIDEO_TOKEN],
         }
 
         def get_replacement_ovis(item_idx, modality: str):

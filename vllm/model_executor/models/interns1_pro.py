@@ -42,7 +42,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -173,7 +173,7 @@ class InternS1ProMoeSparseMoeBlock(nn.Module):
         # For custom routing function
         self.n_groups = getattr(config, "router_n_groups", -1)
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -513,6 +513,8 @@ class InternS1ProMoeMixtureOfExperts(MixtureOfExperts):
                 moe.experts.update_expert_map()
 
     def set_moe_parameters(self):
+        self.expert_weights = []
+
         self.moe_layers = []
         example_moe = None
         for layer in self.language_model.model.layers:
@@ -570,7 +572,10 @@ class InternS1ProForConditionalGeneration(
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-        self._init_video_pruning(multimodal_config)
+        self.video_pruning_rate = multimodal_config.video_pruning_rate
+        self.is_multimodal_pruning_enabled = (
+            multimodal_config.is_multimodal_pruning_enabled()
+        )
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen3_VisionTransformer(

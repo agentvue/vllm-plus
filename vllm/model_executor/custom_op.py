@@ -284,11 +284,7 @@ class CustomOp(nn.Module):
 
         enabled = f"+{cls.name}" in custom_ops
         disabled = f"-{cls.name}" in custom_ops
-        if enabled and disabled:
-            raise ValueError(
-                "custom_ops cannot both enable and disable the same operation: "
-                f"{cls.name}. Remove either the '+' or '-' directive"
-            )
+        assert not (enabled and disabled), f"Cannot enable and disable {cls.name}"
 
         return (CustomOp.default_on() or enabled) and not disabled
 
@@ -303,10 +299,7 @@ class CustomOp(nn.Module):
         compilation_config = get_cached_compilation_config()
         count_none = compilation_config.custom_ops.count("none")
         count_all = compilation_config.custom_ops.count("all")
-        if count_none + count_all != 1:
-            raise ValueError(
-                "custom_ops must contain exactly one base mode: 'all' or 'none'"
-            )
+        assert count_none + count_all == 1
 
         return not count_none > 0 or count_all > 0
 

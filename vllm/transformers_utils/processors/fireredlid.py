@@ -232,7 +232,7 @@ class FireRedLIDProcessor(ProcessorMixin):
     """
 
     feature_extractor_class = "FireRedLIDFeatureExtractor"
-    tokenizer_class = ("PythonBackend", "TokenizersBackend")
+    tokenizer_class = ("PreTrainedTokenizer", "PreTrainedTokenizerFast")
 
     def __init__(self, feature_extractor, tokenizer):
         super().__init__(feature_extractor, tokenizer)

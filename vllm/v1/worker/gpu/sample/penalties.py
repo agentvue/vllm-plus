@@ -120,7 +120,7 @@ def _penalties_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0).to(tl.int64)
+    token_idx = tl.program_id(0)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
     rep_penalty = tl.load(repetition_penalty_ptr + req_state_idx)
     freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)

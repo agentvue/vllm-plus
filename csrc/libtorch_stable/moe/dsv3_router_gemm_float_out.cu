@@ -78,7 +78,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaGridDependencySynchronize();
+  asm volatile("griddepcontrol.wait;");
 #endif
 
   // Process the GEMM in chunks
@@ -163,7 +163,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
+  asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 

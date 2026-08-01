@@ -30,16 +30,17 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
-)
-from vllm.entrypoints.generate.base.serving import (
-    GenerateBaseServing,
-    GenerationError,
+    get_tool_call_id_type,
 )
 from vllm.entrypoints.mcp.tool_server import ToolServer
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ErrorResponse,
     RequestResponseMetadata,
+)
+from vllm.entrypoints.openai.engine.serving import (
+    GenerationError,
+    OpenAIServing,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -54,10 +55,12 @@ from vllm.entrypoints.openai.responses.context import (
     HarmonyContext,
     ParsableContext,
     SimpleContext,
+    StreamingHarmonyContext,
 )
 from vllm.entrypoints.openai.responses.harmony import (
     construct_harmony_previous_input_messages,
     harmony_to_response_output,
+    parser_state_to_response_output,
     response_input_to_harmony,
 )
 from vllm.entrypoints.openai.responses.protocol import (
@@ -89,6 +92,7 @@ from vllm.entrypoints.openai.responses.utils import (
     extract_function_tool_names,
     extract_tool_types,
 )
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
@@ -99,7 +103,6 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import Parser, ParserManager
-from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
@@ -147,12 +150,12 @@ def _extract_allowed_tools_from_mcp_requests(
     return allowed_tools_map
 
 
-class OpenAIServingResponses(GenerateBaseServing):
+class OpenAIServingResponses(OpenAIServing):
     def __init__(
         self,
         engine_client: EngineClient,
         models: OpenAIServingModels,
-        online_renderer: OnlineRenderer,
+        openai_serving_render: OpenAIServingRender,
         *,
         request_logger: RequestLogger | None,
         chat_template: str | None,
@@ -174,7 +177,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             return_tokens_as_token_ids=return_tokens_as_token_ids,
         )
 
-        self.online_renderer = online_renderer
+        self.openai_serving_render = openai_serving_render
         self.chat_template = chat_template
         self.chat_template_content_format: Final = chat_template_content_format
         self.chat_template_kwargs = default_chat_template_kwargs or {}
@@ -219,6 +222,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 "For gpt-oss, we ignore --enable-auto-tool-choice "
                 "and always enable tool use."
             )
+
+        self.tool_call_id_type = get_tool_call_id_type(self.model_config)
+
         self.enable_auto_tools = enable_auto_tools
         # HACK(woosuk): This is a hack. We should use a better store.
         # FIXME: If enable_store=True, this may cause a memory leak since we
@@ -266,7 +272,6 @@ class OpenAIServingResponses(GenerateBaseServing):
             tokenizer,
             request.tools,
             chat_template_kwargs=chat_template_kwargs,
-            model_config=self.model_config,
         )
 
     def _validate_generator_input(
@@ -460,12 +465,20 @@ class OpenAIServingResponses(GenerateBaseServing):
             context: ConversationContext
             function_tool_names = extract_function_tool_names(request.tools)
             if self.use_harmony:
-                context = HarmonyContext(
-                    messages,
-                    available_tools,
-                    function_tool_names,
-                    response_parser=response_parser,
-                )
+                if request.stream:
+                    context = StreamingHarmonyContext(
+                        messages,
+                        available_tools,
+                        function_tool_names,
+                        response_parser=response_parser,
+                    )
+                else:
+                    context = HarmonyContext(
+                        messages,
+                        available_tools,
+                        function_tool_names,
+                        response_parser=response_parser,
+                    )
             else:
                 if envs.VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT:
                     # This is a feature in development for parsing
@@ -480,6 +493,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                         chat_template=self.chat_template,
                         chat_template_content_format=self.chat_template_content_format,
                         enable_auto_tools=self.enable_auto_tools,
+                        tool_call_id_type=self.tool_call_id_type,
                     )
                 else:
                     context = SimpleContext(
@@ -610,13 +624,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
     ):
-        tool_dicts = construct_tool_dicts(
-            request.tools,
-            request.tool_choice,
-            exclude_tools_when_tool_choice_none=(
-                self.online_renderer.exclude_tools_when_tool_choice_none
-            ),
-        )
+        tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
         # Construct the input messages.
         messages = construct_input_messages(
             request_instructions=request.instructions,
@@ -625,7 +633,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             prev_response_output=prev_response.output if prev_response else None,
         )
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
-        _, engine_inputs = await self.online_renderer.preprocess_chat(
+        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
             request,
             messages,
             default_template=self.chat_template,
@@ -649,7 +657,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             request_input=messages,
         )
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
-        _, engine_inputs = await self.online_renderer.preprocess_chat(
+        _, engine_inputs = await self.openai_serving_render.preprocess_chat(
             request,
             new_messages,
             default_template=chat_template,
@@ -714,7 +722,7 @@ class OpenAIServingResponses(GenerateBaseServing):
 
             # Create inputs for the next turn.
             # Render the next prompt token ids and update sampling_params.
-            if isinstance(context, HarmonyContext):
+            if isinstance(context, (HarmonyContext, StreamingHarmonyContext)):
                 token_ids = context.render_for_completion()
                 engine_input = tokens_input(token_ids)
 
@@ -810,20 +818,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         output_messages: ResponseInputOutputMessage | None = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
-            output = []
-            harmony_msgs = context.messages[context.num_init_messages :]
-            if harmony_msgs:
-                fn_names = context.function_tool_names
-                for msg in harmony_msgs[:-1]:
-                    output.extend(harmony_to_response_output(msg, fn_names))
-                output.extend(
-                    harmony_to_response_output(
-                        harmony_msgs[-1],
-                        fn_names,
-                        incomplete=context.last_append_flush_status,
-                    )
-                )
-
+            output = self._make_response_output_items_with_harmony(context)
             if request.enable_response_messages:
                 input_messages = context.messages[: context.num_init_messages]
                 output_messages = context.messages[context.num_init_messages :]
@@ -938,7 +933,6 @@ class OpenAIServingResponses(GenerateBaseServing):
             status=status,
             usage=usage,
             kv_transfer_params=context.kv_transfer_params,
-            ec_transfer_params=context.ec_transfer_params,
         )
 
         if request.store:
@@ -1073,17 +1067,13 @@ class OpenAIServingResponses(GenerateBaseServing):
                 final_output.text,
                 request,
                 enable_auto_tools=self.enable_auto_tools,
-                model_output_token_ids=final_output.token_ids,
             )
-            if not request.include_reasoning:
-                reasoning = None
-                logprobs = None
             return build_response_output_items(
                 reasoning=reasoning,
                 content=content,
                 tool_calls=tool_calls,
                 logprobs=logprobs,
-                tools=request.tools,
+                tool_call_id_type=self.tool_call_id_type,
             )
 
         # Fallback when no parser is configured
@@ -1105,6 +1095,21 @@ class OpenAIServingResponses(GenerateBaseServing):
                 type="message",
             )
         ]
+
+    def _make_response_output_items_with_harmony(
+        self,
+        context: HarmonyContext,
+    ) -> list[ResponseOutputItem]:
+        output_items: list[ResponseOutputItem] = []
+        num_init_messages = context.num_init_messages
+        fn_names = context.function_tool_names
+        for msg in context.messages[num_init_messages:]:
+            output_items.extend(harmony_to_response_output(msg, fn_names))
+        # Handle the generation stopped in the middle (if any).
+        last_items = parser_state_to_response_output(context.parser, fn_names)
+        if last_items:
+            output_items.extend(last_items)
+        return output_items
 
     def _get_harmony_builtin_tool_descriptions(
         self, request: ResponsesRequest, tool_types: set[str]
@@ -1186,6 +1191,30 @@ class OpenAIServingResponses(GenerateBaseServing):
             # instructions are ignored.
             prev_msgs = self.msg_store[prev_response.id]
 
+            # FIXME(woosuk): The slice-delete-reappend cycle below is
+            # currently a no-op --- it removes messages then puts them all
+            # back unfiltered. It may be intentionally deferred (see FIXME
+            # above) or redundant if the Harmony encoder already strips
+            # analysis messages at render time. If analysis messages need
+            # to be dropped here, add a channel != "analysis" filter when
+            # re-appending, similar to auto_drop_analysis_messages in
+            # harmony_utils.py.
+            if len(prev_msgs) > 0:
+                last_msg = prev_msgs[-1]
+                assert isinstance(last_msg, OpenAIHarmonyMessage)
+                if last_msg.channel == "final":
+                    prev_final_msg_idx = -1
+                    for i in range(len(prev_msgs) - 2, -1, -1):
+                        prev_msg_i = prev_msgs[i]
+                        assert isinstance(prev_msg_i, OpenAIHarmonyMessage)
+                        if prev_msg_i.channel == "final":
+                            prev_final_msg_idx = i
+                            break
+                    recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
+                    del prev_msgs[prev_final_msg_idx + 1 :]
+                    for msg in recent_turn_msgs:
+                        assert isinstance(msg, OpenAIHarmonyMessage)
+                        prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
         # Responses API supports simple text inputs without chat format.
@@ -1350,16 +1379,12 @@ class OpenAIServingResponses(GenerateBaseServing):
             [StreamingResponsesResponse], StreamingResponsesResponse
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
-        processor = SimpleStreamingEventProcessor(tools=request.tools)
-
-        hide_stream_metadata = not request.include_reasoning and self.parser is not None
+        processor = SimpleStreamingEventProcessor()
 
         def _get_logprobs(
             output: CompletionOutput,
         ) -> list[response_text_delta_event.Logprob]:
             if not request.is_include_output_logprobs():
-                return []
-            if hide_stream_metadata:
                 return []
             return self._create_stream_response_logprobs(
                 token_ids=output.token_ids,
@@ -1426,30 +1451,27 @@ class OpenAIServingResponses(GenerateBaseServing):
         state = StreamingState()
 
         async for ctx in result_generator:
-            assert isinstance(ctx, HarmonyContext)
+            assert isinstance(ctx, StreamingHarmonyContext)
 
             # finish_reason='error' indicates a retryable error
             self._raise_if_error(ctx.finish_reason, request.request_id)
 
-            for segment in ctx.last_append_segments:
-                if segment.delta:
-                    for event in emit_content_delta_events(
-                        segment, state, ctx.function_tool_names
-                    ):
-                        yield _increment_sequence_number_and_return(event)
-
-                elif completed_message := segment.completed_message:
-                    # TODO: Fix browser emitted as MCP calls
+            if ctx.is_expecting_start():
+                if len(ctx.parser.messages) > 0:
+                    previous_item = ctx.parser.messages[-1]
                     for event in emit_previous_item_done_events(
-                        completed_message, state, ctx.function_tool_names
+                        previous_item, state, ctx.function_tool_names
                     ):
                         yield _increment_sequence_number_and_return(event)
+                state.reset_for_new_item()
 
-                    for event in emit_tool_action_events(
-                        completed_message, state, self.tool_server
-                    ):
-                        yield _increment_sequence_number_and_return(event)
-                    state.reset_for_new_item()
+            # Stream the output of a harmony message
+            for event in emit_content_delta_events(ctx, state):
+                yield _increment_sequence_number_and_return(event)
+
+            # Stream tool call outputs
+            for event in emit_tool_action_events(ctx, state, self.tool_server):
+                yield _increment_sequence_number_and_return(event)
 
     async def responses_stream_generator(
         self,

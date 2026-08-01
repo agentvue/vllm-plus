@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for DeepSeekV32EngineToolParser.
+"""Unit tests for DeepSeekV32ToolParser.
 
 These tests use a minimal mock tokenizer so no real model weights are required.
 """
@@ -17,11 +17,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
-from vllm.tool_parsers.deepseekv32_engine_tool_parser import (
-    DeepSeekV32EngineToolParser,
-)
-
-pytestmark = pytest.mark.skip_global_cleanup
+from vllm.tool_parsers.deepseekv32_tool_parser import DeepSeekV32ToolParser
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,8 +30,8 @@ MOCK_TOKENIZER.get_vocab.return_value = {}
 MOCK_TOKENIZER.tokenize.return_value = []
 
 
-def make_parser(tools=None) -> DeepSeekV32EngineToolParser:
-    return DeepSeekV32EngineToolParser(MOCK_TOKENIZER, tools=tools)
+def make_parser(tools=None) -> DeepSeekV32ToolParser:
+    return DeepSeekV32ToolParser(MOCK_TOKENIZER, tools=tools)
 
 
 def make_tool_param(name: str, params: dict) -> MagicMock:
@@ -171,9 +167,9 @@ class TestExtractToolCalls:
         assert isinstance(args["enabled"], bool)
         assert isinstance(args["count"], int)
 
-    def test_string_attr_true_coerced_by_schema(self):
-        """string="true" delivers a string, but the engine's schema-aware
-        type fixer coerces it to the schema type (integer)."""
+    def test_string_attr_true_preserves_literal_despite_schema(self):
+        """string="true" must keep the value as a string even
+        if the schema says integer."""
         tool = ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="score",
@@ -196,8 +192,8 @@ class TestExtractToolCalls:
         result = parser.extract_tool_calls(model_output, None)
         assert result.tools_called
         args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"value": 42}
-        assert isinstance(args["value"], int)
+        assert args == {"value": "42"}
+        assert isinstance(args["value"], str)
 
     def test_string_attr_false_allows_schema_conversion(self):
         """string="false" allows the parser to convert via the tool schema."""
@@ -226,6 +222,7 @@ class TestExtractToolCalls:
         assert args == {"value": 42}
         assert isinstance(args["value"], int)
 
+    @pytest.mark.skip_global_cleanup
     def test_composed_schema_converts_object_and_array_params(self):
         """Composed JSON Schema types must still drive DSML type coercion."""
         tool = ChatCompletionToolsParam(
@@ -285,9 +282,8 @@ class TestExtractToolCalls:
         assert isinstance(args["wait"], dict)
         assert isinstance(args["patches"], list)
 
-    def test_string_attr_true_coerced_by_composed_schema(self):
-        """string="true" delivers a JSON string, but the engine's schema-aware
-        type fixer coerces it to the composed schema type (object)."""
+    @pytest.mark.skip_global_cleanup
+    def test_string_attr_true_preserves_literal_for_composed_schema(self):
         tool = ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="set_timer",
@@ -317,7 +313,7 @@ class TestExtractToolCalls:
         result = parser.extract_tool_calls(model_output, None)
         assert result.tools_called
         args = json.loads(result.tool_calls[0].function.arguments)
-        assert args == {"wait": {"type": "for", "minutes": 2880}}
+        assert args == {"wait": '{"type":"for","minutes":2880}'}
 
     def test_arguments_wrapper_repaired(self):
         """A single 'arguments' wrapper parameter must be unwrapped when it
@@ -490,9 +486,8 @@ class TestExtractToolCalls:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args["value"] is None
 
-    def test_null_coerced_back_to_string_by_schema(self):
-        """string="false" with 'null' is json-parsed to None, but the
-        engine's schema fixer coerces it back to "null" for string schemas."""
+    def test_null_not_coerced_without_null_in_schema(self):
+        """Literal 'null' must stay as a string when the schema is just 'string'."""
         tool = ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="echo",
@@ -517,8 +512,8 @@ class TestExtractToolCalls:
         assert args["text"] == "null"
         assert isinstance(args["text"], str)
 
-    def test_no_schema_parses_json(self):
-        """Without a tool schema, string='false' params are JSON-parsed."""
+    def test_no_schema_keeps_strings(self):
+        """Without a tool schema, all string='false' params default to string."""
         parser = make_parser(tools=None)
         model_output = (
             f"{FC_START}\n"
@@ -531,8 +526,8 @@ class TestExtractToolCalls:
         result = parser.extract_tool_calls(model_output, None)
         assert result.tools_called
         args = json.loads(result.tool_calls[0].function.arguments)
-        assert args["count"] == 42
-        assert args["flag"] is True
+        assert args["count"] == "42"
+        assert args["flag"] == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -653,9 +648,8 @@ class TestExtractToolCallsStreaming:
         args_str = self._reconstruct_args(deltas)
         assert json.loads(args_str) == {"x": 3, "y": 4}
 
-    def test_string_attr_true_coerced_by_schema_streaming(self):
-        """Streaming: string='true' delivers a string but the engine's
-        schema fixer coerces it to the schema type (integer)."""
+    def test_string_attr_true_preserves_literal_in_streaming(self):
+        """Streaming: string='true' must keep the value literal despite schema."""
         tool = ChatCompletionToolsParam(
             function=FunctionDefinition(
                 name="score",
@@ -678,9 +672,10 @@ class TestExtractToolCallsStreaming:
         deltas = self._stream(parser, full_text)
         args_str = self._reconstruct_args(deltas)
         args = json.loads(args_str)
-        assert args == {"value": 42}
-        assert isinstance(args["value"], int)
+        assert args == {"value": "42"}
+        assert isinstance(args["value"], str)
 
+    @pytest.mark.skip_global_cleanup
     def test_composed_schema_conversion_in_streaming(self):
         tool = ChatCompletionToolsParam(
             function=FunctionDefinition(
@@ -826,13 +821,13 @@ class TestExtractToolCallsStreaming:
         assert json.loads(self._reconstruct_args(deltas, tool_index=0)) == {"p": "v1"}
         assert json.loads(self._reconstruct_args(deltas, tool_index=1)) == {"q": "v2"}
 
-    def test_state_reset_on_new_stream(self):
-        """A fresh parser instance must produce identical results."""
+    def test_state_reset_on_new_stream(self, parser):
+        """A second stream (previous_text == '') must reset state cleanly."""
         full_text = build_tool_call("fn", {"k": "v"})
         # First stream
-        self._stream(make_parser(), full_text)
-        # Second stream with fresh parser
-        deltas2 = self._stream(make_parser(), full_text)
+        self._stream(parser, full_text)
+        # Second stream - should produce identical results
+        deltas2 = self._stream(parser, full_text)
         assert json.loads(self._reconstruct_args(deltas2)) == {"k": "v"}
 
     def test_empty_arguments_streaming(self, parser):
@@ -864,6 +859,26 @@ class TestExtractToolCallsStreaming:
         ]
         assert len(ids) == 2
         assert ids[0] != ids[1]
+
+    def test_eos_after_tool_calls(self, parser):
+        """EOS token (empty delta_text, non-empty delta_token_ids) returns
+        a non-None DeltaMessage so the serving framework can finalize."""
+        full_text = build_tool_call("fn", {"k": "v"})
+        # Drive through the full text first
+        deltas = self._stream(parser, full_text)
+        assert any(d.tool_calls for d in deltas)
+        # Now simulate EOS: empty delta_text, but token ids present
+        prev = full_text
+        result = parser.extract_tool_calls_streaming(
+            previous_text=prev,
+            current_text=prev,
+            delta_text="",
+            previous_token_ids=[],
+            current_token_ids=[],
+            delta_token_ids=[2],  # EOS token id
+            request=make_request(),
+        )
+        assert result is not None
 
     def test_streaming_matches_non_streaming(self, parser):
         """Streaming and non-streaming must produce the same result."""
@@ -953,6 +968,7 @@ class TestExtractToolCallsStreaming:
 
     def test_emits_arguments_before_invoke_completes(self, parser):
         """Argument deltas should stream before the invoke block closes."""
+        # Stream only a partial invoke (no closing tag)
         partial_text = (
             f"{FC_START}\n"
             f'{INV_START}fn">\n'
@@ -965,9 +981,7 @@ class TestExtractToolCallsStreaming:
             for tc in delta.tool_calls or []
             if tc.function and tc.function.arguments is not None
         ]
-        combined = "".join(arg_chunks)
-        assert combined  # some partial args emitted
-        assert combined.startswith('{"k"')
+        assert "".join(arg_chunks) == '{"k":"val"'
 
     def test_no_marker_leak_chunked(self, parser):
         """Chunked streaming must NOT leak DSML start-marker fragments

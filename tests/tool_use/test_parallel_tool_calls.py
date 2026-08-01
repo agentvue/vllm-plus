@@ -115,12 +115,14 @@ async def test_parallel_tool_calls(
             assert not role_name or role_name == "assistant"
             role_name = "assistant"
 
-        # a chunk may carry >1 tool-call delta at a parallel-call boundary
+        # if a tool call is streamed make sure there's exactly one
+        # (based on the request parameters
         streamed_tool_calls = chunk.choices[0].delta.tool_calls
 
-        for tool_call in streamed_tool_calls or []:
-            # deltas arrive in non-decreasing index order
-            assert tool_call.index >= tool_call_idx
+        if streamed_tool_calls and len(streamed_tool_calls) > 0:
+            # make sure only one diff is present - correct even for parallel
+            assert len(streamed_tool_calls) == 1
+            tool_call = streamed_tool_calls[0]
 
             # if a new tool is being called, set up empty arguments
             if tool_call.index != tool_call_idx:

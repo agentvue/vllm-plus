@@ -78,6 +78,7 @@ def _create_mock_engine():
     mock_engine.model_config = MockModelConfig()
     mock_engine.input_processor = MagicMock()
 
+    # renderer is accessed by OpenAIServing.__init__ and serving.py
     mock_renderer = MagicMock()
     mock_renderer.tokenizer = get_tokenizer(MODEL_NAME)
     mock_engine.renderer = mock_renderer
@@ -285,7 +286,7 @@ class TestPromptBuilding:
         )
 
         for i, exp in enumerate(expected):
-            assert engine_inputs[i]["prompt_token_ids"] == exp  # type: ignore[typeddict-item]
+            assert engine_inputs[i]["prompt_token_ids"] == exp
 
 
 class TestGeneration:

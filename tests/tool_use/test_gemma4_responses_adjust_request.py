@@ -100,24 +100,14 @@ def _build_chat_request(
 class _StubTokenizer:
     """Minimal tokenizer stub to satisfy ``Gemma4EngineToolParser.__init__``."""
 
-    _VOCAB: dict[str, int] = {
-        "<|tool_call>": 256_000,
-        "<tool_call|>": 256_001,
-        '<|"|>': 52,
-        "<|channel>": 256_002,
-        "<channel|>": 256_003,
-    }
-
     def get_vocab(self) -> dict[str, int]:
-        return dict(self._VOCAB)
-
-    @property
-    def all_special_tokens(self) -> list[str]:
-        return list(self._VOCAB.keys())
-
-    @property
-    def all_special_ids(self) -> list[int]:
-        return list(self._VOCAB.values())
+        return {
+            "<|tool_call>": 256_000,
+            "<tool_call|>": 256_001,
+            '<|"|>': 52,
+            "<|channel>": 256_002,
+            "<channel|>": 256_003,
+        }
 
 
 def test_gemma4_adjust_request_sets_skip_special_tokens_on_responses() -> None:
@@ -245,10 +235,10 @@ def test_gemma4_keeps_special_tokens_with_tools_thinking_disabled() -> None:
     assert request.skip_special_tokens is False
 
 
-def test_gemma4_keeps_skip_special_tokens_false_when_nothing_to_preserve() -> None:
-    """No active tools + thinking disabled: ``skip_special_tokens`` stays
-    ``False`` because the parser engine's ``__DROP__`` terminal mechanism
-    strips unconfigured special tokens automatically.
+def test_gemma4_strips_special_tokens_when_nothing_to_preserve() -> None:
+    """No active tools + thinking disabled: keep the default
+    (``skip_special_tokens=True``) so stray delimiters do not leak into
+    content.
     """
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_chat_request(
@@ -257,4 +247,4 @@ def test_gemma4_keeps_skip_special_tokens_false_when_nothing_to_preserve() -> No
 
     parser.adjust_request(request)
 
-    assert request.skip_special_tokens is False
+    assert request.skip_special_tokens is True

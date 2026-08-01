@@ -111,8 +111,7 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         return self._parser_engine.reasoning_ended
 
     def finish_streaming(self) -> DeltaMessage | None:
-        with self._skip_tool_parsing():
-            return self._parser_engine.finish_streaming()
+        return self._parser_engine.finish_streaming()
 
     def get_streaming_fallback_content(
         self,

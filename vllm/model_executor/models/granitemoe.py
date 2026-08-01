@@ -40,7 +40,7 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
+    FusedMoE,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -101,7 +101,7 @@ class GraniteMoeMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        self.experts = FusedMoEFactory(
+        self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,

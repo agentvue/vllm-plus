@@ -1,21 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import AsyncGenerator, Callable, Generator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeAlias, TypedDict, TypeVar
+from typing import Any, Generic, TypeAlias, TypeVar
 
 from fastapi import Request
 from pydantic import ConfigDict
 
 from vllm import PoolingParams, PoolingRequestOutput, PromptType
-from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 from vllm.inputs import DataPrompt, EngineInput
 from vllm.lora.request import LoRARequest
-from vllm.renderers import ChatParams, TokenizeParams
-from vllm.renderers.inputs import DictPrompt
 
-from ...tasks import PoolingTask
 from .classify.protocol import (
     ClassificationChatRequest,
     ClassificationCompletionRequest,
@@ -38,7 +34,7 @@ from .pooling.protocol import (
     PoolingResponse,
 )
 from .scoring.protocol import ScoringRequest, ScoringResponse
-from .scoring.typing import ScoreData, ScoringData
+from .scoring.typing import ScoringData
 
 PoolingCompletionLikeRequest: TypeAlias = (
     EmbeddingCompletionRequest
@@ -75,12 +71,6 @@ PoolingRequestT = TypeVar("PoolingRequestT", bound=AnyPoolingRequest)
 
 
 @dataclass(kw_only=True)
-class ChunkedEmbeddingMetadata:
-    prompt_index: int
-    chunk_index: int
-
-
-@dataclass(kw_only=True)
 class PoolingServeContext(Generic[PoolingRequestT]):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -88,13 +78,10 @@ class PoolingServeContext(Generic[PoolingRequestT]):
     raw_request: Request | None = None
     model_name: str
     request_id: str
-    pooling_params: PoolingParams
-    lora_request: LoRARequest | None
-    priorities: int | Sequence[int] | None
-    prompt_extras: dict[str, Any] | None
-
+    pooling_params: PoolingParams | list[PoolingParams]
     created_time: int = field(default_factory=lambda: int(time.time()))
-    engine_inputs: Sequence["PoolingEngineInput"] | None = None
+    lora_request: LoRARequest | None = None
+    engine_inputs: Sequence[EngineInput] | None = None
     prompt_request_ids: list[str] | None = None
 
     result_generator: AsyncGenerator[tuple[int, PoolingRequestOutput], None] | None = (
@@ -103,8 +90,7 @@ class PoolingServeContext(Generic[PoolingRequestT]):
     final_res_batch: list[PoolingRequestOutput] = field(default_factory=list)
 
     ## for Long Text Embedding with Chunked Processing
-    original_engine_inputs: Sequence["PoolingEngineInput"] | None = None
-    chunked_embedding_metadata: list[ChunkedEmbeddingMetadata] | None = None
+    original_engine_inputs: Sequence[EngineInput] | None = None
 
     ## for bi-encoder & late-interaction
     n_queries: int | None = None
@@ -118,36 +104,13 @@ class PoolingServeContext(Generic[PoolingRequestT]):
 
 @dataclass
 class OfflineInputsContext:
-    pooling_task: PoolingTask
-    tokenization_kwargs: dict[str, Any] | None
-    lora_request: Sequence[LoRARequest | None] | None
-    priorities: int | Sequence[int] | None
+    prompts: PromptType | Sequence[PromptType] | DataPrompt | ScoringData
+    pooling_params: PoolingParams | Sequence[PoolingParams]
+    tokenization_kwargs: dict[str, Any] | None = None
+    chat_template: str | None = None
 
-
-@dataclass
-class OfflineEncodeInputsContext(OfflineInputsContext):
-    prompts: PromptType | Sequence[PromptType]
-    pooling_params: PoolingParams | Sequence[PoolingParams] | None
-
-
-@dataclass
-class OfflineScoringInputsContext(OfflineInputsContext):
-    scoring_data: ScoringData
-    chat_template: str | None
-    pooling_params: PoolingParams
-
-
-@dataclass
-class OfflinePluginInputsContext(OfflineInputsContext):
-    prompts: DataPrompt
-    pooling_params: PoolingParams | Sequence[PoolingParams] | None
-
-
-AnyOfflineInputsContext: TypeAlias = (
-    OfflineEncodeInputsContext
-    | OfflineScoringInputsContext
-    | OfflinePluginInputsContext
-)
+    ## for bi-encoder & late-interaction
+    n_queries: int | None = None
 
 
 @dataclass
@@ -156,44 +119,3 @@ class OfflineOutputsContext:
 
     ## for bi-encoder & late-interaction
     n_queries: int | None = None
-
-
-class RenderParams(TypedDict):
-    tok_params: TokenizeParams
-    prompt_extras: dict[str, Any] | None
-    skip_mm_cache: bool
-
-    params: PoolingParams
-    lora_requests: LoRARequest | None
-    priorities: int
-
-
-class EncodeCMPLRenderParams(RenderParams):
-    prompts: DictPrompt
-
-
-class EncodeChatRenderParams(RenderParams):
-    conversations: list["ChatCompletionMessageParam"]
-    chat_params: ChatParams
-
-
-class ScoringRenderParams(RenderParams):
-    data_1: ScoreData
-    data_2: ScoreData
-    chat_template: str | None
-    max_tokens_per_query: int
-    max_tokens_per_doc: int
-
-
-AnyRenderParam: TypeAlias = (
-    EncodeCMPLRenderParams | EncodeChatRenderParams | ScoringRenderParams
-)
-RequestGenerator: TypeAlias = Generator[AnyRenderParam]
-RequestFactory: TypeAlias = Callable[[], RequestGenerator]
-
-
-class PoolingEngineInput(TypedDict):
-    prompts: EngineInput
-    params: PoolingParams
-    lora_requests: LoRARequest | None
-    priorities: int

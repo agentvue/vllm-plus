@@ -17,12 +17,10 @@ from typing import Any
 
 import partial_json_parser.core.complete
 import regex as re
-from openai.types.responses import ToolChoiceFunction
 from partial_json_parser.core.options import Allow
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.engine.protocol import (
@@ -55,8 +53,6 @@ class PoolsideV1ToolParser(ToolParser):
     rather than waiting for the complete </arg_value> tag.
     """
 
-    supports_required_and_named = False
-
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         # Stateful streaming fields
@@ -76,7 +72,7 @@ class PoolsideV1ToolParser(ToolParser):
 
         self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
         self.func_detail_regex = re.compile(
-            r"<tool_call>\s*([^\n<]+?)\s*\n?\s*(<arg_key>.*?)?</tool_call>", re.DOTALL
+            r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
@@ -136,15 +132,15 @@ class PoolsideV1ToolParser(ToolParser):
         if tools is None:
             return False
         for tool in tools:
-            # ChatCompletion tools nest under .function; Responses
-            # FunctionTool is flat (.name/.parameters at the top level).
-            fn = getattr(tool, "function", tool)
-            if getattr(fn, "name", None) != tool_name:
+            if tool.function.name != tool_name:
                 continue
-            params = getattr(fn, "parameters", None)
-            if params is None:
+            if tool.function.parameters is None:
                 return False
-            arg_type = params.get("properties", {}).get(arg_name, {}).get("type", None)
+            arg_type = (
+                tool.function.parameters.get("properties", {})
+                .get(arg_name, {})
+                .get("type", None)
+            )
             return arg_type == "string"
         logger.debug("No tool named '%s'.", tool_name)
         return False
@@ -163,19 +159,7 @@ class PoolsideV1ToolParser(ToolParser):
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
-        """Adjust request parameters for tool call token handling.
-
-        For required/named tool_choice, skip super().adjust_request() so it
-        does not install JSON guided decoding. These models emit XML tool
-        calls (per the chat template), which JSON guidance would break.
-        """
-        if request.tools:
-            tc = request.tool_choice
-            if tc == "required" or isinstance(
-                tc, (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction)
-            ):
-                request.skip_special_tokens = False
-                return request
+        """Adjust request parameters for tool call token handling."""
         request = super().adjust_request(request)
         if request.tools and request.tool_choice != "none":
             # Ensure tool call tokens (<tool_call>, </tool_call>) are not skipped
@@ -208,12 +192,9 @@ class PoolsideV1ToolParser(ToolParser):
                 arg_dct: dict[str, Any] = {}
                 for key, value in pairs:
                     arg_key = key.strip()
-                    # Keep string values verbatim; whitespace is significant
-                    # (e.g. code/file content). Only strip non-string types.
-                    if self._is_string_type(tc_name, arg_key, request.tools):
-                        arg_val = value
-                    else:
-                        arg_val = self._deserialize(value.strip())
+                    arg_val = value.strip()
+                    if not self._is_string_type(tc_name, arg_key, request.tools):
+                        arg_val = self._deserialize(arg_val)
                     logger.debug("arg_key = %s, arg_val = %s", arg_key, arg_val)
                     arg_dct[arg_key] = arg_val
                 tool_calls.append(
@@ -443,11 +424,7 @@ class PoolsideV1ToolParser(ToolParser):
 
         tool_calls = list(pending_deltas.values())
         if content is None and len(tool_calls) == 0:
-            wants_logprobs = getattr(request, "logprobs", None) or (
-                isinstance(request, ResponsesRequest)
-                and request.is_include_output_logprobs()
-            )
-            if wants_logprobs:
+            if request.logprobs:
                 return DeltaMessage(content="")
             return None
         return DeltaMessage(content=content, tool_calls=tool_calls)

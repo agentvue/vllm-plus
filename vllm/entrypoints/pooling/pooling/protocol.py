@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from typing import Annotated, Generic, TypeAlias, TypeVar
+from typing import Generic, TypeAlias, TypeVar
 
-from pydantic import BeforeValidator, Field
+from pydantic import Field
 
 from vllm import PoolingParams
 from vllm.config import ModelConfig
@@ -20,7 +20,6 @@ from ..base.protocol import (
     EncodingRequestMixin,
     FixedMaxLenTokenizeParamsMixin,
     PoolingBasicRequestMixin,
-    reject_removed_pooling_parameters,
 )
 
 
@@ -93,10 +92,9 @@ class IOProcessorResponse(OpenAIBaseModel, Generic[T]):
     """
 
 
-PoolingRequest: TypeAlias = Annotated[
-    PoolingCompletionRequest | PoolingChatRequest | IOProcessorRequest,
-    BeforeValidator(reject_removed_pooling_parameters),
-]
+PoolingRequest: TypeAlias = (
+    PoolingCompletionRequest | PoolingChatRequest | IOProcessorRequest
+)
 
 
 class PoolingResponseData(OpenAIBaseModel):

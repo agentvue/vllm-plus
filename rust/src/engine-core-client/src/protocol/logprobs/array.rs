@@ -1,10 +1,6 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::io::Cursor;
 
 use byteorder::{BigEndian, LittleEndian, NativeEndian, ReadBytesExt};
-use bytes::Bytes;
 use itertools::Itertools as _;
 
 use crate::error::{Error, Result, ext_value_decode};
@@ -127,7 +123,7 @@ pub(super) fn decode_array_metadata<Frame>(
     field: &str,
     frames: &[Frame],
     expected_scalars: &[ScalarType],
-) -> Result<(Vec<usize>, Bytes, ScalarType, Endianness)>
+) -> Result<(Vec<usize>, Vec<u8>, ScalarType, Endianness)>
 where
     Frame: AsRef<[u8]>,
 {
@@ -172,7 +168,7 @@ pub(super) fn resolve_array_bytes<Frame>(
     value: WireArrayData,
     field: &str,
     frames: &[Frame],
-) -> Result<Bytes>
+) -> Result<Vec<u8>>
 where
     Frame: AsRef<[u8]>,
 {
@@ -188,7 +184,7 @@ where
                     ),
                 )
             })?;
-            Ok(Bytes::copy_from_slice(frame.as_ref()))
+            Ok(frame.as_ref().to_vec())
         }
     }
 }

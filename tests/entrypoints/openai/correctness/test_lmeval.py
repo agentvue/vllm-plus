@@ -71,9 +71,8 @@ def test_lm_eval_accuracy_v1_engine():
 
     more_args = []
 
-    # Limit compilation time for V1 on TPU
-    # Avoid OOM on XPU
-    if current_platform.is_tpu() or current_platform.is_xpu():
+    # Limit compilation time for V1
+    if current_platform.is_tpu():
         more_args = ["--max-num-seqs", "64"]
 
     run_test(more_args)

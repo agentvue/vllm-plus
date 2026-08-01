@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import weakref
+
 import pytest
 
 from tests.entrypoints.multimodal.conftest import TEST_IMAGE_ASSETS
+from vllm import LLM
+from vllm.distributed import cleanup_dist_env_and_memory
 
 
 @pytest.fixture(scope="function")
-def vision_llm(multimodal_llm_factory):
-    return multimodal_llm_factory(
+def vision_llm():
+    # pytest caches the fixture so we use weakref.proxy to
+    # enable garbage collection
+    llm = LLM(
         model="microsoft/Phi-3.5-vision-instruct",
         max_model_len=4096,
         max_num_seqs=5,
@@ -16,6 +22,12 @@ def vision_llm(multimodal_llm_factory):
         limit_mm_per_prompt={"image": 2},
         seed=0,
     )
+
+    yield weakref.proxy(llm)
+
+    del llm
+
+    cleanup_dist_env_and_memory()
 
 
 @pytest.mark.parametrize(

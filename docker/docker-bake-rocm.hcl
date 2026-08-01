@@ -53,7 +53,7 @@ variable "CI_BASE_IMAGE" {
 # Upstream dependency commit pins. Plain local bake builds use the Dockerfile
 # ARG defaults. ci-bake-rocm.sh resolves those defaults (plus any env
 # overrides) and writes a small HCL override before invoking CI targets.
-variable "NIXL_BRANCH" {
+variable "RIXL_BRANCH" {
   default = ""
 }
 
@@ -106,7 +106,7 @@ target "test-rocm" {
   output   = ["type=docker"]
 }
 
-# CI base image target - builds only the ci_base stage (NIXL, DeepEP,
+# CI base image target - builds only the ci_base stage (RIXL, DeepEP,
 # torchcodec, requirements, etc.). Used by the weekly scheduled build and
 # the auto-rebuild trigger when requirements change in a PR.
 target "ci-base-rocm" {

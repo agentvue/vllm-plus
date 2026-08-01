@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use minijinja::value::{Kwargs, ViaDeserialize};
 use minijinja::{Error as MinijinjaError, ErrorKind, Value};
 use serde::Deserialize;

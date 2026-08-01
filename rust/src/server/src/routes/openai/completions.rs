@@ -1,10 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 mod convert;
 mod types;
 mod validate;
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::result::Result;
 use std::sync::Arc;
@@ -16,11 +14,9 @@ use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::{Stream, StreamExt as _, pin_mut};
-use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use tracing::{debug, error, info, trace};
 use tracing_futures::Instrument as _;
-use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_text::{
     DecodedPromptLogprobs, DecodedTextEvent, FinishReason, TextOutputStream,
     TextOutputStreamExt as _,
@@ -28,8 +24,8 @@ use vllm_text::{
 
 use self::convert::{ResponseOptions, prepare_completion_request};
 use super::utils::logprobs::{
-    collected_logprobs_to_openai, decoded_logprobs_to_openai, decoded_prompt_logprobs_to_openai,
-    prompt_logprobs_to_maps, text_len,
+    collected_logprobs_to_openai, decoded_logprobs_to_openai, decoded_prompt_logprobs_to_maps,
+    decoded_prompt_logprobs_to_openai, text_len,
 };
 use super::utils::types::Usage;
 use crate::config::ApiServerOptions;
@@ -55,13 +51,7 @@ pub async fn completions(
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
 
-    let tokenizer = state.chat.text().tokenizer();
-    let prepared = match prepare_completion_request(
-        body,
-        &lora_resolution,
-        request_context,
-        tokenizer.as_ref(),
-    ) {
+    let prepared = match prepare_completion_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
@@ -146,7 +136,9 @@ async fn collect_completion(
         .await
         .map_err(|error| server_error!("completion stream failed: {}", error.to_report_string()))?;
     let finish_reason = collected.finish_reason.clone();
-    let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
+    let stop_reason = finish_reason
+        .as_stop_reason()
+        .map(|sr| serde_json::to_value(sr).expect("StopReason must serialize to JSON"));
 
     let prompt_char_count = echo.as_ref().map(|prompt| text_len(prompt)).unwrap_or_default();
     let logprobs = if requested_logprobs.is_some() && prompt_only {
@@ -183,7 +175,7 @@ async fn collect_completion(
         Some(prompt) if prompt_only => prompt.clone(),
         Some(prompt) => format!("{prompt}{}", collected.text),
     };
-    let finish_reason = completion_finish_reason_to_openai(&finish_reason)?.to_string();
+    let finish_reason = completion_finish_reason_to_openai(finish_reason)?.to_string();
     let usage = Usage::from_token_usage(collected.usage, enable_prompt_tokens_details);
 
     if enable_log_requests {
@@ -214,7 +206,6 @@ async fn collect_completion(
         usage: Some(usage),
         system_fingerprint: None,
         kv_transfer_params: collected.kv_transfer_params,
-        ec_transfer_params: collected.ec_transfer_params,
     })
 }
 
@@ -444,34 +435,27 @@ fn final_chunk(
     created: u64,
     finish_reason: FinishReason,
 ) -> Result<CompletionStreamResponse, ApiError> {
-    let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
-    let finish_reason = completion_finish_reason_to_openai(&finish_reason)?;
+    let finish_reason = completion_finish_reason_to_openai(finish_reason)?;
 
     let mut chunk = CompletionStreamResponse::new(request_id, response_model, created);
     chunk.choices.push(CompletionStreamChoice {
         finish_reason: Some(finish_reason.to_string()),
-        stop_reason,
         ..Default::default()
     });
     Ok(chunk)
 }
 
 fn completion_finish_reason_to_openai(
-    finish_reason: &FinishReason,
+    finish_reason: FinishReason,
 ) -> Result<&'static str, ApiError> {
     match finish_reason {
-        FinishReason::Stop(_) => Ok("stop"),
-        FinishReason::Repetition(_) => Ok("repetition"),
+        FinishReason::Stop(_) | FinishReason::Repetition => Ok("stop"),
         FinishReason::Length => Ok("length"),
         FinishReason::Abort => Ok("abort"),
         FinishReason::Error => {
             bail_server_error!("Internal server error");
         }
     }
-}
-
-fn stop_reason_to_json(stop_reason: &StopReason) -> Value {
-    serde_json::to_value(stop_reason).expect("StopReason must serialize to JSON")
 }
 
 fn prompt_only_logprobs_to_openai(
@@ -501,6 +485,27 @@ fn prompt_only_logprobs_to_openai(
 
     Err(server_error!(
         "prompt-only completion requested logprobs but generation returned none"
+    ))
+}
+
+fn prompt_logprobs_to_maps(
+    prompt_logprobs: Option<&DecodedPromptLogprobs>,
+    prompt_token_ids: &[u32],
+    return_tokens_as_token_ids: bool,
+) -> Result<Vec<Option<HashMap<String, f32>>>, ApiError> {
+    if let Some(prompt_logprobs) = prompt_logprobs {
+        return Ok(decoded_prompt_logprobs_to_maps(
+            prompt_logprobs,
+            return_tokens_as_token_ids,
+        ));
+    }
+
+    if let [_token_id] = prompt_token_ids {
+        return Ok(vec![None]);
+    }
+
+    Err(server_error!(
+        "completion response requested prompt_logprobs but generation returned none"
     ))
 }
 
@@ -566,7 +571,6 @@ fn done_sse_event() -> Event {
 mod tests {
     use futures::{StreamExt as _, stream};
     use itertools::Itertools as _;
-    use vllm_engine_core_client::protocol::output::StopReason;
     use vllm_text::{
         DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTextEvent,
         DecodedTokenLogprob, FinishReason, Finished,
@@ -660,11 +664,8 @@ mod tests {
                         output_token_count: 2,
                         cached_token_count: 3,
                     },
-                    finish_reason: FinishReason::Repetition(Some(StopReason::Text(
-                        "repetition_detected".to_string(),
-                    ))),
+                    finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);
@@ -719,20 +720,6 @@ mod tests {
             CompletionSseChunk::Usage(_) => panic!("expected regular chunk"),
         }
 
-        match &chunks[2] {
-            CompletionSseChunk::Chunk(chunk) => {
-                assert_eq!(
-                    chunk.choices[0].finish_reason.as_deref(),
-                    Some("repetition")
-                );
-                assert_eq!(
-                    chunk.choices[0].stop_reason,
-                    Some(serde_json::json!("repetition_detected"))
-                );
-            }
-            CompletionSseChunk::Usage(_) => panic!("expected regular chunk"),
-        }
-
         match &chunks[3] {
             CompletionSseChunk::Usage(chunk) => {
                 assert_eq!(
@@ -769,7 +756,6 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);
@@ -821,7 +807,6 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);
@@ -876,7 +861,6 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);
@@ -948,7 +932,6 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);
@@ -1022,7 +1005,6 @@ mod tests {
                     },
                     finish_reason: FinishReason::Length,
                     kv_transfer_params: None,
-                    ec_transfer_params: None,
                 }),
             }),
         ]);

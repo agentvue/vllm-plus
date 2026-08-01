@@ -39,7 +39,6 @@ def create_standby_groups(
     new_world_size_across_dp: int,
     master_ip: str,
     coord_store_port: int,
-    use_all2all: bool,
     enable_eplb: bool = True,
     backend: str | None = None,
 ) -> None:
@@ -87,7 +86,7 @@ def create_standby_groups(
     )
     standby_ep_ranks = [x.tolist() for x in standby_ep_ranks]
     _STANDBY_EP = _init_stateless_group(
-        standby_ep_ranks, "ep", master_ip, backend, coord_store, use_all2all=use_all2all
+        standby_ep_ranks, "ep", master_ip, backend, coord_store=coord_store
     )
 
     if enable_eplb:

@@ -5,10 +5,12 @@ import json
 
 import pytest
 
-from vllm.parser.mistral import MistralToolCall
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers.mistral import MistralTokenizer
-from vllm.tool_parsers.mistral_tool_parser import MistralToolParser
+from vllm.tool_parsers.mistral_tool_parser import (
+    MistralToolCall,
+    MistralToolParser,
+)
 
 from ...utils import check_logprobs_close
 
@@ -259,7 +261,7 @@ def test_mistral_function_calling(vllm_runner, model: str, dtype: str) -> None:
 
         model_output = outputs[0].outputs[0].text.strip()
         assert model_output.startswith(tool_parser.bot_token), model_output
-        parsed_message = tool_parser.extract_tool_calls(model_output, None)  # type: ignore[arg-type]
+        parsed_message = tool_parser.extract_tool_calls(model_output, None)
 
         assert parsed_message.tools_called
 
@@ -302,7 +304,7 @@ def test_mistral_function_call_nested_json():
 
     model_output = f"{parser.bot_token}get_current_weather{json.dumps(args_dict)}"
 
-    parsed = parser.extract_tool_calls(model_output, None)  # type: ignore[arg-type]
+    parsed = parser.extract_tool_calls(model_output, None)
 
     # Assertions: the tool call is detected and the full nested JSON is parsed
     # without truncation.
@@ -335,7 +337,7 @@ def test_mistral_function_call_nested_json():
         ]
     )
 
-    parsed = parser.extract_tool_calls(model_output, None)  # type: ignore[arg-type]
+    parsed = parser.extract_tool_calls(model_output, None)
 
     # Assertions: the tool call is detected and the full nested JSON is parsed
     # without truncation.

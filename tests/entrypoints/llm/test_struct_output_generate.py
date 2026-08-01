@@ -212,7 +212,6 @@ class CarDescription(BaseModel):
     PARAMS_MODELS_BACKENDS_TOKENIZER_MODE,
 )
 def test_structured_output(
-    request: pytest.FixtureRequest,
     backend: str,
     tokenizer_mode: str,
     model_name: str,
@@ -243,7 +242,6 @@ def test_structured_output(
         speculative_config=speculative_config,
         **platform_args,
     )
-    request.addfinalizer(llm.llm_engine.engine_core.shutdown)
 
     #
     # Test 1: Generate JSON output based on a provided schema

@@ -1,19 +1,15 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 mod cli;
+mod logging;
 
 use std::env;
-use std::ffi::OsStr;
-use std::process::{ExitCode, ExitStatus};
+use std::process::ExitStatus;
 
 use anyhow::{Context, Result, anyhow, bail};
-use thiserror_ext::AsReport as _;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use vllm_managed_engine::ManagedEngineHandle;
 
-use crate::cli::{BenchCommand, Cli, Command};
+use crate::cli::{Cli, Command};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -82,15 +78,8 @@ fn shutdown_signal() -> CancellationToken {
     token
 }
 
-fn main() -> ExitCode {
-    let process_label =
-        match env::args_os().nth(1).as_deref().and_then(OsStr::to_str).unwrap_or_default() {
-            "bench" => "Bench",
-            "serve" | "frontend" => "RustFrontend",
-            _ => "Rust",
-        };
-    vllm_tracing::init_tracing(process_label);
-
+fn main() -> Result<()> {
+    logging::init_tracing();
     let cli = Cli::parse();
 
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
@@ -99,27 +88,15 @@ fn main() -> ExitCode {
         runtime.worker_threads(worker_threads);
     }
 
-    let result = runtime
+    runtime
         .build()
-        .context("failed to build Tokio runtime")
-        .and_then(|runtime| runtime.block_on(async_main(cli)));
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            error!("process failed with error: {:#?}", error.as_report());
-            ExitCode::FAILURE
-        }
-    }
+        .context("failed to build Tokio runtime")?
+        .block_on(async_main(cli))
 }
 
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Frontend(args) => vllm_server::serve(args.into_config(), shutdown_signal()).await,
-        Command::Bench(BenchCommand::Serve(bench_args)) => {
-            vllm_bench::prepare_process();
-            vllm_bench::run(bench_args).await
-        }
         Command::Serve(args) => {
             let handshake_port = args.managed_engine.resolve_handshake_port()?;
 

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +25,6 @@ pub enum Error {
     ValueDecode(#[from] rmpv::decode::Error),
     #[error("messagepack ext value decode failed: {message}")]
     ExtValueDecode { message: String },
-    #[error("invalid structured outputs params: {message}")]
-    InvalidStructuredOutputsParams { message: String },
     #[error("io error")]
     Io(#[from] std::io::Error),
     #[error("transport error")]

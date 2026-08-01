@@ -32,8 +32,6 @@ from vllm.multimodal.inputs import (
 from vllm.multimodal.processing import PromptInsertion
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 
-from ..utils import create_new_process_for_each_test
-
 pytestmark = pytest.mark.cpu_test
 
 
@@ -144,8 +142,7 @@ def _compare_caches(
         for _ in range(int(item_capacity / hit_rate))
     ]
     all_hashes = [
-        MultiModalHasher.hash_kwargs("blake3", item=item.get_data())
-        for item in all_items
+        MultiModalHasher.hash_kwargs(item=item.get_data()) for item in all_items
     ]
 
     prompt_update = PromptInsertion("dummy", "target", "insertion").resolve(0)
@@ -562,7 +559,6 @@ _SLEEP_VISION_PROMPT = (
 )
 
 
-@create_new_process_for_each_test()
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="sleep mode regression requires a CUDA GPU",

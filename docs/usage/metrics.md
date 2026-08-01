@@ -35,21 +35,21 @@ The following metrics are exposed:
 
 ## General Metrics
 
---8<-- "gen:metrics-general"
+--8<-- "docs/generated/metrics/general.inc.md"
 
 ## Speculative Decoding Metrics
 
---8<-- "gen:metrics-spec-decode"
+--8<-- "docs/generated/metrics/spec_decode.inc.md"
 
 ## NIXL KV Connector Metrics
 
---8<-- "gen:metrics-nixl"
+--8<-- "docs/generated/metrics/nixl_connector.inc.md"
 
 ## Model Flops Utilization (MFU) Performance Metrics
 
 These metrics are available via `--enable-mfu-metrics`:
 
---8<-- "gen:metrics-mfu"
+--8<-- "docs/generated/metrics/perf.inc.md"
 
 ## Deprecation Policy
 

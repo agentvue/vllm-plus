@@ -31,7 +31,7 @@ def _get_attention_backend_params() -> list[str | None]:
               falls back to ROCM_AITER_UNIFIED_ATTN or TRITON_ATTN for
               cross-attention since ROCM_ATTN doesn't support ENCODER_DECODER)
       - TRITON_ATTN: always available on ROCm
-      - ROCM_AITER_UNIFIED_ATTN: only on gfx942/gfx950/gfx1250
+      - ROCM_AITER_UNIFIED_ATTN: only on gfx942/gfx950
 
     On non-ROCm platforms, we just run with the default backend.
     """
@@ -40,9 +40,9 @@ def _get_attention_backend_params() -> list[str | None]:
 
         if current_platform.is_rocm():
             backends: list[str | None] = [None, "TRITON_ATTN"]
-            from vllm.platforms.rocm import get_cdna_version
+            from vllm.platforms.rocm import _ON_MI3XX
 
-            if get_cdna_version() > 2:
+            if _ON_MI3XX:
                 backends.append("ROCM_AITER_UNIFIED_ATTN")
             return backends
     except Exception:
@@ -68,8 +68,7 @@ def server(request):
     if request.param is not None:
         args += ["--attention-backend", request.param]
         if "AITER" in request.param:
-            # TODO: re-enable once AITER reenables fp16 unified attention.
-            pytest.skip("ROCM_AITER_UNIFIED_ATTN does not support fp16")
+            env_dict = _AITER_ENV
     with RemoteOpenAIServer(MODEL_NAME, args, env_dict=env_dict) as remote_server:
         yield remote_server
 

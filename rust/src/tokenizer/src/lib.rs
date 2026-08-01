@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 use std::sync::Arc;
 
 use crate::incremental::DecodeStream;
@@ -11,8 +8,6 @@ mod error;
 mod hf;
 mod incremental;
 mod tekken;
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
 mod tiktoken;
 
 pub use error::{Result, TokenizerError};
@@ -25,10 +20,6 @@ pub trait Tokenizer: Send + Sync {
     /// Encode one prompt string into token IDs.
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>>;
 
-    /// Equivalent to `encode(text, false)`, except that every added,
-    /// special, and control-token matcher is bypassed.
-    fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>>;
-
     /// Decode one token sequence into text.
     fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String>;
 
@@ -37,7 +28,11 @@ pub trait Tokenizer: Send + Sync {
     fn token_to_id(&self, token: &str) -> Option<u32>;
 
     /// Convert one token ID into the tokenizer's raw token string.
-    fn id_to_token(&self, id: u32) -> Option<String>;
+    fn id_to_token(&self, _id: u32) -> Option<String> {
+        // TODO: remove default impl and require this to be implemented by all
+        // tokenizers
+        None
+    }
 
     /// Return the vocabulary size. Backends that cannot report it fall back to
     /// `usize::MAX`, an effectively unbounded value used only by test stubs.

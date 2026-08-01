@@ -108,8 +108,7 @@ class CompressedTensorsW4A16FlydslMoEMethod(CompressedTensorsMoEMethod):
         # grouped actorder isn't supported by this kernel
         assert weight_quant.actorder != "group"
         assert weight_quant.symmetric, (
-            "Only symmetric quantization is supported for MoE. "
-            "Try --moe-backend emulation."
+            "Only symmetric quantization is supported for MoE"
         )
 
     def create_weights(

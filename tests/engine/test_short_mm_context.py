@@ -3,8 +3,6 @@
 
 import pytest
 
-from vllm.exceptions import VLLMValidationError
-
 from ..conftest import IMAGE_ASSETS
 
 HF_IMAGE_PROMPTS = IMAGE_ASSETS.prompts(
@@ -21,9 +19,7 @@ models = ["llava-hf/llava-1.5-7b-hf"]
 def test_context_length_too_short(vllm_runner, image_assets, model):
     images = [asset.pil_image for asset in image_assets]
 
-    with pytest.raises(
-        VLLMValidationError, match="longer than the maximum model length"
-    ):
+    with pytest.raises(ValueError, match="longer than the maximum model length"):
         vllm_model = vllm_runner(
             model,
             # LLaVA has a feature size of 576
