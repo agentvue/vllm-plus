@@ -6,8 +6,14 @@ import functools
 
 import torch
 
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    _decode_e4m3fn_bf16_lut,
+    _get_e4m3fn_bf16_lut,
+)
 
 # DeepSeek-V3.2 / GLM-5 sparse MLA shape constants.
 _BLOCK_DMODEL = 512
@@ -45,10 +51,22 @@ _MIN_TOPK_PER_SPLIT = 128  # below this, per-split work is too small to amortize
 _SPLIT_MAX_OCCUPANCY = 4  # skip split when baseline grid fills >=1/4 of SMs
 
 
+def _supports_native_e4m3_load(capability: DeviceCapability | None) -> bool:
+    """Return whether Triton accepts typed E4M3 pointers for this target."""
+    if capability is None:
+        return False
+    capability_int = capability.to_int()
+    # The deployed Triton build rejects fp8e4nv on SM100+ even though the
+    # hardware supports E4M3 conversion. Use byte/LUT decoding on those
+    # targets until typed E4M3 pointers compile there.
+    return 89 <= capability_int < 100
+
+
 @triton.jit
 def _sparse_mla_compute_tile(
     q_buffer,
     k_buffer,  # V is the first BLOCK_DV lanes of each row of k_buffer.
+    fp8_lut_ptr,
     indices_ptr,
     cur_q,
     cur_head,
@@ -64,6 +82,8 @@ def _sparse_mla_compute_tile(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    IS_FP8: tl.constexpr,
+    USE_FP8_LUT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -121,6 +141,10 @@ def _sparse_mla_compute_tile(
             + offs_d[:, None]
         )
         k = tl.load(k_buffer + offs_k, mask=mask_kv[None, :], other=0.0)
+        if USE_FP8_LUT:
+            k = _decode_e4m3fn_bf16_lut(k, fp8_lut_ptr)
+        elif IS_FP8:
+            k = k.to(tl.bfloat16)
         qk = tl.dot(q, k.to(q.dtype))
 
         offs_kpe = (
@@ -133,6 +157,10 @@ def _sparse_mla_compute_tile(
             mask=(mask_kv[None, :]) & (mask_dpe[:, None]),
             other=0.0,
         )
+        if USE_FP8_LUT:
+            kpe = _decode_e4m3fn_bf16_lut(kpe, fp8_lut_ptr)
+        elif IS_FP8:
+            kpe = kpe.to(tl.bfloat16)
         qk += tl.dot(qpe, kpe.to(q.dtype))
 
         qk *= sm_scale
@@ -144,6 +172,10 @@ def _sparse_mla_compute_tile(
             + offs_dv[None, :]
         )
         v = tl.load(k_buffer + offs_v, mask=mask_kv[:, None], other=0.0)
+        if USE_FP8_LUT:
+            v = _decode_e4m3fn_bf16_lut(v, fp8_lut_ptr)
+        elif IS_FP8:
+            v = v.to(tl.bfloat16)
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2(e_max - n_e_max)
@@ -156,11 +188,15 @@ def _sparse_mla_compute_tile(
     return acc, e_max, e_sum
 
 
-@triton.autotune(configs=_FINAL_AUTOTUNE_CONFIGS, key=["index_topk", "kv_group_num"])
+@triton.autotune(
+    configs=_FINAL_AUTOTUNE_CONFIGS,
+    key=["index_topk", "kv_group_num", "IS_FP8", "USE_FP8_LUT"],
+)
 @triton.jit
 def _sparse_mla_kernel_final(
     q_buffer,
     k_buffer,
+    fp8_lut_ptr,
     indices_ptr,
     out_ptr,
     seq_kv,
@@ -174,8 +210,11 @@ def _sparse_mla_kernel_final(
     stride_indices_token,
     stride_indices_head,
     sm_scale,
+    output_scale,
     index_topk: tl.constexpr,
     kv_group_num: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    USE_FP8_LUT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -194,6 +233,7 @@ def _sparse_mla_kernel_final(
     acc, e_max, e_sum = _sparse_mla_compute_tile(
         q_buffer,
         k_buffer,
+        fp8_lut_ptr,
         indices_ptr,
         cur_q,
         cur_head,
@@ -209,6 +249,8 @@ def _sparse_mla_kernel_final(
         stride_indices_token,
         stride_indices_head,
         sm_scale,
+        IS_FP8,
+        USE_FP8_LUT,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
@@ -219,24 +261,34 @@ def _sparse_mla_kernel_final(
     # Guard against queries with zero valid KV (e_sum == 0 → NaN from 0/0).
     e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
     offs_dv = tl.arange(0, BLOCK_DV)
+    normalized_acc = acc / e_sum_safe[:, None]
+    if IS_FP8:
+        normalized_acc *= output_scale
     tl.store(
         out_ptr
         + cur_q * stride_out_token
         + cur_head[:, None] * stride_out_head
         + offs_dv[None, :],
-        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+        normalized_acc.to(tl.bfloat16),
         mask=mask_h[:, None],
     )
 
 
 @triton.autotune(
     configs=_SPLIT_AUTOTUNE_CONFIGS,
-    key=["index_topk", "NUM_KV_SPLITS", "kv_group_num"],
+    key=[
+        "index_topk",
+        "NUM_KV_SPLITS",
+        "kv_group_num",
+        "IS_FP8",
+        "USE_FP8_LUT",
+    ],
 )
 @triton.jit
 def _sparse_mla_kernel_split(
     q_buffer,
     k_buffer,
+    fp8_lut_ptr,
     indices_ptr,
     mid_out_ptr,
     seq_kv,
@@ -254,6 +306,8 @@ def _sparse_mla_kernel_split(
     index_topk: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
     kv_group_num: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    USE_FP8_LUT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -279,6 +333,7 @@ def _sparse_mla_kernel_split(
     acc, e_max, e_sum = _sparse_mla_compute_tile(
         q_buffer,
         k_buffer,
+        fp8_lut_ptr,
         indices_ptr,
         cur_q,
         cur_head,
@@ -294,6 +349,8 @@ def _sparse_mla_kernel_split(
         stride_indices_token,
         stride_indices_head,
         sm_scale,
+        IS_FP8,
+        USE_FP8_LUT,
         BLOCK_H,
         BLOCK_N,
         BLOCK_DV,
@@ -338,6 +395,8 @@ def _sparse_mla_merge_kernel(
     stride_mid_split,
     stride_out_token,
     stride_out_head,
+    output_scale,
+    IS_FP8: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
     kv_group_num: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -393,12 +452,15 @@ def _sparse_mla_merge_kernel(
         e_max = n_e_max
 
     e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
+    normalized_acc = acc / e_sum_safe[:, None]
+    if IS_FP8:
+        normalized_acc *= output_scale
     tl.store(
         out_ptr
         + cur_q * stride_out_token
         + cur_head[:, None] * stride_out_head
         + offs_dv[None, :],
-        (acc / e_sum_safe[:, None]).to(tl.bfloat16),
+        normalized_acc.to(tl.bfloat16),
         mask=mask_h[:, None] & mask_dv[None, :],
     )
 
@@ -428,18 +490,22 @@ def triton_mla_sparse_attention(
     kv: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
+    kv_scale: float = 1.0,
     num_kv_splits: int | None = None,
     sm_count: int | None = None,
+    use_fp8_lut: bool | None = None,
 ) -> torch.Tensor:
     """Sparse MLA attention over topk indices.
 
     Args:
         q:         [num_tokens, num_heads_q, dim_qk] bf16
-        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16
+        kv:        [seq_kv, num_heads_kv=1, dim_qk] bf16 or E4M3
         indices:   [num_tokens, num_heads_kv=1, topk] int32
         sm_scale:  softmax scale
+        kv_scale:  scalar used to dequantize an E4M3 cache
         num_kv_splits: override auto-heuristic; None/0 = auto, 1 = force single-pass.
         sm_count:  cached device SM count for the split heuristic.
+        use_fp8_lut: override the architecture-selected E4M3 decode path.
 
     Returns:
         out:   [num_tokens, num_heads_q, _BLOCK_DV] bf16
@@ -450,6 +516,29 @@ def triton_mla_sparse_attention(
         f"got {dim_qk}"
     )
     assert kv.shape[1] == 1 and kv.shape[2] == _DIM_QK
+    is_fp8 = kv.dtype == torch.float8_e4m3fn
+    assert is_fp8 or kv.dtype in (torch.float16, torch.bfloat16), (
+        f"unsupported sparse MLA KV dtype: {kv.dtype}"
+    )
+    assert kv_scale > 0.0, f"kv_scale must be positive, got {kv_scale}"
+
+    native_fp8 = False
+    if is_fp8:
+        device_id = kv.device.index or 0
+        capability = current_platform.get_device_capability(device_id=device_id)
+        native_fp8 = _supports_native_e4m3_load(capability)
+    if use_fp8_lut is None:
+        use_fp8_lut = is_fp8 and not native_fp8
+    if use_fp8_lut and not is_fp8:
+        raise ValueError("E4M3 LUT decoding requires an E4M3 KV cache")
+    if is_fp8 and not use_fp8_lut and not native_fp8:
+        raise ValueError(
+            "Native E4M3 Triton loads require a supported SM89/SM90 target"
+        )
+
+    fp8_lut = _get_e4m3fn_bf16_lut(kv.device) if is_fp8 else kv
+    kernel_kv = kv.view(torch.uint8) if use_fp8_lut else kv
+    dequant_scale = kv_scale if is_fp8 else 1.0
     index_topk = indices.shape[2]
     assert index_topk % _MIN_BLOCK_N == 0, (
         f"topk ({index_topk}) must be a multiple of the smallest autotune "
@@ -475,22 +564,26 @@ def triton_mla_sparse_attention(
     if num_kv_splits == 1:
         _sparse_mla_kernel_final[(num_tokens, num_head_groups)](
             q_buffer=q,
-            k_buffer=kv,
+            k_buffer=kernel_kv,
+            fp8_lut_ptr=fp8_lut,
             indices_ptr=indices,
             out_ptr=out,
             seq_kv=kv.shape[0],
             h_q=num_heads_q,
             stride_q_token=q.stride(0),
             stride_q_head=q.stride(1),
-            stride_kv_token=kv.stride(0),
-            stride_kv_head=kv.stride(1),
+            stride_kv_token=kernel_kv.stride(0),
+            stride_kv_head=kernel_kv.stride(1),
             stride_out_token=out.stride(0),
             stride_out_head=out.stride(1),
             stride_indices_token=indices.stride(0),
             stride_indices_head=indices.stride(1),
-            sm_scale=sm_scale * LOG2E,
+            sm_scale=sm_scale * dequant_scale * LOG2E,
+            output_scale=dequant_scale,
             index_topk=index_topk,
             kv_group_num=kv_group_num,
+            IS_FP8=is_fp8,
+            USE_FP8_LUT=use_fp8_lut,
             BLOCK_H=_BLOCK_H,
             BLOCK_DV=_BLOCK_DV,
             BLOCK_DMODEL=_BLOCK_DMODEL,
@@ -506,24 +599,27 @@ def triton_mla_sparse_attention(
     )
     _sparse_mla_kernel_split[(num_tokens, num_head_groups, num_kv_splits)](
         q_buffer=q,
-        k_buffer=kv,
+        k_buffer=kernel_kv,
+        fp8_lut_ptr=fp8_lut,
         indices_ptr=indices,
         mid_out_ptr=mid_out,
         seq_kv=kv.shape[0],
         h_q=num_heads_q,
         stride_q_token=q.stride(0),
         stride_q_head=q.stride(1),
-        stride_kv_token=kv.stride(0),
-        stride_kv_head=kv.stride(1),
+        stride_kv_token=kernel_kv.stride(0),
+        stride_kv_head=kernel_kv.stride(1),
         stride_mid_token=mid_out.stride(0),
         stride_mid_head=mid_out.stride(1),
         stride_mid_split=mid_out.stride(2),
         stride_indices_token=indices.stride(0),
         stride_indices_head=indices.stride(1),
-        sm_scale=sm_scale * LOG2E,
+        sm_scale=sm_scale * dequant_scale * LOG2E,
         index_topk=index_topk,
         NUM_KV_SPLITS=num_kv_splits,
         kv_group_num=kv_group_num,
+        IS_FP8=is_fp8,
+        USE_FP8_LUT=use_fp8_lut,
         BLOCK_H=_BLOCK_H,
         BLOCK_DV=_BLOCK_DV,
         BLOCK_DMODEL=_BLOCK_DMODEL,
@@ -540,6 +636,8 @@ def triton_mla_sparse_attention(
         stride_mid_split=mid_out.stride(2),
         stride_out_token=out.stride(0),
         stride_out_head=out.stride(1),
+        output_scale=dequant_scale,
+        IS_FP8=is_fp8,
         NUM_KV_SPLITS=num_kv_splits,
         kv_group_num=kv_group_num,
         BLOCK_H=_MERGE_BLOCK_H,

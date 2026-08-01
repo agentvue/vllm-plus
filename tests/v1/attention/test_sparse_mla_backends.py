@@ -42,7 +42,13 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.backends.mla.indexer import split_indexer_prefill_chunks
+from vllm.v1.attention.backends.mla.indexer import (
+    get_max_prefill_buffer_size,
+    split_indexer_prefill_chunks,
+)
+from vllm.v1.attention.backends.mla.triton_mla_sparse import (
+    TritonMLASparseBackend,
+)
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
 
@@ -65,6 +71,15 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_triton_sparse_backend_supports_only_standard_e4m3_fp8():
+    supported = TritonMLASparseBackend.supported_kv_cache_dtypes
+
+    assert "fp8" in supported
+    assert "fp8_e4m3" in supported
+    assert "fp8_e5m2" not in supported
+    assert "fp8_ds_mla" not in supported
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
@@ -174,8 +189,12 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseTRTLLMBackend],
-    ids=["FlashMLA", "FlashInferTRTLLM"],
+    [
+        FlashMLASparseBackend,
+        FlashInferMLASparseTRTLLMBackend,
+        TritonMLASparseBackend,
+    ],
+    ids=["FlashMLA", "FlashInferTRTLLM", "Triton"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_ds_mla"])
@@ -795,6 +814,24 @@ def test_split_indexer_prefill_chunks_single_request_overflow():
     # req1: M=5, N=50 -> 250 elems fits budget
     expected.append((slice(1, 2), slice(0, 5)))
     assert out == expected
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected_multiplier"),
+    [(1, 1), (4, 4), (40, 40), (256, 40)],
+)
+def test_max_prefill_buffer_respects_scheduler_concurrency(
+    max_num_seqs, expected_multiplier
+):
+    max_model_len = 294400
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+    )
+
+    assert get_max_prefill_buffer_size(vllm_config) == (
+        max_model_len * expected_multiplier
+    )
 
 
 def test_triton_convert_returns_valid_counts():

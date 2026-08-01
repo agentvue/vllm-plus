@@ -334,6 +334,21 @@ class RayExecutorV2(MultiprocExecutor):
         self.shutting_down = False
         self.shutdown_lock = threading.Lock()
 
+        try:
+            self._init_executor_impl()
+        except BaseException:
+            try:
+                self.shutdown()
+            except Exception:
+                logger.exception(
+                    "Failed to clean up Ray workers after executor "
+                    "initialization failed."
+                )
+            raise
+
+    def _init_executor_impl(self) -> None:
+        """Create and initialize the Ray workers."""
+
         # Step 1: Initialize Ray cluster and retrieve placement group
         if ray is None:
             raise ImportError("Using Ray backend requires installation of ray.")

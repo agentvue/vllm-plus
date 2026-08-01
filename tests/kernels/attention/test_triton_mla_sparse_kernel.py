@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness tests for the Triton sparse MLA kernel.
-
-Compares split-KV against the single-pass (`num_kv_splits=1`) path
-produced by the same kernel — both paths must agree to within bf16 ULPs.
-"""
+"""Correctness tests for the Triton sparse MLA kernel."""
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
     _DIM_QK,
+    _supports_native_e4m3_load,
     triton_mla_sparse_attention,
 )
 
@@ -59,6 +57,27 @@ def _assert_split_matches_single_pass(
         atol=5e-2,
         rtol=5e-3,
     )
+
+
+def _torch_sparse_mla_reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    outputs = []
+    for token_idx in range(q.shape[0]):
+        token_indices = indices[token_idx, 0]
+        token_indices = token_indices[token_indices >= 0].long()
+        selected_kv = kv[token_indices, 0].float()
+        logits = torch.einsum(
+            "hd,nd->hn", q[token_idx].float(), selected_kv
+        ) * sm_scale
+        probs = torch.softmax(logits, dim=-1)
+        outputs.append(
+            torch.einsum("hn,nd->hd", probs, selected_kv[:, :512])
+        )
+    return torch.stack(outputs).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize(
@@ -114,3 +133,64 @@ def test_short_prefill_no_nan(num_kv_splits, kv_cache):
     )
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+@pytest.mark.parametrize("num_kv_splits", [1, 4, None])
+@pytest.mark.parametrize("use_fp8_lut", [True, False], ids=["lut", "native"])
+def test_fp8_matches_dequantized_reference(num_kv_splits, use_fp8_lut):
+    capability = current_platform.get_device_capability()
+    if not use_fp8_lut and not _supports_native_e4m3_load(capability):
+        pytest.skip("Typed E4M3 Triton loads are unavailable on this target")
+
+    torch.manual_seed(1)
+    num_tokens, num_heads, seq_len, topk = 2, 16, 4096, 2048
+    sm_scale = 0.0417
+    kv_scale = 0.125
+    q = torch.randn(
+        num_tokens,
+        num_heads,
+        _DIM_QK,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    kv_bf16 = torch.randn(
+        seq_len, 1, _DIM_QK, dtype=torch.bfloat16, device="cuda"
+    )
+    kv_fp8 = (kv_bf16 / kv_scale).to(torch.float8_e4m3fn)
+    kv_dequant = kv_fp8.to(torch.bfloat16) * kv_scale
+    indices = torch.randint(
+        0,
+        seq_len,
+        (num_tokens, 1, topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    indices[:, :, 1536:] = -1
+
+    reference = _torch_sparse_mla_reference(q, kv_dequant, indices, sm_scale)
+    output = triton_mla_sparse_attention(
+        q,
+        kv_fp8,
+        indices,
+        sm_scale=sm_scale,
+        kv_scale=kv_scale,
+        num_kv_splits=num_kv_splits,
+        use_fp8_lut=use_fp8_lut,
+    )
+
+    torch.testing.assert_close(output, reference, rtol=0.06, atol=0.08)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        (None, False),
+        (DeviceCapability(8, 6), False),
+        (DeviceCapability(8, 9), True),
+        (DeviceCapability(9, 0), True),
+        (DeviceCapability(10, 0), False),
+        (DeviceCapability(12, 0), False),
+    ],
+)
+def test_native_e4m3_load_target_selection(capability, expected):
+    assert _supports_native_e4m3_load(capability) is expected

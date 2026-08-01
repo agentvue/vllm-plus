@@ -20,9 +20,11 @@ from tests.models.utils import check_logprobs_close
 from vllm.model_executor.kernels.linear import (
     Fp8BlockScaledMMLinearKernel,
 )
+from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
+    CompressedTensorsKVCacheMethod,
     CompressedTensorsLinearMethod,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Mxfp4,
@@ -582,6 +584,111 @@ def _make_ct_config(*, target: str = "Linear") -> CompressedTensorsConfig:
         ignore=[],
         quant_format="pack-quantized",
     )
+
+
+def _make_mla_kv_config(
+    *, strategy: str = "tensor", dynamic: bool = False
+) -> CompressedTensorsConfig:
+    return CompressedTensorsConfig(
+        target_scheme_map={},
+        ignore=[],
+        quant_format="compressed-tensors",
+        kv_cache_scheme={
+            "type": "float",
+            "num_bits": 8,
+            "strategy": strategy,
+            "symmetric": True,
+            "dynamic": dynamic,
+        },
+    )
+
+
+def _make_dummy_mla_layer() -> MLAAttention:
+    layer = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.num_kv_heads = 1
+    layer.kv_cache_dtype = "fp8"
+    layer.calculate_kv_scales = False
+    layer.register_buffer("_q_scale", torch.tensor(1.0, dtype=torch.float32))
+    layer.register_buffer("_k_scale", torch.tensor(1.0, dtype=torch.float32))
+    layer.register_buffer("_v_scale", torch.tensor(1.0, dtype=torch.float32))
+    layer._q_scale_float = 1.0
+    layer._k_scale_float = 1.0
+    layer._v_scale_float = 1.0
+    return layer
+
+
+def test_compressed_tensors_dispatches_mla_kv_method():
+    config = _make_mla_kv_config()
+    layer = _make_dummy_mla_layer()
+
+    method = config.get_quant_method(layer, prefix="model.layers.0.self_attn")
+
+    assert isinstance(method, CompressedTensorsKVCacheMethod)
+
+
+def test_compressed_tensors_mla_fp8_requires_loaded_scale():
+    config = _make_mla_kv_config()
+    layer = _make_dummy_mla_layer()
+    method = config.get_quant_method(layer, prefix="model.layers.0.self_attn")
+    assert isinstance(method, CompressedTensorsKVCacheMethod)
+    method.create_weights(layer)
+
+    with pytest.raises(ValueError, match="finite positive"):
+        method.process_weights_after_loading(layer)
+
+    with torch.no_grad():
+        layer.k_scale.fill_(0.25)
+    method.process_weights_after_loading(layer)
+
+    assert layer._k_scale_float == 0.25
+    assert layer._v_scale_float == 0.25
+    torch.testing.assert_close(layer._k_scale, torch.tensor(0.25))
+    torch.testing.assert_close(layer._v_scale, torch.tensor(0.25))
+
+
+def test_compressed_tensors_mla_fp8_requires_scheme():
+    config = CompressedTensorsConfig(
+        target_scheme_map={},
+        ignore=[],
+        quant_format="compressed-tensors",
+    )
+    layer = _make_dummy_mla_layer()
+    method = config.get_quant_method(layer, prefix="model.layers.0.self_attn")
+    assert isinstance(method, CompressedTensorsKVCacheMethod)
+
+    with pytest.raises(ValueError, match="calibrated kv_cache_scheme"):
+        method.create_weights(layer)
+
+
+def test_compressed_tensors_mla_fp8_rejects_calculated_scales():
+    config = _make_mla_kv_config()
+    layer = _make_dummy_mla_layer()
+    layer.calculate_kv_scales = True
+    method = config.get_quant_method(layer, prefix="model.layers.0.self_attn")
+    assert isinstance(method, CompressedTensorsKVCacheMethod)
+
+    with pytest.raises(ValueError, match="calculate-kv-scales"):
+        method.create_weights(layer)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "dynamic", "error"),
+    [
+        ("attn_head", False, "per-tensor"),
+        ("tensor", True, "static checkpoint"),
+    ],
+)
+def test_compressed_tensors_mla_fp8_rejects_unsupported_scheme(
+    strategy, dynamic, error
+):
+    config = _make_mla_kv_config(strategy=strategy, dynamic=dynamic)
+    layer = _make_dummy_mla_layer()
+    method = config.get_quant_method(layer, prefix="model.layers.0.self_attn")
+    assert isinstance(method, CompressedTensorsKVCacheMethod)
+
+    with pytest.raises(ValueError, match=error):
+        method.create_weights(layer)
 
 
 def test_get_quant_method_returns_linear_method_for_parallel_lm_head():

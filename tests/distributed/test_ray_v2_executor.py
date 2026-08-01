@@ -117,6 +117,21 @@ def test_ray_v2_driver_local_reader_ranks(world_size, driver_ranks):
     ) == driver_ranks
 
 
+def test_ray_v2_executor_cleans_up_initialization_failure():
+    executor = RayExecutorV2.__new__(RayExecutorV2)
+    init_error = RuntimeError("worker initialization failed")
+
+    with (
+        patch.object(executor, "shutdown") as shutdown,
+        patch.object(executor, "_init_executor_impl", side_effect=init_error),
+        pytest.raises(RuntimeError, match="worker initialization failed"),
+    ):
+        executor._init_executor()
+
+    shutdown.assert_called_once_with()
+    executor._finalizer.detach()
+
+
 @pytest.mark.parametrize("tp_size, pp_size", [(1, 1), (2, 1), (4, 1), (2, 2)])
 def test_ray_v2_executor(tp_size, pp_size):
     """Validate RayExecutorV2 with various TP/PP configs."""

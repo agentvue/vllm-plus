@@ -18,7 +18,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -202,7 +202,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
             return CompressedTensorsEmbeddingWNA16Int(weight_quant)
 
-        if isinstance(layer, Attention):
+        if isinstance(layer, (Attention, MLAAttention)):
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, RoutedExperts):
             return CompressedTensorsMoEMethod.get_moe_method(
@@ -969,6 +969,36 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         super().__init__(quant_config)
 
     @staticmethod
+    def _is_mla_fp8(layer: torch.nn.Module) -> bool:
+        return isinstance(layer, MLAAttention) and layer.kv_cache_dtype in (
+            "fp8",
+            "fp8_e4m3",
+        )
+
+    def _validate_mla_fp8_scheme(self, layer: torch.nn.Module) -> None:
+        scheme = self.quant_config.kv_cache_scheme
+        if scheme is None:
+            raise ValueError(
+                "FP8 MLAAttention with compressed-tensors requires a calibrated "
+                "kv_cache_scheme"
+            )
+        if scheme.get("dynamic", False):
+            raise ValueError(
+                "FP8 MLAAttention requires static checkpoint KV-cache scales"
+            )
+        strategy = QuantizationStrategy(scheme.get("strategy"))
+        if strategy != QuantizationStrategy.TENSOR:
+            raise ValueError(
+                "FP8 MLAAttention requires a per-tensor KV-cache scale, "
+                f"got strategy={strategy.value}"
+            )
+        if layer.calculate_kv_scales:
+            raise ValueError(
+                "FP8 MLAAttention does not support --calculate-kv-scales; "
+                "use calibrated checkpoint scales"
+            )
+
+    @staticmethod
     def validate_kv_cache_scheme(kv_cache_scheme: dict[str, Any] | None):
         """
         Validator for the kv cache scheme. Useful for controlling the
@@ -1015,6 +1045,10 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         Initialize placeholder scales and zero points to enable loading of
         quantized params from compressed-tensors checkpoints.
         """
+        is_mla_fp8 = self._is_mla_fp8(layer)
+        if is_mla_fp8:
+            self._validate_mla_fp8_scheme(layer)
+
         strategy = None  # for backward compatibility
         if (
             hasattr(self.quant_config, "kv_cache_scheme")
@@ -1026,14 +1060,30 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
 
         n_scales = int(layer.num_kv_heads) if strategy == "attn_head" else 1
 
+        init_value = float("nan") if is_mla_fp8 else 1.0
         layer.k_scale = torch.nn.Parameter(
-            torch.ones(n_scales, requires_grad=False, dtype=torch.float32)
+            torch.full(
+                (n_scales,),
+                init_value,
+                requires_grad=False,
+                dtype=torch.float32,
+            )
         )
         layer.v_scale = torch.nn.Parameter(
-            torch.ones(n_scales, requires_grad=False, dtype=torch.float32)
+            torch.full(
+                (n_scales,),
+                init_value,
+                requires_grad=False,
+                dtype=torch.float32,
+            )
         )
         layer.q_scale = torch.nn.Parameter(
-            torch.ones(n_scales, requires_grad=False, dtype=torch.float32)
+            torch.full(
+                (n_scales,),
+                init_value,
+                requires_grad=False,
+                dtype=torch.float32,
+            )
         )
 
         # Zero points are not used in vLLM as currently only symmetric quantization is
@@ -1123,6 +1173,10 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         Override the default vLLM placeholder scales with the llm-compressor loaded
         scales. Zero points are not used as only symmetric quantization is supported.
         """
+        if self._is_mla_fp8(layer):
+            self._process_mla_fp8_scales(layer)
+            return
+
         layer._k_scale = layer.k_scale
         layer._v_scale = layer.v_scale
         layer._q_scale = layer.q_scale
@@ -1139,6 +1193,42 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         layer._q_scale_float = _to_scalar(layer.q_scale)
 
         # Discard all placeholders.
+        del layer.k_scale
+        del layer.v_scale
+        del layer.q_scale
+        del layer.k_zero_point
+        del layer.v_zero_point
+        del layer.q_zero_point
+
+    def _process_mla_fp8_scales(self, layer: torch.nn.Module) -> None:
+        """Load the single calibrated scale used by MLA's latent KV cache."""
+        self._validate_mla_fp8_scheme(layer)
+        if layer.k_scale.numel() != 1:
+            raise ValueError(
+                "FP8 MLAAttention requires exactly one checkpoint K/latent scale"
+            )
+
+        k_scale = float(layer.k_scale.detach().item())
+        if not torch.isfinite(layer.k_scale).all().item() or k_scale <= 0.0:
+            raise ValueError(
+                "FP8 MLAAttention checkpoint did not provide a finite positive "
+                "K/latent KV-cache scale"
+            )
+
+        q_scale = k_scale
+        if layer.q_scale.numel() == 1 and torch.isfinite(layer.q_scale).all().item():
+            loaded_q_scale = float(layer.q_scale.detach().item())
+            if loaded_q_scale > 0.0:
+                q_scale = loaded_q_scale
+
+        layer._k_scale.fill_(k_scale)
+        layer._v_scale.fill_(k_scale)
+        layer._q_scale.fill_(q_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = k_scale
+        layer._q_scale_float = q_scale
+        layer.calculate_kv_scales = False
+
         del layer.k_scale
         del layer.v_scale
         del layer.q_scale
