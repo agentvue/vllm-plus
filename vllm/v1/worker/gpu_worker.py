@@ -1213,12 +1213,25 @@ def init_worker_distributed_environment(
     if parallel_config.distributed_timeout_seconds is not None:
         timeout = timedelta(seconds=parallel_config.distributed_timeout_seconds)
 
+    init_backend = backend
+    model_parallel_backend = backend
+    if (
+        envs.VLLM_RAY_CPU_WORLD_GROUP
+        and parallel_config.distributed_executor_backend == "ray"
+    ):
+        logger.info(
+            "VLLM_RAY_CPU_WORLD_GROUP is enabled; initializing default "
+            "world process group with gloo and model-parallel groups with %s.",
+            backend,
+        )
+        init_backend = "gloo"
+
     init_distributed_environment(
         parallel_config.world_size,
         rank,
         init_method,
         local_rank,
-        backend,
+        init_backend,
         timeout,
     )
 
@@ -1227,6 +1240,7 @@ def init_worker_distributed_environment(
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
+        backend=model_parallel_backend,
     )
 
     # Init ec connector here before KV caches init

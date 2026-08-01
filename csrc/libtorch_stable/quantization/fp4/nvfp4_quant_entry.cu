@@ -173,3 +173,4 @@ void silu_and_mul_scaled_fp4_experts_quant(
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled silu_and_mul nvfp4 experts quantization kernel");
 }
+

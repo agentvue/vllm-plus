@@ -1,0 +1,35 @@
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 0985202..23ddbab 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -279,7 +279,7 @@ static ncclResult_t applyPeerRail(struct ncclComm* comm, struct ncclPeerInfo* my
+   *netDev = selectedDev;
+ 
+   INFO(NCCL_INIT | NCCL_NET,
+-       "Peer rail override rank %d node %d -> rank %d node %d: rail %d via NET/%s/%d", myInfo->rank,
++       "Peer rail override (local-port safe) rank %d node %d -> rank %d node %d: rail %d via NET/%s/%d", myInfo->rank,
+        myInfo->netNodeId, peerInfo->rank, peerInfo->netNodeId, railId, comm->ncclNet->name, *netDev);
+   return ncclSuccess;
+ }
+diff --git a/src/transport/net_ib/connect.cc b/src/transport/net_ib/connect.cc
+index e2c8ecb..e8bd98f 100644
+--- a/src/transport/net_ib/connect.cc
++++ b/src/transport/net_ib/connect.cc
+@@ -763,7 +763,7 @@ static ncclResult_t ncclIbSenderQpsToRts(ncclIbSendComm* comm, struct ncclIbConn
+     rtrAttr->remoteQpNum = remQpInfo->qpn;
+     rtrAttr->remoteLid = remDevInfo->lid;
+     rtrAttr->remoteGid = remDevInfo->gid;
+-    rtrAttr->localIbPort = remDevInfo->ib_port;
++    rtrAttr->localIbPort = ibDev->portNum;
+     rtrAttr->localPortFlags = ibDev->portAttr.flags;
+     rtrAttr->localGid = commDev->base.gidInfo.localGid;
+     rtrAttr->localGidIndex = commDev->base.gidInfo.localGidIndex;
+@@ -1249,7 +1249,7 @@ static ncclResult_t ncclIbReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
+     rtrAttr->remoteQpNum = remQpInfo->qpn;
+     rtrAttr->remoteLid = remDevInfo->lid;
+     rtrAttr->remoteGid = remDevInfo->gid;
+-    rtrAttr->localIbPort = remDevInfo->ib_port;
++    rtrAttr->localIbPort = ibDev->portNum;
+     rtrAttr->localPortFlags = ibDev->portAttr.flags;
+     rtrAttr->localGid = rCommDev->base.gidInfo.localGid;
+     rtrAttr->localGidIndex = rCommDev->base.gidInfo.localGidIndex;

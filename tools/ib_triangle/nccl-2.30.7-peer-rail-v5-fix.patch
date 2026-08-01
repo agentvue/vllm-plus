@@ -1,0 +1,127 @@
+diff --git a/src/graph/topo.cc b/src/graph/topo.cc
+index 40af488..3c5a0fb 100644
+--- a/src/graph/topo.cc
++++ b/src/graph/topo.cc
+@@ -1618,18 +1618,29 @@ static ncclResult_t ncclTopoPopulateNics(ncclXml* xml, int startIndex, int endIn
+   for (int n = startIndex; n < endIndex; n++) {
+     ncclNetProperties_t props;
+     NCCLCHECK(netInfo->getProperties(n, &props));
++    const char* topoName = props.name;
++    char peerRailName[PATH_MAX];
++    const char* peerRailMap = ncclGetEnv("NCCL_NET_PEER_RAIL_MAP");
++    if (netInfo->net && peerRailMap && peerRailMap[0] != '\0' && props.railId != NCCL_NET_ID_UNDEF) {
++      int len = snprintf(peerRailName, sizeof(peerRailName), "%s#rail%d", props.name, props.railId);
++      if (len < 0 || len >= (int)sizeof(peerRailName)) {
++        WARN("Peer-rail topology name is too long for network device '%s' rail %d", props.name, props.railId);
++        return ncclInvalidUsage;
++      }
++      topoName = peerRailName;
++    }
+     struct ncclXmlNode* netNode = NULL;
+     struct ncclXmlNode* parent = NULL;
+     if (virtualNics) {
+       struct ncclXmlNode* net = NULL;
+-      NCCLCHECK(xmlFindTagKv(xml, "net", &net, "name", props.name));
++      NCCLCHECK(xmlFindTagKv(xml, "net", &net, "name", topoName));
+       // In the event of multithreaded use case, we need to re-discover the shared parent of the given devices for
+       // this vNIC
+       // Only run this if the net doesn't exist locally - this may alter the XML state
+       if (net == NULL) NCCLCHECK(ncclTopoGetVNicParent(xml, netInfo->getProperties, &props.vProps, &parent));
+     }
+ 
+-    NCCLCHECK(ncclTopoFillNet(xml, "net", props.pciPath, props.name, &netNode, parent));
++    NCCLCHECK(ncclTopoFillNet(xml, "net", props.pciPath, topoName, &netNode, parent));
+ 
+     const char* colAttr;
+     NCCLCHECK(xmlGetAttr(netNode, "coll", &colAttr));
+@@ -1673,8 +1684,9 @@ static ncclResult_t ncclTopoPopulateNics(ncclXml* xml, int startIndex, int endIn
+     NCCLCHECK(xmlGetAttr(netNode, "keep", &keepAttr));
+     INFO(
+       NCCL_GRAPH,
+-      "ncclTopoPopulateNics : Filled %s in topo with pciPath=%s net=%s gin=%s rma=%s keep=%s coll=%s rail=%d plane=%d",
+-      props.name, props.pciPath, netAttr, ginAttr, rmaAttr, keepAttr, colAttr, props.railId, props.planeId);
++      "ncclTopoPopulateNics : Filled %s as %s in topo with pciPath=%s net=%s gin=%s rma=%s keep=%s coll=%s "
++      "rail=%d plane=%d",
++      props.name, topoName, props.pciPath, netAttr, ginAttr, rmaAttr, keepAttr, colAttr, props.railId, props.planeId);
+   }
+ 
+   return ncclSuccess;
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 23ddbab..433640d 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -17,6 +17,7 @@
+ #include "transport.h"
+ #include "shm.h"
+ #include "compiler.h"
++#include "graph/topo.h"
+ #include "param.h"
+ #include <errno.h>
+ #include <limits.h>
+@@ -250,7 +251,8 @@ static ncclResult_t getPeerRail(int peerNodeId, bool* enabled, int* railId) {
+ }
+ 
+ static ncclResult_t applyPeerRail(struct ncclComm* comm, struct ncclPeerInfo* myInfo,
+-                                  struct ncclPeerInfo* peerInfo, int* netDev) {
++                                  struct ncclPeerInfo* peerInfo, bool allowProxy, int64_t* netId, int* netDev,
++                                  int* proxyRank) {
+   if (myInfo->hostHash == peerInfo->hostHash) return ncclSuccess;
+ 
+   bool enabled;
+@@ -276,11 +278,36 @@ static ncclResult_t applyPeerRail(struct ncclComm* comm, struct ncclPeerInfo* my
+     return ncclInvalidUsage;
+   }
+ 
++  struct ncclTopoNode* selectedTopo = NULL;
++  for (int n = 0; n < comm->topo->nodes[NET].count; n++) {
++    struct ncclTopoNode* candidate = comm->topo->nodes[NET].nodes + n;
++    if (NCCL_TOPO_ID_SYSTEM_ID(candidate->id) != comm->topo->systemId || candidate->net.dev != selectedDev ||
++        candidate->net.railId != railId) {
++      continue;
++    }
++    if (selectedTopo != NULL) {
++      WARN("Multiple local topology devices match NCCL plugin device %d rail %d for peer node ID %d", selectedDev,
++           railId, peerInfo->netNodeId);
++      return ncclInvalidUsage;
++    }
++    selectedTopo = candidate;
++  }
++  if (selectedTopo == NULL) {
++    WARN("No local topology device matches NCCL plugin device %d rail %d for peer node ID %d", selectedDev,
++         railId, peerInfo->netNodeId);
++    return ncclInvalidUsage;
++  }
++
+   *netDev = selectedDev;
++  *netId = selectedTopo->id;
++  if (allowProxy) NCCLCHECK(ncclTopoGetIntermediateRank(comm->topo, myInfo->rank, *netId, proxyRank));
++  else *proxyRank = myInfo->rank;
+ 
+   INFO(NCCL_INIT | NCCL_NET,
+-       "Peer rail override (local-port safe) rank %d node %d -> rank %d node %d: rail %d via NET/%s/%d", myInfo->rank,
+-       myInfo->netNodeId, peerInfo->rank, peerInfo->netNodeId, railId, comm->ncclNet->name, *netDev);
++       "Peer rail override (topology-consistent) rank %d node %d -> rank %d node %d: rail %d via NET/%s/%d "
++       "topo_id=%lx proxy_rank=%d",
++       myInfo->rank, myInfo->netNodeId, peerInfo->rank, peerInfo->netNodeId, railId, comm->ncclNet->name, *netDev,
++       (unsigned long)*netId, *proxyRank);
+   return ncclSuccess;
+ }
+ 
+@@ -421,7 +448,7 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int proxyRank;
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
+-  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, &req.netDev));
++  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, /*allowProxy=*/true, &netId, &req.netDev, &proxyRank));
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 1, &req.useGdr));
+   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;
+@@ -471,7 +498,7 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, /*peerRank=*/myInfo->rank, &netId, &req.netDev,
+                               &proxyRank));
+-  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, &req.netDev));
++  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, /*allowProxy=*/false, &netId, &req.netDev, &proxyRank));
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 0, &req.useGdr));
+   recv->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;

@@ -95,6 +95,28 @@ def assert_executor(executor, tp_size, pp_size):
         assert handle.node_id is not None
 
 
+@pytest.mark.parametrize(
+    ("world_size", "driver_ranks"),
+    [
+        (4, [0, 1]),
+        (32, [3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 27]),
+    ],
+)
+def test_ray_v2_driver_local_reader_ranks(world_size, driver_ranks):
+    driver_node = "driver-node"
+    bundle_assignments = [
+        {
+            "rank": rank,
+            "node_id": driver_node if rank in driver_ranks else "remote-node",
+        }
+        for rank in range(world_size)
+    ]
+
+    assert RayExecutorV2._get_driver_local_reader_ranks(
+        bundle_assignments, driver_node
+    ) == driver_ranks
+
+
 @pytest.mark.parametrize("tp_size, pp_size", [(1, 1), (2, 1), (4, 1), (2, 2)])
 def test_ray_v2_executor(tp_size, pp_size):
     """Validate RayExecutorV2 with various TP/PP configs."""

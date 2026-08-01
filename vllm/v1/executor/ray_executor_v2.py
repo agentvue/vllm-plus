@@ -30,8 +30,11 @@ from vllm.v1.executor.ray_utils import (
     WORKER_SPECIFIC_ENV_VARS,
     build_actor_name,
     get_bundles_for_indices,
+    get_bundles_for_node_ips,
     get_bundles_sorted_by_node,
     initialize_ray_cluster,
+    parse_ray_node_env_vars_json,
+    parse_ray_ordered_node_ips,
     ray,
 )
 
@@ -43,6 +46,39 @@ else:
     ActorHandle = None
 
 logger = init_logger(__name__)
+
+TRANSPORT_ENV_LOG_KEYS = (
+    "VLLM_HOST_IP",
+    "NCCL_SOCKET_IFNAME",
+    "GLOO_SOCKET_IFNAME",
+    "NCCL_IB_HCA",
+    "NCCL_IB_MERGE_NICS",
+    "NCCL_NET_MERGE_LEVEL",
+    "NCCL_NET_MERGE_POLICY",
+    "NCCL_NETDEVS_POLICY",
+    "NCCL_CROSS_NIC",
+    "NCCL_SOCKET_FAMILY",
+    "NCCL_IB_DISABLE",
+    "NCCL_NET",
+    "VLLM_NCCL_SO_PATH",
+)
+
+
+def _transport_env_snapshot() -> dict[str, str]:
+    return {
+        key: os.environ[key]
+        for key in TRANSPORT_ENV_LOG_KEYS
+        if key in os.environ
+    }
+
+
+def _is_stale_ray_actor_handle_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        exc.__class__.__name__ == "ActorHandleNotFoundError"
+        or "not valid across Ray sessions" in message
+        or "actor handle from previous session" in message
+    )
 
 
 @dataclass
@@ -60,6 +96,9 @@ class RayWorkerHandle:
 
     node_id: str
     """Node ID of the worker"""
+
+    node_ip: str
+    """Node IP of the worker"""
 
     bundle_id_idx: int = -1
     """Placement group bundle index for the worker"""
@@ -154,6 +193,12 @@ class RayWorkerProc(WorkerProc):
                 os.environ.setdefault(key, value)
         for key, value in env_vars.items():
             os.environ[key] = value
+        logger.info(
+            "RayWorkerProc rank=%d local_rank=%d transport env: %s",
+            self._init_kwargs["rank"],
+            local_rank,
+            _transport_env_snapshot(),
+        )
 
         if assigned_physical_gpu_ids is not None:
             vllm_config = self._init_kwargs["vllm_config"]
@@ -251,6 +296,28 @@ class RayExecutorV2(MultiprocExecutor):
         return runtime_env
 
     @staticmethod
+    def _build_actor_runtime_env(
+        runtime_env: dict,
+        worker_env_vars: dict[str, str],
+    ) -> dict:
+        actor_runtime_env = copy.deepcopy(runtime_env)
+        if worker_env_vars:
+            env_vars = actor_runtime_env.setdefault("env_vars", {})
+            env_vars.update(worker_env_vars)
+        return actor_runtime_env
+
+    @staticmethod
+    def _get_driver_local_reader_ranks(
+        bundle_assignments: list[dict[str, Any]],
+        driver_node: str,
+    ) -> list[int]:
+        return [
+            assignment["rank"]
+            for assignment in bundle_assignments
+            if assignment["node_id"] == driver_node
+        ]
+
+    @staticmethod
     def _get_actor_resource_kwargs() -> dict[str, Any]:
         """Return Ray actor resource kwargs for the current platform."""
         num_devices = envs.VLLM_RAY_PER_WORKER_GPUS
@@ -282,8 +349,19 @@ class RayExecutorV2(MultiprocExecutor):
         )
 
         # Step 2: Build bundle assignments for worker rank placement
-        # while respecting VLLM_RAY_BUNDLE_INDICES.
-        if envs.VLLM_RAY_BUNDLE_INDICES:
+        # while respecting explicit rank placement env vars.
+        if envs.VLLM_RAY_ORDERED_NODE_IPS and envs.VLLM_RAY_BUNDLE_INDICES:
+            raise ValueError(
+                "VLLM_RAY_ORDERED_NODE_IPS and VLLM_RAY_BUNDLE_INDICES "
+                "cannot be set at the same time."
+            )
+        if envs.VLLM_RAY_ORDERED_NODE_IPS:
+            bundle_to_node_id = get_bundles_for_node_ips(
+                placement_group,
+                parse_ray_ordered_node_ips(envs.VLLM_RAY_ORDERED_NODE_IPS),
+                self.world_size,
+            )
+        elif envs.VLLM_RAY_BUNDLE_INDICES:
             bundle_to_node_id = get_bundles_for_indices(
                 placement_group,
                 list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))),
@@ -303,6 +381,39 @@ class RayExecutorV2(MultiprocExecutor):
                     "node_ip": node_ip,
                 }
             )
+        logger.info(
+            "RayExecutorV2 rank placement: %s",
+            [
+                (
+                    a["rank"],
+                    a["bundle_id_idx"],
+                    a["node_ip"],
+                    str(a["node_id"])[:8],
+                )
+                for a in bundle_assignments
+            ],
+        )
+        node_env_vars_by_ip = parse_ray_node_env_vars_json(
+            envs.VLLM_RAY_NODE_ENV_VARS_JSON
+        )
+        if node_env_vars_by_ip:
+            placement_node_ips = {a["node_ip"] for a in bundle_assignments}
+            missing_node_ips = sorted(
+                placement_node_ips - set(node_env_vars_by_ip)
+            )
+            if missing_node_ips:
+                raise ValueError(
+                    "VLLM_RAY_NODE_ENV_VARS_JSON is set but does not include "
+                    f"env vars for Ray node IPs used by placement: "
+                    f"{missing_node_ips}."
+                )
+            unused_node_ips = sorted(set(node_env_vars_by_ip) - placement_node_ips)
+            if unused_node_ips:
+                logger.warning(
+                    "VLLM_RAY_NODE_ENV_VARS_JSON includes unused Ray node IPs: "
+                    "%s",
+                    unused_node_ips,
+                )
 
         # Step 3: Resolve the IP for torch.distributed TCPStore.
         # The TCPStore server runs on rank 0's node, so all workers
@@ -313,10 +424,24 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        local_reader_ranks = self._get_driver_local_reader_ranks(
+            bundle_assignments, driver_node
+        )
+        remote_reader_ranks = [
+            assignment["rank"]
+            for assignment in bundle_assignments
+            if assignment["node_id"] != driver_node
+        ]
+        logger.info(
+            "Ray broadcast message queue reader placement: local_ranks=%s "
+            "remote_ranks=%s",
+            local_reader_ranks,
+            remote_reader_ranks,
+        )
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
-            n_local,
+            len(local_reader_ranks),
+            local_reader_ranks=local_reader_ranks,
             max_chunk_bytes=max_chunk_bytes,
             connect_ip=ray.util.get_node_ip_address(),
         )
@@ -336,10 +461,15 @@ class RayExecutorV2(MultiprocExecutor):
         runtime_env = self._build_runtime_env()
         resource_kwargs = self._get_actor_resource_kwargs()
 
+        logger.info("Creating %d RayWorkerProc actors.", self.world_size)
         for bundle_idx in range(self.world_size):
             bundle = bundle_assignments[bundle_idx]
             is_driver_worker = self._is_driver_worker(bundle["rank"])
             is_driver_node = bundle["node_id"] == driver_node
+            worker_env_vars = node_env_vars_by_ip.get(bundle["node_ip"], {})
+            actor_runtime_env = self._build_actor_runtime_env(
+                runtime_env, worker_env_vars
+            )
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=placement_group,
@@ -357,7 +487,7 @@ class RayExecutorV2(MultiprocExecutor):
                     num_cpus=0,
                     **resource_kwargs,
                     scheduling_strategy=scheduling_strategy,
-                    runtime_env=runtime_env,
+                    runtime_env=actor_runtime_env,
                 )
                 .remote(
                     vllm_config=self.vllm_config,
@@ -374,17 +504,68 @@ class RayExecutorV2(MultiprocExecutor):
                 rank=bundle["rank"],
                 local_rank=-1,  # Set in Step 7 after GPU ID discovery
                 node_id=bundle["node_id"],
+                node_ip=bundle["node_ip"],
                 bundle_id_idx=bundle["bundle_id_idx"],
             )
             self.ray_worker_handles.append(handle)
+            logger.info(
+                "Created RayWorkerProc actor rank=%d bundle=%d node_ip=%s "
+                "node_id=%s transport_env_overrides=%s.",
+                bundle["rank"],
+                bundle["bundle_id_idx"],
+                bundle["node_ip"],
+                str(bundle["node_id"])[:8],
+                worker_env_vars,
+            )
 
         # Step 6: Discover physical GPU IDs assigned to each worker via Ray
         # runtime context.
-        worker_node_and_physical_gpu_ids = ray.get(
-            [
-                h.actor.get_node_and_physical_gpu_ids.remote()
-                for h in self.ray_worker_handles
+        discovery_refs = [
+            h.actor.get_node_and_physical_gpu_ids.remote()
+            for h in self.ray_worker_handles
+        ]
+        start_timeout = envs.VLLM_RAY_WORKER_START_TIMEOUT_S
+        logger.info(
+            "Waiting up to %d seconds for Ray workers to start and report "
+            "assigned GPUs.",
+            start_timeout,
+        )
+        ready_refs, pending_refs = ray.wait(
+            discovery_refs,
+            num_returns=len(discovery_refs),
+            timeout=start_timeout,
+        )
+        if pending_refs:
+            ref_to_handle = {
+                ref: handle
+                for ref, handle in zip(discovery_refs, self.ray_worker_handles)
+            }
+            pending_workers = [
+                {
+                    "rank": ref_to_handle[ref].rank,
+                    "bundle_id_idx": ref_to_handle[ref].bundle_id_idx,
+                    "node_id": ref_to_handle[ref].node_id,
+                    "node_ip": ref_to_handle[ref].node_ip,
+                }
+                for ref in pending_refs
             ]
+            ready_ranks = sorted(ref_to_handle[ref].rank for ref in ready_refs)
+            raise RuntimeError(
+                "Timed out waiting for Ray workers to start before model "
+                f"loading. ready_ranks={ready_ranks}, "
+                f"pending_workers={pending_workers}. Check the corresponding "
+                "Ray worker logs and raylet logs for actor startup failures."
+            )
+
+        worker_node_and_physical_gpu_ids = ray.get(discovery_refs)
+        logger.info(
+            "Ray workers reported node/GPU assignments: %s",
+            [
+                (rank, node_id[:8], gpu_ids)
+                for rank, (node_id, gpu_ids) in enumerate(
+                    worker_node_and_physical_gpu_ids
+                )
+            ],
         )
 
         node_workers: dict[str, list[int]] = defaultdict(list)
@@ -400,10 +581,20 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 7: Initialize workers with local logical ranks and the
         # logical-to-physical GPU mapping discovered from Ray placement.
         init_worker_refs = []
+        logger.info("Initializing Ray workers after GPU assignment.")
         for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
             local_rank = node_workers[node_id].index(i)
             assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
-            worker_env_vars: dict[str, str] = {}
+            node_ip = bundle_assignments[i]["node_ip"]
+            worker_env_vars = node_env_vars_by_ip.get(node_ip, {})
+            logger.info(
+                "Initializing Ray worker rank=%d node_ip=%s local_rank=%d "
+                "with transport env overrides: %s",
+                self.ray_worker_handles[i].rank,
+                node_ip,
+                local_rank,
+                worker_env_vars,
+            )
             self.ray_worker_handles[i].local_rank = local_rank
             init_worker_refs.append(
                 self.ray_worker_handles[i].actor.initialize_worker.remote(
@@ -420,9 +611,41 @@ class RayExecutorV2(MultiprocExecutor):
             self.vllm_config.parallel_config.assigned_physical_gpu_ids = sorted(
                 node_physical_gpu_ids[node_id_0]
             )
+        init_timeout = envs.VLLM_RAY_WORKER_INIT_TIMEOUT_S
+        logger.info(
+            "Waiting up to %d seconds for Ray worker model initialization.",
+            init_timeout,
+        )
+        ready_refs, pending_refs = ray.wait(
+            init_worker_refs,
+            num_returns=len(init_worker_refs),
+            timeout=init_timeout,
+        )
+        if pending_refs:
+            ref_to_handle = {
+                ref: handle
+                for ref, handle in zip(init_worker_refs, self.ray_worker_handles)
+            }
+            pending_workers = [
+                {
+                    "rank": ref_to_handle[ref].rank,
+                    "bundle_id_idx": ref_to_handle[ref].bundle_id_idx,
+                    "node_id": ref_to_handle[ref].node_id,
+                    "node_ip": ref_to_handle[ref].node_ip,
+                }
+                for ref in pending_refs
+            ]
+            ready_ranks = sorted(ref_to_handle[ref].rank for ref in ready_refs)
+            raise RuntimeError(
+                "Timed out waiting for Ray worker model initialization. "
+                f"ready_ranks={ready_ranks}, "
+                f"pending_workers={pending_workers}. Check Ray worker logs "
+                "for the last WorkerProc initialization stage."
+            )
         ray.get(init_worker_refs)
 
         # Step 8: Collect response MQ handles
+        logger.info("Collecting Ray worker response message queues.")
         init_results = ray.get(
             [h.actor.wait_for_init.remote() for h in self.ray_worker_handles]
         )
@@ -537,8 +760,16 @@ class RayExecutorV2(MultiprocExecutor):
             try:
                 ray.kill(handle.actor)
                 logger.debug("Killed actor rank=%d", handle.rank)
-            except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+            except Exception as e:
+                if _is_stale_ray_actor_handle_error(e):
+                    logger.debug(
+                        "Ignoring stale Ray actor handle for rank=%d during "
+                        "shutdown: %s",
+                        handle.rank,
+                        e,
+                    )
+                else:
+                    logger.exception("Failed to kill actor rank=%d", handle.rank)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()

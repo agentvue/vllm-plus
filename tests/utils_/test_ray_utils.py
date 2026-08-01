@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.v1.executor.ray_utils import get_bundles_sorted_by_node
+from vllm.v1.executor.ray_utils import (
+    get_bundles_for_node_ips,
+    get_bundles_sorted_by_node,
+    parse_ray_node_env_vars_json,
+    parse_ray_ordered_node_ips,
+)
 
 NODE_A = "node_a"
 NODE_B = "node_b"
@@ -98,3 +103,76 @@ def test_get_bundles_sorted_by_node(bundles_to_node_id, bundle_specs, expected):
         result = get_bundles_sorted_by_node(mock_pg)
 
     assert result == expected
+
+
+def test_parse_ray_ordered_node_ips():
+    result = parse_ray_ordered_node_ips(" 10.0.0.1,10.0.0.2,, 10.0.0.3 ")
+
+    assert result == [IP_A, IP_B, IP_C]
+
+
+def test_parse_ray_node_env_vars_json():
+    result = parse_ray_node_env_vars_json(
+        '{"10.0.0.1":{"VLLM_HOST_IP":"10.0.0.1","NCCL_IB_HCA":"mlx5_0:1"}}'
+    )
+
+    assert result == {
+        IP_A: {
+            "VLLM_HOST_IP": IP_A,
+            "NCCL_IB_HCA": "mlx5_0:1",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[1, 2, 3]",
+        '{"10.0.0.1":["NCCL_IB_HCA"]}',
+        '{"10.0.0.1":{"NCCL_IB_HCA":1}}',
+    ],
+)
+def test_parse_ray_node_env_vars_json_rejects_invalid_shapes(value):
+    with pytest.raises(ValueError, match="VLLM_RAY_NODE_ENV_VARS_JSON"):
+        parse_ray_node_env_vars_json(value)
+
+
+def test_get_bundles_for_node_ips():
+    mock_pg = MagicMock()
+    mock_pg.bundle_specs = [{"CPU": 1}, {"GPU": 1}, {"GPU": 1}, {"GPU": 1}]
+
+    with (
+        patch(
+            "vllm.v1.executor.ray_utils.placement_group_table",
+            return_value={"bundles_to_node_id": {1: NODE_B, 2: NODE_A, 3: NODE_C}},
+        ),
+        patch("vllm.v1.executor.ray_utils.ray") as mock_ray,
+        patch("vllm.v1.executor.ray_utils.current_platform") as mock_platform,
+    ):
+        mock_ray.nodes.return_value = MOCK_RAY_NODES
+        mock_platform.ray_device_key = "GPU"
+
+        result = get_bundles_for_node_ips(
+            mock_pg, [IP_B, IP_A, IP_C], world_size=3
+        )
+
+    assert result == [(1, NODE_B, IP_B), (2, NODE_A, IP_A), (3, NODE_C, IP_C)]
+
+
+def test_get_bundles_for_node_ips_rejects_mismatch():
+    mock_pg = MagicMock()
+    mock_pg.bundle_specs = [{"GPU": 1}]
+
+    with (
+        patch(
+            "vllm.v1.executor.ray_utils.placement_group_table",
+            return_value={"bundles_to_node_id": {0: NODE_A}},
+        ),
+        patch("vllm.v1.executor.ray_utils.ray") as mock_ray,
+        patch("vllm.v1.executor.ray_utils.current_platform") as mock_platform,
+    ):
+        mock_ray.nodes.return_value = MOCK_RAY_NODES
+        mock_platform.ray_device_key = "GPU"
+
+        with pytest.raises(RuntimeError, match="placement mismatch"):
+            get_bundles_for_node_ips(mock_pg, [IP_B], world_size=1)

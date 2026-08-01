@@ -1,0 +1,12 @@
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index e0d3488..0985202 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -17,7 +17,6 @@
+ #include "transport.h"
+ #include "shm.h"
+ #include "compiler.h"
+-#include "graph/topo.h"
+ #include "param.h"
+ #include <errno.h>
+ #include <limits.h>

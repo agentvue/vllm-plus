@@ -1,0 +1,92 @@
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 69d17f6..0985202 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -17,7 +17,6 @@
+ #include "transport.h"
+ #include "shm.h"
+ #include "compiler.h"
+-#include "graph/topo.h"
+ #include "param.h"
+ #include <errno.h>
+ #include <limits.h>
+@@ -251,8 +250,7 @@ static ncclResult_t getPeerRail(int peerNodeId, bool* enabled, int* railId) {
+ }
+ 
+ static ncclResult_t applyPeerRail(struct ncclComm* comm, struct ncclPeerInfo* myInfo,
+-                                  struct ncclPeerInfo* peerInfo, bool allowProxy, int64_t* netId, int* netDev,
+-                                  int* proxyRank) {
++                                  struct ncclPeerInfo* peerInfo, int* netDev) {
+   if (myInfo->hostHash == peerInfo->hostHash) return ncclSuccess;
+ 
+   bool enabled;
+@@ -260,38 +258,25 @@ static ncclResult_t applyPeerRail(struct ncclComm* comm, struct ncclPeerInfo* my
+   NCCLCHECK(getPeerRail(peerInfo->netNodeId, &enabled, &railId));
+   if (!enabled) return ncclSuccess;
+ 
+-  int gpuIndex;
+-  NCCLCHECK(ncclTopoRankToIndex(comm->topo, myInfo->rank, &gpuIndex, /*showWarn=*/true));
+-  struct ncclTopoNode* gpu = comm->topo->nodes[GPU].nodes + gpuIndex;
+-  int best = -1;
+-  for (int n = 0; n < comm->topo->nodes[NET].count; n++) {
+-    struct ncclTopoNode* candidate = comm->topo->nodes[NET].nodes + n;
+-    if (NCCL_TOPO_ID_SYSTEM_ID(candidate->id) != comm->topo->systemId || candidate->net.railId != railId) continue;
+-    if (best == -1) {
+-      best = n;
+-      continue;
+-    }
+-
+-    struct ncclTopoLinkList* candidatePath = gpu->paths[NET] + n;
+-    struct ncclTopoLinkList* bestPath = gpu->paths[NET] + best;
+-    if (candidatePath->type < bestPath->type ||
+-        (candidatePath->type == bestPath->type && candidatePath->bw > bestPath->bw) ||
+-        (candidatePath->type == bestPath->type && candidatePath->bw == bestPath->bw &&
+-         candidate->net.dev < comm->topo->nodes[NET].nodes[best].net.dev)) {
+-      best = n;
++  int deviceCount = 0;
++  NCCLCHECK(comm->ncclNet->devices(&deviceCount));
++  int selectedDev = -1;
++  int selectedSpeed = -1;
++  for (int dev = 0; dev < deviceCount; dev++) {
++    ncclNetProperties_t props;
++    NCCLCHECK(comm->ncclNet->getProperties(dev, &props));
++    if (props.railId == railId && (selectedDev == -1 || props.speed > selectedSpeed)) {
++      selectedDev = dev;
++      selectedSpeed = props.speed;
+     }
+   }
+ 
+-  if (best == -1) {
+-    WARN("No local NCCL network device advertises rail %d for peer node ID %d", railId, peerInfo->netNodeId);
++  if (selectedDev == -1) {
++    WARN("No local NCCL plugin device advertises rail %d for peer node ID %d", railId, peerInfo->netNodeId);
+     return ncclInvalidUsage;
+   }
+ 
+-  struct ncclTopoNode* selected = comm->topo->nodes[NET].nodes + best;
+-  *netId = selected->id;
+-  *netDev = selected->net.dev;
+-  if (allowProxy) NCCLCHECK(ncclTopoGetIntermediateRank(comm->topo, myInfo->rank, *netId, proxyRank));
+-  else *proxyRank = myInfo->rank;
++  *netDev = selectedDev;
+ 
+   INFO(NCCL_INIT | NCCL_NET,
+        "Peer rail override rank %d node %d -> rank %d node %d: rail %d via NET/%s/%d", myInfo->rank,
+@@ -436,7 +421,7 @@ static ncclResult_t sendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int proxyRank;
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, peerInfo->rank, &netId, &req.netDev, &proxyRank));
+-  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, /*allowProxy=*/true, &netId, &req.netDev, &proxyRank));
++  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, &req.netDev));
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 1, &req.useGdr));
+   send->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;
+@@ -486,7 +471,7 @@ static ncclResult_t recvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph
+   int64_t netId;
+   NCCLCHECK(ncclTopoGetNetDev(comm, myInfo->rank, graph, channelId, /*peerRank=*/myInfo->rank, &netId, &req.netDev,
+                               &proxyRank));
+-  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, /*allowProxy=*/false, &netId, &req.netDev, &proxyRank));
++  NCCLCHECK(applyPeerRail(comm, myInfo, peerInfo, &req.netDev));
+   NCCLCHECK(ncclTopoCheckGdr(comm->topo, myInfo->rank, netId, 0, &req.useGdr));
+   recv->conn.flags |= req.useGdr ? NCCL_DIRECT_NIC : 0;
+   if (!req.useGdr && connIndex == 0) comm->useGdr = 0;

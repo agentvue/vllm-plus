@@ -602,6 +602,11 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d starting wrapper init.",
+            rank,
+            local_rank,
+        )
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -617,21 +622,46 @@ class WorkerProc:
         }
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d finished wrapper init.",
+            rank,
+            local_rank,
+        )
 
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
         )
 
         # Load model
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d starting device/distributed init.",
+            rank,
+            local_rank,
+        )
         self.worker.init_device()
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d finished device/distributed init.",
+            rank,
+            local_rank,
+        )
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
+        )
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d starting model load.",
+            rank,
+            local_rank,
         )
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d finished model load.",
+            rank,
+            local_rank,
+        )
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
@@ -649,7 +679,17 @@ class WorkerProc:
 
         # Initialize message queues after init_device() since multi-node setups
         # (nnodes_within_dp > 1) require distributed groups to be initialized
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d starting message queue init.",
+            rank,
+            local_rank,
+        )
         self._init_message_queues(input_shm_handle, vllm_config)
+        logger.info(
+            "WorkerProc rank=%d local_rank=%d finished message queue init.",
+            rank,
+            local_rank,
+        )
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
