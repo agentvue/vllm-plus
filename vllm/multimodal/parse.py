@@ -554,9 +554,10 @@ class MultiModalDataParser:
             embedding inputs. If provided, validates that user-supplied
             embeddings have the correct hidden size to prevent crashes
             during model inference.
-        allow_missing_mm_embeddings (bool): Whether pre-computed embedding
-            tensors may be absent from the request on a disaggregated consumer.
-            Derived by `BaseProcessingInfo.allow_missing_mm_embeddings`.
+        embeds_from_ec_connector (bool): Whether pre-computed embeddings may be
+            absent from the request because an encode/prefill/decode encoder
+            instance publishes them through an EC connector instead. Derived by
+            `BaseProcessingInfo.embeds_from_ec_connector`.
     """
 
     embedding_fields: Mapping[str, Mapping[str, EmbeddingFieldRole]] = {}
@@ -593,7 +594,7 @@ class MultiModalDataParser:
         """
         metadata = self.placeholder_metadata_fields(modality)
         values = set(self.embedding_fields.get(modality, {})) - metadata
-        if self.allow_missing_mm_embeddings:
+        if self.embeds_from_ec_connector:
             return metadata, values
         return metadata | values, set()
 
@@ -605,11 +606,11 @@ class MultiModalDataParser:
         audio_resample_method: Literal["pyav", "scipy", "soxr"] = "pyav",
         video_needs_metadata: bool = False,
         expected_hidden_size: int | None = None,
-        allow_missing_mm_embeddings: bool = False,
+        embeds_from_ec_connector: bool = False,
     ) -> None:
         super().__init__()
 
-        self.allow_missing_mm_embeddings = allow_missing_mm_embeddings
+        self.embeds_from_ec_connector = embeds_from_ec_connector
 
         self.audio_resampler = AudioResampler(
             target_sr=target_sr,

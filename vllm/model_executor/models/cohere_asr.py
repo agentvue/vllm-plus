@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import BatchFeature, PretrainedConfig
+from transformers import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, SpeechToTextConfig, VllmConfig
@@ -45,12 +45,9 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
     EncDecMultiModalProcessor,
-    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
-    TimingContext,
 )
-from vllm.multimodal.processing.processor import MultiModalProcessingInfo
 from vllm.renderers import TokenizeParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.transformers_utils.processors.cohere_asr import (
@@ -59,7 +56,6 @@ from vllm.transformers_utils.processors.cohere_asr import (
     CohereASRProcessor,
 )
 from vllm.utils.collection_utils import is_list_of
-from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backend import (
     AttentionType,
 )
@@ -1774,9 +1770,10 @@ class CohereASRModel(nn.Module):
                 out = self.encoder_decoder_proj(out)
 
             # Convert padded tensor to packed
-            with gpu_sync_allowed():
-                lengths = encoder_output_length.tolist()
-            outs = [feat[:length, :] for feat, length in zip(out, lengths)]
+            outs = []
+            for i, feat in enumerate(out):
+                feat_len = encoder_output_length[i]
+                outs.append(feat[:feat_len, :])
 
             return outs
         else:
@@ -1939,56 +1936,34 @@ class CohereASRMultiModalProcessor(EncDecMultiModalProcessor[CohereASRProcessing
 
     def create_encoder_prompt(
         self,
-        prompt: list[int],
+        prompt: str | list[int],
         mm_items: MultiModalDataItems,
-    ) -> list[int]:
+    ) -> str | list[int]:
         return [0]
 
-    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
-        return self.dummy_inputs.get_dummy_text(mm_counts)
-
-    def _preprocess_hf_mm_data(
+    def _call_hf_processor(
         self,
+        prompt: str,
         mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-
-        mm_data = dict(mm_data)
-        mm_data["audio"] = mm_data.pop("audios")
-
-        hf_processor_mm_kwargs = dict(
-            **hf_processor_mm_kwargs,
-            sampling_rate=feature_extractor.sampling_rate,
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ):
+        if mm_data:
+            feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
+            mm_data = dict(audio=dict(mm_data).pop("audios"))
+            mm_kwargs = dict(
+                **mm_kwargs,
+                sampling_rate=feature_extractor.sampling_rate,
+            )
+        processed_outputs = super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
         )
-
-        return mm_data, hf_processor_mm_kwargs
-
-    def _postprocess_hf_mm_data(
-        self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-        processed_data: BatchFeature,
-    ) -> BatchFeature:
-        if "labels" in processed_data:
-            processed_data["input_ids"] = processed_data.pop("labels")
-
-        return processed_data
-
-    def _cached_apply_hf_processor(
-        self,
-        inputs: ProcessorInputs,
-        timing_ctx: TimingContext,
-    ) -> MultiModalProcessingInfo:
-        # Dithering injects noise into the extracted features, so the
-        # feature extractor is not a pure function of its input. Since the
-        # processing cache assumes that processor outputs are invariant
-        # across calls, bypass the cache when dithering is active.
-        preproc = self.info.get_hf_config().preprocessor
-        if preproc.get("dither", 1e-05) > 0:
-            return self._apply_hf_processor(inputs, timing_ctx)
-
-        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+        if "labels" in processed_outputs:
+            processed_outputs["input_ids"] = processed_outputs.pop("labels")
+        return processed_outputs
 
     def _get_mm_fields_config(
         self,
@@ -2039,15 +2014,7 @@ class CohereAsrForConditionalGeneration(
     }
 
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".fc1.": ".mlp.fc1.",
-            ".fc2.": ".mlp.fc2.",
-            "model.conv.batch_norm.num_batches_tracked": None,
-        },
-        orig_to_new_prefix={
-            "model.preprocessor.featurizer.fb": None,
-            "model.preprocessor.featurizer.window": None,
-        },
+        orig_to_new_substr={".fc1.": ".mlp.fc1.", ".fc2.": ".mlp.fc2."}
     )
 
     supports_transcription_only = True
@@ -2306,7 +2273,14 @@ class CohereAsrForConditionalGeneration(
 
             return name, loaded_weight
 
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=[
+                "model.preprocessor.featurizer.fb",
+                "model.preprocessor.featurizer.window",
+            ],
+            skip_substrs=["model.conv.batch_norm.num_batches_tracked"],
+        )
 
         return loader.load_weights(
             map(transform, weights), mapper=self.hf_to_vllm_mapper

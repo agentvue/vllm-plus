@@ -531,6 +531,16 @@ class GroupCoordinator:
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
+        pynccl_comm = getattr(self.device_communicator, "pynccl_comm", None)
+        self.use_pynccl_tensor_p2p = (
+            group_name == "pp"
+            and pynccl_comm is not None
+            and not pynccl_comm.disabled
+        )
+        if self.use_pynccl_tensor_p2p:
+            logger.info_once(
+                "Using PyNccl for pipeline-parallel intermediate tensor P2P."
+            )
 
     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
         """Create a new device-side ProcessGroup with the same per-rank membership
@@ -1054,6 +1064,8 @@ class GroupCoordinator:
         assert len(tensor_keys) == len(tensor_list)
 
         handles: list[Handle] = []
+        device_ops: list[torch.distributed.P2POp] = []
+        device_tensors: list[torch.Tensor] = []
         for key, tensor in zip(tensor_keys, tensor_list):
             if tensor.numel() == 0:
                 continue
@@ -1064,12 +1076,30 @@ class GroupCoordinator:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
+            if not tensor.is_cpu and self.use_pynccl_tensor_p2p:
+                device_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        tensor,
+                        self.ranks[dst],
+                        comm_group,
+                    )
+                )
+                device_tensors.append(tensor)
+            else:
+                handle = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=comm_group
+                )
+                if tensor.is_cuda:
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                handles.append(handle)
+
+        if device_ops:
+            assert self.device_communicator is not None
+            self.device_communicator.batch_isend_irecv(device_ops)
+            for tensor in device_tensors:
+                if tensor.is_cuda:
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
 
         return handles
 
@@ -1148,6 +1178,7 @@ class GroupCoordinator:
         recv_metadata_list = self.recv_object(src=src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
+        device_ops: list[torch.distributed.P2POp] = []
         postprocess: list[Callable[[], None]] = []
 
         for key, value in recv_metadata_list:
@@ -1167,10 +1198,23 @@ class GroupCoordinator:
                         all_gather_rank
                     ]
                     comm_group = metadata_group if slice_tensor.is_cpu else group
-                    handle = torch.distributed.irecv(
-                        slice_tensor, src=self.ranks[src], group=comm_group
-                    )
-                    handles.append(handle)
+                    if not slice_tensor.is_cpu and self.use_pynccl_tensor_p2p:
+                        device_ops.append(
+                            torch.distributed.P2POp(
+                                torch.distributed.irecv,
+                                slice_tensor,
+                                self.ranks[src],
+                                comm_group,
+                            )
+                        )
+                    else:
+                        handles.append(
+                            torch.distributed.irecv(
+                                slice_tensor,
+                                src=self.ranks[src],
+                                group=comm_group,
+                            )
+                        )
 
                     def _postprocess(
                         key: str = key,
@@ -1187,13 +1231,30 @@ class GroupCoordinator:
                     tensor_dict[key] = slice_tensor
                 else:
                     comm_group = metadata_group if full_tensor.is_cpu else group
-                    handle = torch.distributed.irecv(
-                        full_tensor, src=self.ranks[src], group=comm_group
-                    )
-                    handles.append(handle)
+                    if not full_tensor.is_cpu and self.use_pynccl_tensor_p2p:
+                        device_ops.append(
+                            torch.distributed.P2POp(
+                                torch.distributed.irecv,
+                                full_tensor,
+                                self.ranks[src],
+                                comm_group,
+                            )
+                        )
+                    else:
+                        handles.append(
+                            torch.distributed.irecv(
+                                full_tensor,
+                                src=self.ranks[src],
+                                group=comm_group,
+                            )
+                        )
                     tensor_dict[key] = full_tensor
             else:
                 tensor_dict[key] = value
+
+        if device_ops:
+            assert self.device_communicator is not None
+            self.device_communicator.batch_isend_irecv(device_ops)
 
         return tensor_dict, handles, postprocess
 
@@ -1366,21 +1427,21 @@ def _replace_active_groups(
     ep: GroupCoordinator | None,
     eplb: GroupCoordinator | None,
     node_count: int | None,
-) -> tuple[GroupCoordinator | None, ...]:
-    """Replace the active groups and return the groups they replaced.
+) -> None:
+    """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
 
-    The caller must destroy the returned DP, EP, WORLD, and EPLB groups
-    collectively and in that order. Pass all-``None`` to remove the active
-    groups without replacement.
+    Destruction is collective — all ranks in the old groups must call this
+    function together.  Pass all-``None`` to tear down without replacement.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
-    old_groups = _DP, _EP, _WORLD, _EPLB
+    for group in (_DP, _EP, _WORLD, _EPLB):
+        if group is not None:
+            group.destroy()
     _WORLD = world
     _DP = dp
     _EP = ep
     _EPLB = eplb
     _NODE_COUNT = node_count
-    return old_groups
 
 
 _TP: GroupCoordinator | None = None

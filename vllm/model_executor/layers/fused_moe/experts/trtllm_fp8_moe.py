@@ -36,28 +36,6 @@ from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 logger = init_logger(__name__)
 
 
-def prepare_deepseek_fp8_x_sf(x: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
-    """Validate DeepSeek Blockwise FP8 tensors and return TRTLLM layout."""
-    if x.dtype != current_platform.fp8_dtype():
-        raise ValueError(
-            f"DeepSeekFp8 activations must use the platform E4M3 dtype; got {x.dtype}"
-        )
-    if x.ndim != 2 or x.shape[1] % 128 != 0:
-        raise ValueError(
-            "DeepSeekFp8 activations must be [M,K] with K divisible by 128; "
-            f"got {tuple(x.shape)}"
-        )
-    expected_shape = (x.shape[0], x.shape[1] // 128)
-    if x_sf.dtype != torch.float32 or tuple(x_sf.shape) != expected_shape:
-        raise ValueError(
-            "DeepSeekFp8 activation scales must be FP32 [M,K/128]; "
-            f"expected {expected_shape}, got dtype={x_sf.dtype}, "
-            f"shape={tuple(x_sf.shape)}"
-        )
-    # FlashInfer TRTLLM-gen consumes [K/128,M] for DeepSeekFp8/BlockMajorK.
-    return x_sf.t().contiguous()
-
-
 class TrtLlmFp8ExpertsBase:
     """
     Fp8 TRTLLM-Gen MoE kernels. Shared base for modular and monolithic
@@ -79,27 +57,12 @@ class TrtLlmFp8ExpertsBase:
             activation_key,
             activation_format,
         )
-        if not supported:
+        if not supported or moe_config.num_experts <= 2048:
             return supported, reason
-        # FlashInfer accepts gemm1_alpha/beta/clamp_limit only for MXFP8; the
-        # DeepSeek-FP8 block-scale kernel rejects them and the per-tensor kernel
-        # has no clamp at all, so a model-requested SwiGLU clamp cannot be
-        # honored on those paths.
-        if (
-            moe_config.swiglu_limit is not None
-            or moe_config.swiglu_alpha is not None
-            or moe_config.swiglu_beta is not None
-        ) and (weight_key, activation_key) != (kMxfp8Static, kMxfp8Dynamic):
-            return False, (
-                "the TRTLLM FP8 kernels apply the SwiGLU alpha/beta/clamp "
-                "parameters only for MXFP8 weights"
-            )
-        if moe_config.num_experts > 2048:
-            return False, (
-                "FlashInfer TRTLLM routing supports at most 2048 experts, "
-                f"but got {moe_config.num_experts}"
-            )
-        return True, None
+        return False, (
+            "FlashInfer TRTLLM routing supports at most 2048 experts, "
+            f"but got {moe_config.num_experts}"
+        )
 
     def __init__(
         self,
@@ -276,10 +239,6 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
         # Pack topk ids and weights into format expected by the kernel.
         packed_topk_ids = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
 
-        if a1q_scale is None:
-            raise RuntimeError(
-                "TRT-LLM FP8 experts require precomputed activation scales"
-            )
         assert a1q_scale is not None
 
         is_mxfp8 = self.quant_config.block_shape == [1, 32]
@@ -292,18 +251,15 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
             use_shuffled_weight = True
             weight_layout = WeightLayout.BlockMajorK
-            hidden_states_scale = prepare_deepseek_fp8_x_sf(hidden_states, a1q_scale)
+            hidden_states_scale = a1q_scale.t().contiguous()
 
-        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
+        kwargs = dict(
             topk_ids=packed_topk_ids,
             routing_bias=None,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,
@@ -321,6 +277,11 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             output=output,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
+        if is_mxfp8:
+            kwargs["gemm1_alpha"] = self.gemm1_alpha
+            kwargs["gemm1_beta"] = self.gemm1_beta
+            kwargs["gemm1_clamp_limit"] = self.gemm1_clamp_limit
+        flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(**kwargs)
 
 
 class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolithic):
@@ -481,9 +442,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1,
             gemm1_weights_scale=self.quant_config.w1_scale,
-            gemm1_alpha=self.gemm1_alpha,
-            gemm1_beta=self.gemm1_beta,
-            gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
             num_experts=global_num_experts,
@@ -501,6 +459,10 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             routing_replay_out=routing_replay_out,
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
+        if is_mxfp8:
+            kwargs["gemm1_alpha"] = self.gemm1_alpha
+            kwargs["gemm1_beta"] = self.gemm1_beta
+            kwargs["gemm1_clamp_limit"] = self.gemm1_clamp_limit
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
         result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)

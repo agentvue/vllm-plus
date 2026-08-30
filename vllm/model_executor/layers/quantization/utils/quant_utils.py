@@ -25,13 +25,6 @@ INT4_DTYPE = scalar_types.uint4b8
 INT8_DTYPE = scalar_types.uint8b128
 
 
-def _dtype_abbr(dtype: torch.dtype | ScalarType) -> str:
-    """Return a stable short name for torch and ScalarType dtypes."""
-    if isinstance(dtype, ScalarType):
-        return str(dtype)
-    return fx.graph.dtype_abbrs[dtype]
-
-
 def weight_amax(
     weight: torch.Tensor, *, dim: int | None = None, keepdim: bool = False
 ) -> torch.Tensor:
@@ -159,7 +152,7 @@ class ScaleDesc:
         group_shape = d.get(self.group_shape, str(self.group_shape))
 
         return (
-            f"{_dtype_abbr(self.dtype)},"
+            f"{fx.graph.dtype_abbrs[self.dtype]},"
             f"{'static' if self.static else 'dynamic'},{group_shape}"
         )
 
@@ -185,8 +178,13 @@ class QuantKey:
 
     def __str__(self):
         scale2_str = f"scale2({self.scale2})," if self.scale2 else ""
+        dtype_description = (
+            fx.graph.dtype_abbrs[self.dtype]
+            if isinstance(self.dtype, torch.dtype)
+            else self.dtype
+        )
         return (
-            f"QuantKey({_dtype_abbr(self.dtype)},"
+            f"QuantKey({dtype_description},"
             f"scale({self.scale}),{scale2_str}"
             f"{'a' if not self.symmetric else ''}symmetric)"
         )

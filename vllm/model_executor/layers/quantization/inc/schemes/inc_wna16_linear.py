@@ -458,3 +458,7 @@ class INCARKLinearMethod(INCXPULinearBase):
             layer.ark_scale_type,
             not self.sym,
         )
+
+
+class INCXPUW4A16LinearScheme(INCXPULinearMethod):
+    pass

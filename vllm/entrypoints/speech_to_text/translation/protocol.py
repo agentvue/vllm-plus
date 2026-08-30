@@ -271,8 +271,6 @@ class TranslationRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def validate_stream_options(cls, data):
-        if not isinstance(data, dict):
-            return data
         stream_opts = ["stream_include_usage", "stream_continuous_usage_stats"]
         stream = data.get("stream", False)
         if any(bool(data.get(so, False)) for so in stream_opts) and not stream:

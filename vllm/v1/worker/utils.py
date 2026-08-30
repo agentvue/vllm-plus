@@ -13,11 +13,11 @@ import torch
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -31,11 +31,9 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
-    create_kv_cache_views,
 )
 from vllm.v1.worker.block_table import get_block_table_width
 
@@ -54,7 +52,22 @@ def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
     raise RuntimeError(f"NaNs detected in logits: {corrupted_requests}")
 
 
-@triton.jit
+def compressed_kernel_block_size(spec: AttentionSpec) -> int:
+    """Kernel page of a compressed cache (storage_block_size != block_size),
+    in storage entries.
+
+    Storage blocks up to DeepGEMM paged-MQA's largest supported page are used
+    natively; larger blocks are virtually split into the largest supported page
+    that tiles them.
+    """
+    storage = spec.storage_block_size
+    max_page, min_page = max(PAGED_MQA_PAGE_SIZES), min(PAGED_MQA_PAGE_SIZES)
+    if storage <= max_page:
+        return storage
+    return max_page if storage % max_page == 0 else min_page
+
+
+@triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_block_strides_ptr,
@@ -64,10 +77,10 @@ def _zero_kv_blocks_kernel(
 ):
     """Zero KV cache blocks across all segments in a single launch.
 
-    Each segment is a contiguous region of one block's data.  Layer-compact
-    layouts have one segment per layer buffer; dimensions physically outside
-    the block dim (separate head groups under LHBNC) and virtual block splits
-    each get their own segment.
+    Each segment is a contiguous region of one block's data.  For backends
+    where blocks are outermost (block_dim=0) there is one segment per
+    buffer.  For backends where K/V is outermost (block_dim=1) there are
+    two segments per buffer (one for K, one for V).
 
     Segments may have different block strides and page sizes (e.g. packed
     KV views or models with multiple KV cache groups like MLA + DSA
@@ -113,19 +126,15 @@ class KVBlockZeroer:
         device: torch.device,
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
+        cache_dtype: str,
         static_forward_context: dict[str, Any],
+        num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
 
         Each entry is the absolute byte address of a segment start on the
         GPU, so segments in different CUDA allocations work correctly.
-
-        Per-layer views are standardized ``[B, H, N, C]`` with blocks at dim 0; dims
-        physically outside B (separate head groups under LHBNC) each get their own
-        segment. A segment's page spans everything inside its block, so under BHLNC it
-        also covers the block's other layers -- safe, since block IDs are global pool
-        indices and a newly allocated block owns its whole tile.
 
         Block IDs from the scheduler reference logical blocks whose size
         may differ from the kernel block size (virtual block splitting).
@@ -141,10 +150,7 @@ class KVBlockZeroer:
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
-        # Overlaid layers (packed layouts) share a base address but may have
-        # different page sizes; keep the widest span per address so newly
-        # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
+        seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
         seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
@@ -157,7 +163,12 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
-            ratio = spec.block_size // kernel_bs
+            block_dim = group.backend.get_kv_cache_block_dim(
+                kernel_bs,
+                spec.num_kv_heads,
+                spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
 
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
@@ -166,18 +177,31 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
+                if dp in seen_ptrs:
+                    continue
+                seen_ptrs.add(dp)
+
+                # Derive kernel pages per logical block from each allocation;
+                # layers in one group can use different page counts.
+                num_kernel_blocks = kv.shape[block_dim]
+                assert num_kernel_blocks % num_blocks == 0, (
+                    f"{layer_name}: {num_kernel_blocks} kernel blocks is not a "
+                    f"multiple of {num_blocks} logical blocks"
+                )
+                ratio = num_kernel_blocks // num_blocks
 
                 el = kv.element_size()
-                block_stride_bytes = kv.stride(0) * el
+                block_stride_bytes = kv.stride(block_dim) * el
                 assert block_stride_bytes % 4 == 0
-                assert kv.shape[0] % ratio == 0
                 outer_dims = [
                     d
-                    for d in range(1, kv.ndim)
+                    for d in range(block_dim)
                     if kv.stride(d) * el > block_stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
-                inner_dims = [d for d in range(1, kv.ndim) if d not in outer_dims]
+                inner_dims = [
+                    d for d in range(kv.ndim) if d != block_dim and d not in outer_dims
+                ]
                 kernel_page_bytes = el + sum(
                     (kv.shape[d] - 1) * kv.stride(d) * el for d in inner_dims
                 )
@@ -187,18 +211,9 @@ class KVBlockZeroer:
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
-                        addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
-                            )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
-                        seg_addrs.append(addr)
+                        seg_addrs.append(
+                            dp + off_bytes + virtual_index * block_stride_bytes
+                        )
                         seg_block_strides.append(logical_block_stride_bytes // 4)
                         seg_page_sizes.append(kernel_page_bytes // 4)
 
@@ -266,11 +281,25 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
-        kv_cache_spec_builder = (
-            self.kv_cache_spec.copy_with_new_block_size(kernel_block_size)
-            if kernel_block_size is not None
-            else self.kv_cache_spec
-        )
+        # Compressed MLA is addressed at pool-page granularity. Rescale to the
+        # pool page so block tables, slot mappings, and paged-MQA metadata stay
+        # aligned with storage.
+        if kernel_block_size is None:
+            kv_cache_spec_builder = self.kv_cache_spec
+        elif (
+            isinstance(self.kv_cache_spec, AttentionSpec)
+            and self.kv_cache_spec.storage_block_size != self.kv_cache_spec.block_size
+        ):
+            compress_ratio = self.kv_cache_spec.block_size // (
+                self.kv_cache_spec.storage_block_size
+            )
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                compressed_kernel_block_size(self.kv_cache_spec) * compress_ratio
+            )
+        else:
+            kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
+                kernel_block_size
+            )
         builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width:
@@ -290,6 +319,15 @@ class AttentionGroup:
             )
             for _ in range(num_metadata_builders)
         ]
+        # Expose the kernel block size to builders that need to translate the
+        # shared (kernel-granularity) block_table into their own addressing
+        # (e.g. the kpool indexer, which shares the MLA's 64-token table but is
+        # addressed at storage_block_size pool-page granularity).
+        if kernel_block_size is not None:
+            for _b in self.metadata_builders:
+                # Dynamic attribute: the kpool indexer builder reads it via
+                # getattr to translate the shared block_table.
+                _b.kernel_block_size = kernel_block_size  # type: ignore[attr-defined]
 
     def get_metadata_builder(self, ubatch_id: int = 0) -> AttentionMetadataBuilder:
         assert len(self.metadata_builders) > ubatch_id
@@ -374,69 +412,6 @@ def select_common_block_size(
         if block_size_is_supported(backends, supported_size):
             return supported_size
     raise ValueError(f"No common block size for {kv_manager_block_size}. ")
-
-
-def allocate_kv_cache(
-    kv_cache_config: KVCacheConfig,
-    device: torch.device,
-    layout: KVCacheLayout,
-    kernel_block_sizes: list[int] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
-
-    Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
-    block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
-    groups overlay each other, so tensors may address the same bytes.
-    """
-    if not kv_cache_config.kv_cache_tensors:
-        return {}
-
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    raw_size = sizes.pop()
-    # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
-    # are created lazily on the first qualifying GEMM. Force that now, before
-    # the giant backing allocation below: if one landed in this segment's
-    # rounding tail it would pin the whole segment at engine shutdown.
-    if current_platform.is_rocm():
-        warmup_rocm_skinny_gemm_workspaces(device)
-        # Pad to the page granularity MoRIIO needs to register the shared
-        # backing as a single RDMA memory region. Other platforms keep the
-        # exact-size allocation: NIXL and SimpleCPUOffload rely on
-        # storage.nbytes() matching the logical KV size (see #53974).
-        page_size = 4096
-        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
-    else:
-        buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
-
-    kv_caches: dict[str, torch.Tensor] = {}
-    for tensor in kv_cache_config.kv_cache_tensors:
-        layer_name = tensor.layers[0]
-        group_id, group = next(
-            (group_id, group)
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-            if layer_name in group.layer_names
-        )
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = spec.kv_cache_specs[layer_name]
-
-        num_blocks = kv_cache_config.num_blocks
-        kernel_block_size = None
-        if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
-            kernel_block_size = kernel_block_sizes[group_id]
-
-        views = create_kv_cache_views(
-            buf,
-            spec,
-            num_blocks,
-            layout,
-            tensor,
-            kernel_block_size=kernel_block_size,
-        )
-        kv_caches.update(zip(tensor.layers, views))
-    return kv_caches
 
 
 def prepare_kernel_block_sizes(
@@ -610,7 +585,17 @@ def bind_kv_cache(
             # TODO - analyze where runner_kv_caches is used and the right
             # way to ensure it properly reflects multiple attention layers
             # in the same decoder block.
-            current_platform.check_runner_kv_caches_multi_layer()
+            if (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+            ):
+                # We know that the GPU / CPU runner is not impacted by this
+                # case. Some test code depends on runner_kv_caches, but
+                # not in a way that's impacted by ignoring this.
+                pass
+            else:
+                raise NotImplementedError
         for layer_name in layer_names:
             runner_kv_caches.append(kv_caches[layer_name])
 
@@ -622,74 +607,43 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
-def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
-    """Detach the KV/state cache tensors installed by bind_kv_cache().
-
-    The model object can outlive the runner (e.g. LLMEngine's finalizer keeps
-    it reachable until engine deletion), so dropping the runner's references
-    alone does not release the KV cache memory on teardown paths.
-    """
-    for layer in layers:
-        if not hasattr(layer, "kv_cache"):
-            continue
-        kv_cache = layer.kv_cache
-        layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
-        # Clean up quantized KV cache scale views
-        # (int8_per_token_head, fp8_per_token_head)
-        if hasattr(layer, "impl"):
-            if hasattr(layer.impl, "_k_scale_cache"):
-                layer.impl._k_scale_cache = None
-            if hasattr(layer.impl, "_v_scale_cache"):
-                layer.impl._v_scale_cache = None
-
-
 def copy_kv_cache_blocks_inplace(
-    kv_caches: Iterable[torch.Tensor],
+    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices: torch.Tensor | None = None
-    seen: set[tuple[torch.device, int]] = set()
-    copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
-        # once. data_ptr distinguishes per-layer views of a shared allocation.
-        key = (cache.device, cache.data_ptr())
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
-        assert cache.device == indices.device
-        src, dst = indices.unbind(dim=1)
-
-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
-        assert remainder == 0, (
-            f"{cache.shape[0]} kernel blocks not divisible by "
-            f"{num_blocks} scheduler blocks"
-        )
-        storage = cache.untyped_storage()
-        storage_key = (cache.device, storage.data_ptr())
-        scheduler_block_stride = (
-            cache.stride(0) * cache.element_size() * kernel_blocks_per_block
-        )
-        if storage.nbytes() == num_blocks * scheduler_block_stride:
-            if storage_key in copied_storages:
+    storage_tensors: list[torch.Tensor] = []
+    seen_storage: set[int] = set()
+    for entry in kv_caches:
+        # Mamba layers hold a list of state tensors; attention layers a single
+        # tensor. Both alias the shared block-major backing storage.
+        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)
+        for tensor in tensors:
+            ptr = tensor.untyped_storage().data_ptr()
+            if ptr in seen_storage:
                 continue
-            copied_storages.add(storage_key)
-            blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
-            blocks.set_(storage)
-            blocks = blocks.view(num_blocks, -1)
-        else:
-            # Fold virtual block splitting into the shape so that dim 0 counts
-            # scheduler blocks; unflatten of dim 0 is always a view.
-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+            seen_storage.add(ptr)
+            storage_tensors.append(tensor)
+
+    if not storage_tensors:
+        return
+    device = storage_tensors[0].device
+    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    indices = async_tensor_h2d(indices_np, device=device)
+    src_indices, dst_indices = indices.unbind(dim=1)
+
+    for tensor in storage_tensors:
+        assert tensor.device == device
+        blocks = torch.empty(0, dtype=torch.uint8, device=device)
+        blocks.set_(tensor.untyped_storage())
+        # Block-major backing storage: block i owns the contiguous byte range
+        # [i * page_size, (i + 1) * page_size).
+        assert blocks.numel() % num_blocks == 0
+        blocks = blocks.view(num_blocks, -1)
+        blocks[dst_indices] = blocks[src_indices]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

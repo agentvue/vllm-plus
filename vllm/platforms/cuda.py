@@ -133,13 +133,43 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         else:
+            # Prefer FlashInfer FA3 for GLM-5.3-Flash NoPE sparse MLA on SM90;
+            # its feature gate falls through to the other sparse backends when
+            # unsupported. RoPE sparse models retain their existing order.
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            hf = (
+                cfg.model_config.hf_text_config
+                if cfg is not None and cfg.model_config is not None
+                else None
+            )
+            prefer_fi_sm90 = (
+                hf is not None
+                and getattr(hf, "qk_rope_head_dim", None) == 0
+                and hasattr(hf, "index_topk")
+            )
+            sparse_tail = [
+                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
+                AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+            ]
+            if prefer_fi_sm90:
+                sparse_tail.pop()  # dedupe the head entry
+                return [
+                    AttentionBackendEnum.FLASH_ATTN_MLA,
+                    AttentionBackendEnum.FLASHMLA,
+                    AttentionBackendEnum.FLASHINFER_MLA,
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+                    *sparse_tail,
+                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
-                AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
-                AttentionBackendEnum.FLASHMLA_SPARSE,
+                *sparse_tail,
             ]
     else:
         # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
@@ -228,10 +258,6 @@ class CudaPlatformBase(Platform):
             import vllm._moe_C_stable_libtorch  # noqa: F401
         with contextlib.suppress(ImportError):
             import vllm._qutlass_C  # noqa: F401
-
-    @classmethod
-    def check_runner_kv_caches_multi_layer(cls) -> None:
-        pass
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
@@ -386,11 +412,8 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except (ImportError, OSError) as e:
-                logger.debug(
-                    "Attention backend %s is unavailable", backend.name, exc_info=True
-                )
-                invalid_reasons_i = [f"{type(e).__name__}: {e}"]
+            except ImportError:
+                invalid_reasons_i = ["ImportError"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:
@@ -399,6 +422,26 @@ class CudaPlatformBase(Platform):
                 )
 
         return valid_backends_priorities, invalid_reasons
+
+    @classmethod
+    def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        index_kpool = getattr(
+            vllm_config.model_config.hf_text_config, "index_kpool", None
+        )
+        if not index_kpool or index_kpool <= 1:
+            return None
+        from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+
+        # kpool paged-MQA indexer: the storage block (block_size /
+        # index_kpool) is virtually split into pool pages. Consumer Blackwell's
+        # FP8 kernel supports only 64-entry pages; other CUDA architectures also
+        # support the 32-entry page.
+        page_size = (
+            max(PAGED_MQA_PAGE_SIZES)
+            if cls.is_device_capability_family(120)
+            else min(PAGED_MQA_PAGE_SIZES)
+        )
+        return index_kpool * page_size
 
     @classmethod
     def get_attn_backend_cls(
@@ -418,11 +461,8 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except (ImportError, OSError) as e:
-                raise ValueError(
-                    f"Selected backend {selected_backend} is not valid for "
-                    f"this configuration. Reason: [{type(e).__name__}: {e}]"
-                ) from e
+            except ImportError:
+                invalid_reasons = ["ImportError"]
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

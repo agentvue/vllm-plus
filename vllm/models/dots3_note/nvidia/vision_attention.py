@@ -36,28 +36,15 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-VisionRotaryPositionEmbedding = tuple[torch.Tensor, torch.Tensor]
-
-
-def prepare_rotary_pos_emb_vision(
-    freqs: torch.Tensor,
-) -> VisionRotaryPositionEmbedding:
-    """Materialize vision RoPE cos/sin once for every encoder layer."""
-    cos = freqs.cos().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = freqs.sin().unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    return cos, sin
-
-
 def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor,
-    rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding,
+    tensor: torch.Tensor, freqs: torch.Tensor
 ) -> torch.Tensor:
     orig_dtype = tensor.dtype
     tensor = tensor.float()
-    if isinstance(rotary_pos_emb, torch.Tensor):
-        cos, sin = prepare_rotary_pos_emb_vision(rotary_pos_emb)
-    else:
-        cos, sin = rotary_pos_emb
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
+    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
     output = (tensor * cos) + (rotate_half(tensor) * sin)
     return output.to(orig_dtype)
 
@@ -162,7 +149,7 @@ class _VisionAttentionBase(nn.Module):
     def _qkv_with_rope(
         self,
         hidden_states: torch.Tensor,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None,
+        rotary_pos_emb: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_length = hidden_states.shape[0]
         q, k, v = (
@@ -174,8 +161,6 @@ class _VisionAttentionBase(nn.Module):
         if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        if rotary_pos_emb is None:
-            raise ValueError("Vision rotary position embedding is required")
         q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
         return q, k, v
@@ -189,7 +174,7 @@ class VisionAttention(_VisionAttentionBase):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
         seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -227,7 +212,7 @@ class VisionAttentionV2(_VisionAttentionBase):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
         seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -264,7 +249,7 @@ class VisionFlashAttention2(_VisionAttentionBase):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
         seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -289,7 +274,7 @@ class VisionFlashAttention3(_VisionAttentionBase):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
         seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -328,7 +313,7 @@ class VisionSdpaAttention(_VisionAttentionBase):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
         seqlens: list[int] | None = None,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
@@ -454,7 +439,7 @@ def apply_vision_attention_residual(
     hidden_states: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
-    rotary_pos_emb: torch.Tensor | VisionRotaryPositionEmbedding,
+    rotary_pos_emb: torch.Tensor,
     *,
     seqlens: list[int] | None = None,
     uses_seqlens: bool = False,
@@ -480,13 +465,11 @@ __all__ = [
     "VisionFlashAttention2",
     "VisionFlashAttention3",
     "VisionRotaryEmbedding",
-    "VisionRotaryPositionEmbedding",
     "VisionSdpaAttention",
     "apply_rotary_pos_emb_vision",
     "apply_vision_attention_residual",
     "attn_uses_seqlens",
     "build_vision_attention",
-    "prepare_rotary_pos_emb_vision",
     "prepare_seqlens_for_attention",
     "resolve_attn_implementation",
     "rotate_half",

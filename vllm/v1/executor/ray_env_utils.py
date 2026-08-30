@@ -4,7 +4,16 @@ import os
 
 from vllm.ray.ray_env import RAY_NON_CARRY_OVER_ENV_VARS
 
-_RAY_WORKER_PRE_IMPORT_ENV_VARS = frozenset({"VLLM_USE_BREAKABLE_CUDAGRAPH"})
+
+NODE_LOCAL_PATH_ENV_VARS = (
+    "CUTE_DSL_LIBS",
+    "CUTE_EXPERIMENTAL_DSL_LIBS",
+    "TVM_LIBRARY_PATH",
+    "TVM_IMPORT_PYTHON_PATH",
+    "TL_CUTLASS_PATH",
+    "TL_COMPOSABLE_KERNEL_PATH",
+    "TL_TEMPLATE_PATH",
+)
 
 
 def get_driver_env_vars(
@@ -20,14 +29,20 @@ def get_driver_env_vars(
     return {key: value for key, value in os.environ.items() if key not in exclude_vars}
 
 
-def update_runtime_env_for_worker_import(runtime_env: dict) -> dict:
-    """Expose driver environment variables needed before Ray actor import.
-
-    VllmConfig can auto-enable breakable CUDA graphs after Ray starts, while
-    eager_break_during_capture resolves the setting during model import.
-    """
-    for env_var in _RAY_WORKER_PRE_IMPORT_ENV_VARS:
-        if env_var in os.environ:
-            env_vars = runtime_env.setdefault("env_vars", {})
-            env_vars[env_var] = os.environ[env_var]
-    return runtime_env
+def sanitize_node_local_path_env_vars() -> list[str]:
+    """Remove path entries inherited from another Ray node."""
+    sanitized: list[str] = []
+    for name in NODE_LOCAL_PATH_ENV_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        paths = [path for path in value.split(os.pathsep) if path]
+        local_paths = [path for path in paths if os.path.exists(path)]
+        if local_paths == paths:
+            continue
+        sanitized.append(name)
+        if local_paths:
+            os.environ[name] = os.pathsep.join(local_paths)
+        else:
+            os.environ.pop(name, None)
+    return sanitized

@@ -83,21 +83,12 @@ class BaseDummyInputsBuilder(ABC, Generic[_I]):
         dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
         dummy_mm_items = self.info.parse_mm_data(dummy_mm_data, validate=False)
 
-        tokenizer = self.info.ctx.tokenizer
-        dummy_prompt: list[int]
-        if tokenizer is None:
-            # Tokenizer-less models (e.g. `skip_tokenizer_init=True`) only
-            # accept embeddings and have an empty dummy text, so there are no
-            # prompt tokens.
-            dummy_prompt = []
-        else:
-            from .processor import cached_encode
-
-            dummy_prompt = cached_encode(tokenizer, dummy_text, truncation=False)
+        tokenization_kwargs = {"truncation": False}
 
         return ProcessorInputs(
-            prompt=dummy_prompt,
+            prompt=dummy_text,
             mm_data_items=dummy_mm_items,
+            tokenization_kwargs=tokenization_kwargs,
         )
 
     def _get_dummy_audios(

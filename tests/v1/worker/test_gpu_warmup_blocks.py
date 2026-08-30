@@ -77,6 +77,7 @@ def _make_runner(
         num_speculative_steps=num_spec_steps,
         decode_query_len=num_spec_steps + 1,
         is_pooling_model=False,
+        is_encoder_only=False,
         is_encoder_decoder=False,
         is_last_pp_rank=True,
         max_num_reqs=4,
@@ -87,9 +88,7 @@ def _make_runner(
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
         ),
-        vllm_config=SimpleNamespace(
-            num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
-        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=num_lookahead_tokens),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
     )

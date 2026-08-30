@@ -43,6 +43,7 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.tokenizers.hf import HfTokenizer
 from vllm.transformers_utils.configs.deepseek_vl2 import (
     DeepseekVLV2Config,
     MlpProjectorConfig,
@@ -235,23 +236,30 @@ class DeepseekVL2DummyInputsBuilder(BaseDummyInputsBuilder[DeepseekVL2Processing
 class DeepseekVL2MultiModalProcessor(
     BaseMultiModalProcessor[DeepseekVL2ProcessingInfo]
 ):
-    def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
-        return self.dummy_inputs.get_dummy_text(mm_counts)
-
-    def _postprocess_hf_mm_data(
+    def _call_hf_processor(
         self,
+        prompt: str,
         mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-        processed_data: BatchFeature,
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         if not mm_data:
-            return processed_data
+            tokenizer = self.info.get_tokenizer()
+            assert isinstance(tokenizer, HfTokenizer)
+            return tokenizer(prompt, add_special_tokens=True, return_tensors="pt")
 
-        processed_data["num_patches"] = (
-            processed_data["images_spatial_crop"].prod(-1) + 1
+        processed_outputs = super()._call_hf_processor(
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
         )
 
-        return processed_data
+        processed_outputs["num_patches"] = (
+            processed_outputs["images_spatial_crop"].prod(-1) + 1
+        )
+
+        return processed_outputs
 
     def _get_mm_fields_config(
         self,
@@ -262,9 +270,7 @@ class DeepseekVL2MultiModalProcessor(
 
         return dict(
             pixel_values=MultiModalFieldConfig.flat_from_sizes("image", num_patches),
-            images_spatial_crop=MultiModalFieldConfig.batched(
-                "image", keep_on_cpu=True
-            ),
+            images_spatial_crop=MultiModalFieldConfig.batched("image"),
             image_embeds=MultiModalFieldConfig.batched("image"),
         )
 
@@ -309,7 +315,7 @@ class DeepseekVL2MultiModalProcessor(
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> MultiModalProcessingInfo:
+    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
         # The processor logic is different for len(images) <= 2 vs > 2
         # Since the processing cache assumes that the processor output is
         # invariant of how many images are passed per prompt, we only

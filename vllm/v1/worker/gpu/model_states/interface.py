@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar, cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -43,9 +43,6 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
-    supports_prompt_embeds: ClassVar[bool] = False
-    """Whether this state implements user-provided prompt embeddings."""
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -156,13 +153,12 @@ class ModelState(ABC):
         return None
 
     @abstractmethod
-    def prepare_inputs_embeds(
+    def get_mm_embeddings(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor | None:
-        """Prepare the ``inputs_embeds`` tensor for the current forward pass."""
         raise NotImplementedError
 
     def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor | None:
