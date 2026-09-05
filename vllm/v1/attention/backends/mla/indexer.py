@@ -548,13 +548,11 @@ def compute_kpool_tail_slot_mapping(
     ``slot = own_block * kpool + pos % kpool`` instead, which is the layout
     the tail kernels and ``KpoolTailManager`` are designed around.
 
-    Pure torch (no Triton, no device sync): the indexer op consumes the tail
-    slot mapping on its eager break, so the returned tensor need not be the
-    persistent ``BlockTables`` buffer.
+    Pure torch (no Triton, no device sync): update the persistent slot-mapping
+    buffer in place so CUDA graph replay keeps a stable buffer address.
     """
-    out = slot_mapping.clone()
     if num_actual_tokens == 0:
-        return out
+        return slot_mapping
     device = slot_mapping.device
     tokens = torch.arange(num_actual_tokens, device=device)
     # searchsorted(right=True): token i in [qsl[r], qsl[r+1]) -> request r.
@@ -562,8 +560,8 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
-    return out
+    slot_mapping[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    return slot_mapping
 
 
 class KpoolTailMetadataBuilder(AttentionMetadataBuilder):

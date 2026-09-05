@@ -16,6 +16,7 @@ def _compressed_slot_mapping_kernel(
     # [num_reqs, max_num_blocks]
     block_table_ptr,
     block_table_stride,
+    block_table_width,
     block_size,
     COMPRESS_RATIO: tl.constexpr,
     PAD_ID: tl.constexpr,
@@ -35,18 +36,20 @@ def _compressed_slot_mapping_kernel(
         mask = offset < query_len
 
         pos = start_pos + i + tl.arange(0, TRITON_BLOCK_SIZE)
-        is_valid = (pos + 1) % COMPRESS_RATIO == 0
+        is_valid = (pos >= 0) & ((pos + 1) % COMPRESS_RATIO == 0)
         pos_after_compress = pos // COMPRESS_RATIO
 
         block_ids = pos_after_compress // block_size
+        in_range = (block_ids >= 0) & (block_ids < block_table_width)
+        valid_slot = is_valid & in_range
         block_numbers = tl.load(
             block_table_ptr + batch_idx * block_table_stride + block_ids,
-            mask=mask & is_valid,
+            mask=mask & valid_slot,
+            other=0,
         )
         slot_ids = block_numbers * block_size + pos_after_compress % block_size
 
-        # NOTE
-        slot_ids = tl.where(is_valid, slot_ids, PAD_ID)
+        slot_ids = tl.where(valid_slot, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + query_start + offset, slot_ids, mask=mask)
 
 
@@ -78,6 +81,7 @@ def get_compressed_slot_mapping(
         seq_lens,
         block_table,
         block_table.stride(0),
+        block_table.shape[1],
         block_size,
         compress_ratio,
         PAD_ID=-1,
