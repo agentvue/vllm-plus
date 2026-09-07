@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from copy import copy
+
 import torch
 import torch.nn as nn
 
@@ -7,6 +9,7 @@ from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.utils import get_draft_quant_config
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -39,6 +42,10 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    if speculative_config.method == "mtp":
+        # Draft module mappings must not mutate the target's quantization config.
+        vllm_config = copy(vllm_config)
+        vllm_config.quant_config = get_draft_quant_config(vllm_config)
     if speculative_config.kv_cache_dtype is not None:
         vllm_config = replace(
             vllm_config,
@@ -96,7 +103,16 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
             for layer in items:
                 sh = getattr(layer, "shared_head", None)
-                if sh is not None and hasattr(sh, "head"):
+                if (
+                    sh is not None
+                    and hasattr(sh, "head")
+                    and (
+                        not getattr(eagle_model, "has_own_lm_head", False)
+                        or torch.equal(
+                            sh.head.weight.cpu(), target_lm_head.weight.cpu()
+                        )
+                    )
+                ):
                     del sh.head
                     sh.head = target_lm_head
 
@@ -110,5 +126,9 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             for _, module in draft_inner.named_modules():
                 if hasattr(module, "topk_indices_buffer"):
                     module.topk_indices_buffer = target_buffer
+                # Backend implementations are not registered nn.Module children.
+                impl = getattr(module, "impl", None)
+                if impl is not None and hasattr(impl, "topk_indices_buffer"):
+                    impl.topk_indices_buffer = target_buffer
 
     return eagle_model

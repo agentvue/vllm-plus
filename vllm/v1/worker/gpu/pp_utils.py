@@ -10,8 +10,34 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+@triton.jit
+def _scatter_draft_tokens_kernel(
+    destination, source, idx_mapping, width: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    request = tl.load(idx_mapping + row).to(tl.int64)
+    column = tl.arange(0, BLOCK)
+    mask = (request >= 0) & (column < width)
+    tokens = tl.load(source + row * width + column, mask=mask, other=0)
+    tl.store(destination + request * width + column, tokens, mask=mask)
+
+
+def scatter_draft_tokens(
+    destination: torch.Tensor, source: torch.Tensor, idx_mapping: torch.Tensor
+) -> None:
+    width = destination.shape[1]
+    if idx_mapping.numel() == 0 or width == 0:
+        return
+    assert source.shape == (idx_mapping.numel(), width)
+    assert source.is_contiguous() and destination.is_contiguous()
+    _scatter_draft_tokens_kernel[(idx_mapping.numel(),)](
+        destination, source, idx_mapping, width, triton.next_power_of_2(width)
+    )
 
 
 @dataclass

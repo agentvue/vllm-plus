@@ -151,12 +151,36 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def profile_cudagraph_memory(
+        self,
+    ) -> dict[CUDAGraphMode, tuple[int, int]]:
+        assert self.query_cudagraph_manager is not None
+        return self.query_cudagraph_manager.profile_memory(
+            self._generate_draft,
+            self.input_buffers,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            self.max_model_len,
+            causal=self._group_causal,
+        )
+
     def load_draft_model(
         self,
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         return load_dflash_model(target_model, self.vllm_config)
+
+    def _reserve_attention_workspace_for_profile(self) -> None:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if self.speculative_config.attention_backend == AttentionBackendEnum.FLASHINFER:
+            from vllm.v1.attention.backends.flashinfer import (
+                _get_trtllm_workspace_buffer,
+            )
+
+            _get_trtllm_workspace_buffer()
 
     def set_attn(
         self,
@@ -350,6 +374,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            if is_profile:
+                self._reserve_attention_workspace_for_profile()
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],

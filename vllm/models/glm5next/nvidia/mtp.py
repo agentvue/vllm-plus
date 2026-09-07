@@ -205,6 +205,12 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -252,11 +258,15 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        *,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if hidden_states is None:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
         return self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
@@ -336,6 +346,14 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            elif name.startswith("language_model.model."):
+                name = name.replace("language_model.model.", "model.", 1)
+            if name == "model.embed_tokens.weight":
+                if name not in loaded_params:
+                    param = self.model.embed_tokens.weight
+                    param.weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue

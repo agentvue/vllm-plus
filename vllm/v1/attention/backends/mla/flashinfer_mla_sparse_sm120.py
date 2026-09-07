@@ -91,9 +91,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         if vllm_config.model_config is not None:
             hf_text_config = vllm_config.model_config.hf_text_config
             model_type = getattr(hf_text_config, "model_type", None)
-            self.sparse_mla_top_k = int(
-                getattr(hf_text_config, "index_topk", 2048)
-            )
+            self.sparse_mla_top_k = int(getattr(hf_text_config, "index_topk", 2048))
             self.index_kpool = int(getattr(hf_text_config, "index_kpool", 1) or 1)
         else:
             self.sparse_mla_top_k = 2048
@@ -102,7 +100,8 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
         # Skip-topk layers are built with indexer=None and get the shared
         # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
-        self.topk_indices_buffer: torch.Tensor | None = (
+        self._indexer = indexer
+        self._topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer
             if indexer is not None
             else mla_args.get("topk_indices_buffer")
@@ -123,6 +122,18 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+
+    @property
+    def topk_indices_buffer(self) -> torch.Tensor | None:
+        if self._indexer is not None:
+            return self._indexer.topk_indices_buffer
+        return self._topk_indices_buffer
+
+    @topk_indices_buffer.setter
+    def topk_indices_buffer(self, buffer: torch.Tensor | None) -> None:
+        self._topk_indices_buffer = buffer
+        if self._indexer is not None:
+            self._indexer.topk_indices_buffer = buffer
 
     def _fit_topk_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
         topk = self.sparse_mla_top_k
@@ -184,9 +195,7 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 f"heads per worker; got {actual_num_heads}."
             )
         if kernel_num_heads != actual_num_heads:
-            q_padded = q.new_zeros(
-                (num_actual_toks, kernel_num_heads, q.shape[-1])
-            )
+            q_padded = q.new_zeros((num_actual_toks, kernel_num_heads, q.shape[-1]))
             q_padded[:, :actual_num_heads].copy_(q)
             q = q_padded
 

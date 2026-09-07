@@ -91,14 +91,20 @@ FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
 
-trtllm_workspace_buffer = None
+trtllm_workspace_buffer: torch.Tensor | None = None
 
 
-def _get_trtllm_workspace_buffer():
+def _get_trtllm_workspace_buffer(min_size: int | None = None) -> torch.Tensor:
     global trtllm_workspace_buffer
-    if trtllm_workspace_buffer is None:
+    buffer_size = max(
+        envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+        min_size or 0,
+    )
+    if trtllm_workspace_buffer is None or trtllm_workspace_buffer.numel() < buffer_size:
         trtllm_workspace_buffer = torch.zeros(
-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
+            buffer_size,
+            dtype=torch.uint8,
+            device="cuda",
         )
     return trtllm_workspace_buffer
 
@@ -1026,9 +1032,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
                 )
                 buffer_size = max(buffer_size, est)
-            self._workspace_buffer = torch.zeros(
-                buffer_size, dtype=torch.uint8, device=self.device
-            )
+            # Metadata planning and the TRTLLM/XQA forward execute serially.
+            # Reuse one process-wide workspace instead of retaining two copies.
+            self._workspace_buffer = _get_trtllm_workspace_buffer(buffer_size)
         return self._workspace_buffer
 
     def set_workspace_buffer(self, workspace_buffer: torch.Tensor):

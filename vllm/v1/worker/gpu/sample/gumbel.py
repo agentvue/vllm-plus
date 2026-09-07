@@ -82,6 +82,34 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
 
 
 @triton.jit
+def gumbel_noised_argmax(
+    logits,
+    keys,
+    mask,
+    seed,
+    pos,
+    temp,
+    USE_FP64: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr = True,
+):
+    if temp != 0.0 and APPLY_TEMPERATURE:
+        logits = logits / temp
+    if USE_FP64:
+        logits = logits.to(tl.float64)
+    if temp != 0.0:
+        gumbel_seed = tl.randint(seed, pos)
+        if USE_FP64:
+            u = tl_rand64(gumbel_seed, keys, includes_zero=False)
+            gumbel_noise = -tl.log(-tl.log(u))
+        else:
+            u = tl_rand32(gumbel_seed, keys, includes_zero=False)
+            gumbel_noise = -tl.log(-tldevice.log1p(-u))
+        logits = logits + gumbel_noise
+    logits = tl.where(mask, logits, float("-inf"))
+    return tl.max(logits, axis=0, return_indices=True)
+
+
+@triton.jit
 def gumbel_block_argmax(
     logits,
     block,

@@ -630,6 +630,8 @@ class VllmConfig:
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
+            if not use_v2_model_runner and self._is_dflash2_draft():
+                raise ValueError("DFlash2 requires VLLM_USE_V2_MODEL_RUNNER=1.")
             return use_v2_model_runner
 
         # PCP runtime support is implemented only by the V2 model runner.
@@ -649,6 +651,12 @@ class VllmConfig:
         # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
         # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
         if self._dflash_needs_multi_kv_group():
+            return True
+
+        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
+        # the same checkpoint drafts through DFlashProposer, which never calls
+        # it, so the draft degrades to DFlash1 silently. Force V2 as for dspark.
+        if self._is_dflash2_draft():
             return True
 
         if self.model_config is not None and self.model_config.is_diffusion:
@@ -673,6 +681,17 @@ class VllmConfig:
             return False
 
         return True
+
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the DFlash draft is a DFlash2 one, by the architecture the
+        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DFlash2DraftModel" in (draft_config.architectures or [])
 
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""

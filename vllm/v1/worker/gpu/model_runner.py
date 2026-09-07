@@ -122,7 +122,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
-from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -240,7 +240,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                draft_hf_config = self.speculative_config.draft_model_config.hf_config
+                target_hf_config = self.model_config.hf_text_config
+                supports_dflash2_pp = (
+                    self.vllm_config._is_dflash2_draft()
+                    and target_hf_config.model_type == "glm5_next_text"
+                    and target_hf_config.num_hidden_layers
+                    == getattr(draft_hf_config, "num_target_layers", None)
+                    and target_hf_config.hidden_size == draft_hf_config.hidden_size
+                )
+                if self.use_pp and not supports_dflash2_pp:
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -904,18 +913,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         room for it. Without this the budget is oversized and capture OOMs at
         high ``gpu_memory_utilization`` with large ``max_num_seqs``.
 
-        Builds a throwaway minimal KV cache to populate the cudagraph manager's
-        capture descriptors, dry-captures the 2 largest graphs per mode (in
-        ``CudaGraphManager.profile_memory``), and extrapolates. The target
-        model's estimate is included here; speculator (MTP) capture memory is a
-        follow-up.
+        Builds a throwaway minimal KV cache to populate the cudagraph managers'
+        capture descriptors, then dry-captures their graphs. Draft speculators
+        can contribute their own estimate when they use a separate graph pool.
         """
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
         manager = self.cudagraph_manager
         assert manager is not None
-        if not manager.needs_capture():
+        speculator_profiles_graphs = self.speculator is not None and hasattr(
+            self.speculator, "profile_cudagraph_memory"
+        )
+        if not manager.needs_capture() and not speculator_profiles_graphs:
             self._cleanup_profiling_kv_cache()
             return 0
 
@@ -927,21 +937,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # re-enables it); disabling it in this finally would break the real
         # capture that runs next.
         try:
-            estimates = manager.profile_memory(
-                self.model,
-                self.model_state,
-                self.input_buffers,
-                self.intermediate_tensors,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                has_lora=self.lora_config is not None,
-                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-            )
-            for mode, (first, rest) in estimates.items():
-                shared[mode] = first
-                per_graph[mode] = rest
+            all_estimates = []
+            if manager.needs_capture():
+                all_estimates.append(
+                    manager.profile_memory(
+                        self.model,
+                        self.model_state,
+                        self.input_buffers,
+                        self.intermediate_tensors,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        has_lora=self.lora_config is not None,
+                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                        lora_capture_hook=create_lora_capture_hook(
+                            self.lora_config, self
+                        ),
+                    )
+                )
+            if speculator_profiles_graphs:
+                all_estimates.append(self.speculator.profile_cudagraph_memory())  # type: ignore[union-attr]
+            for estimates in all_estimates:
+                for mode, (first, rest) in estimates.items():
+                    shared[mode] = shared.get(mode, 0) + first
+                    per_graph[mode] = per_graph.get(mode, 0) + rest
         finally:
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
             self._cleanup_profiling_kv_cache()
@@ -1061,10 +1080,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 idx_mapping = outputs["idx_mapping"]
                 self.postprocess_sampled(**outputs)
                 if draft_tokens is not None:
-                    valid = idx_mapping >= 0
-                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
-                        valid
-                    ]
+                    scatter_draft_tokens(
+                        self.req_states.draft_tokens, draft_tokens, idx_mapping
+                    )
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:

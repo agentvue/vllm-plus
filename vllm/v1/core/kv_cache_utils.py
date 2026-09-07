@@ -1366,8 +1366,15 @@ def _pp_balanced_mamba_group_count(
     mla_indices = [extract_layer_index(name) for name in mla_layer_names]
     for rank in range(pp_size):
         start, end = get_pp_indices(total_layers, rank, pp_size)
-        num_mamba = sum(start <= i < end for i in mamba_indices)
-        num_mla = sum(start <= i < end for i in mla_indices)
+
+        num_mamba = sum(
+            start <= i < end or (rank == pp_size - 1 and i >= total_layers)
+            for i in mamba_indices
+        )
+        num_mla = sum(
+            start <= i < end or (rank == pp_size - 1 and i >= total_layers)
+            for i in mla_indices
+        )
         if not num_mamba:
             continue
         if not num_mla:
@@ -1392,10 +1399,13 @@ def _get_kv_cache_groups_glm5_next(
     tail_specs = {
         k: v for k, v in kv_cache_spec.items() if isinstance(v, KpoolTailSpec)
     }
+    sliding_specs = {
+        k: v for k, v in kv_cache_spec.items() if type(v) is SlidingWindowSpec
+    }
     attn_specs = {
         k: v
         for k, v in kv_cache_spec.items()
-        if not isinstance(v, (MambaSpec, KpoolTailSpec))
+        if not isinstance(v, (MambaSpec, KpoolTailSpec)) and k not in sliding_specs
     }
     if not mamba_specs or not all(
         type(s) is MLAAttentionSpec for s in attn_specs.values()
@@ -1450,10 +1460,44 @@ def _get_kv_cache_groups_glm5_next(
     mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
     for k, name in enumerate(mamba_specs):
         mamba_grouped_names[k % num_groups].append(name)
+    sliding_groups = []
+    if sliding_specs:
+        # DFlash's window cache uses distinct block IDs in the same MLA slots,
+        # avoiding a full-context-sized allocation for every draft layer.
+        sliding_spec = next(iter(sliding_specs.values()))
+        if not all(spec == sliding_spec for spec in sliding_specs.values()):
+            return None
+        draft_page = sliding_spec.real_page_size_bytes
+        if mla_page % draft_page:
+            raise ValueError(
+                f"DFlash window cache page ({draft_page} bytes) does not "
+                f"evenly divide the MLA page ({mla_page} bytes)."
+            )
+        sliding_count = _pp_balanced_mamba_group_count(
+            vllm_config, list(sliding_specs), mla_names
+        )
+        if sliding_count is None:
+            raise ValueError("DFlash PP stage has no MLA slot for its window cache.")
+        aligned_sliding: dict[str, KVCacheSpec] = {
+            name: replace(
+                spec,
+                block_size=spec.block_size * (mla_page // draft_page),
+                page_size_padded=None,
+            )
+            for name, spec in sliding_specs.items()
+        }
+        assert all(
+            spec.page_size_bytes == mla_page for spec in aligned_sliding.values()
+        )
+        sliding_names: list[list[str]] = [[] for _ in range(sliding_count)]
+        for i, name in enumerate(sliding_specs):
+            sliding_names[i % sliding_count].append(name)
+        sliding_groups = create_kv_cache_group_specs(aligned_sliding, sliding_names)
     return (
         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + sliding_groups
     )
 
 
@@ -1476,6 +1520,9 @@ def _glm5_next_tensor_layout(
     (possibly PP-projected) groups, so tensor emission and the accounting
     paths can never disagree.
 
+    PP projection retains empty groups to keep group IDs consistent across
+    workers. They own no tensor on that worker and must not consume its pool.
+
     Returns:
       - (attn_group, mamba_groups, mla_names, idx_names, mla_page, idx_page,
          tail_names, tail_page)
@@ -1484,10 +1531,12 @@ def _glm5_next_tensor_layout(
     uniform_groups = [
         g
         for g in kv_cache_groups
-        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+        if g.layer_names and isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
     ]
     mamba_groups = [
-        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+        g
+        for g in kv_cache_groups
+        if g.layer_names and isinstance(g.kv_cache_spec, (MambaSpec, SlidingWindowSpec))
     ]
     # Both the MLA(+indexer) attn group and the kpool tail group are
     # UniformTypeKVCacheSpecs; distinguish by the inner spec type.
@@ -1501,7 +1550,8 @@ def _glm5_next_tensor_layout(
             tail_group = g
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    num_nonempty_groups = sum(bool(g.layer_names) for g in kv_cache_groups)
+    if len(uniform_groups) + len(mamba_groups) != num_nonempty_groups:
         return None
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
     if not all(

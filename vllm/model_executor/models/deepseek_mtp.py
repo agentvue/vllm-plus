@@ -37,9 +37,11 @@ from .deepseek_v2 import (
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
 )
+from .interfaces import SupportsPP
 from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
+    make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 
@@ -228,13 +230,22 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], self.config.hidden_size
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
@@ -263,11 +274,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        *,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if hidden_states is None:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
         hidden_states = self.model(
             input_ids,
             positions,
@@ -320,6 +335,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
+            if name == "model.embed_tokens.weight":
+                if name not in loaded_params:
+                    param = self.model.embed_tokens.weight
+                    param.weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)

@@ -5,6 +5,8 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -36,6 +38,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
+    draft_vllm_config.quant_config = get_draft_quant_config(draft_vllm_config)
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config
@@ -61,6 +64,27 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+    elif not dflash_model.has_own_embed_tokens:
+        # The first PP stage owns the target embedding; load a local TP shard
+        # once for the last-stage drafter when its checkpoint omits it.
+        loader = DefaultModelLoader(vllm_config.load_config)
+        source = DefaultModelLoader.Source(
+            vllm_config.model_config.model, vllm_config.model_config.revision
+        )
+        embedding_names = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.model.embed_tokens.weight",
+        }
+        for name, weight in loader._get_weights_iterator(source):
+            if name in embedding_names:
+                param = draft_inner.embed_tokens.weight
+                param.weight_loader(param, weight)
+                break
+        else:
+            raise ValueError(
+                "DFlash under PP requires target or draft embedding weights."
+            )
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)

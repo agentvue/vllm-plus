@@ -1382,6 +1382,7 @@ class DeepseekV2Model(nn.Module):
         else:
             topk_indices_buffer = None
 
+        self.topk_indices_buffer = topk_indices_buffer
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -1405,8 +1406,15 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+        self._make_base_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.hidden_size
+        )
+        self._recv_pp_topk = self.start_layer > 0 and self._shares_topk(
+            self.start_layer
+        )
+        self._send_pp_topk = (
+            self.end_layer < config.num_hidden_layers
+            and self._shares_topk(self.end_layer)
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -1420,6 +1428,29 @@ class DeepseekV2Model(nn.Module):
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
+
+    def _shares_topk(self, layer: int) -> bool:
+        if not self.is_v32:
+            return False
+        pattern = getattr(self.config, "index_topk_pattern", None)
+        if pattern is not None:
+            return layer < len(pattern) and pattern[layer] == "S"
+        offset = getattr(self.config, "index_skip_topk_offset", 2)
+        frequency = getattr(self.config, "index_topk_freq", 1)
+        return max(layer - offset + 1, 0) % frequency != 0
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = self._make_base_intermediate_tensors(batch_size, dtype, device)
+        if self._recv_pp_topk:
+            tensors["topk_indices"] = torch.full(
+                (batch_size, self.config.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+        return tensors
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1446,6 +1477,11 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            if self._recv_pp_topk:
+                assert self.topk_indices_buffer is not None
+                self.topk_indices_buffer[: positions.shape[0]].copy_(
+                    intermediate_tensors["topk_indices"]
+                )
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
@@ -1490,9 +1526,13 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            if self._send_pp_topk:
+                assert self.topk_indices_buffer is not None
+                tensors["topk_indices"] = self.topk_indices_buffer[
+                    : positions.shape[0]
+                ].clone()
+            return IntermediateTensors(tensors)
 
         if hidden_states.shape[0] != positions.shape[0]:
             combined_states = torch.cat([hidden_states, residual], dim=-1)
