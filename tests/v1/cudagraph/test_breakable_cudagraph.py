@@ -7,8 +7,9 @@ Unit tests for the breakable cudagraph primitives.
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
-from unittest.mock import patch
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -61,8 +62,9 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     with (
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
-            return_value=nullcontext(),
+            return_value=nullcontext(SimpleNamespace(stream=MagicMock())),
         ),
+        patch("torch.cuda.current_stream"),
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
             return_value=False,
@@ -76,6 +78,86 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
         CUDAGraphMode.PIECEWISE,
     ]
     assert create_calls[0][1] is not create_calls[1][1]
+
+
+def test_wrapper_synchronizes_before_cleanup_only_on_capture():
+    """Finish warmup before freeing buffers, without blocking graph replay."""
+    from vllm.compilation import breakable_cudagraph as bcg
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    calls = MagicMock()
+    context = SimpleNamespace(
+        batch_descriptor=BatchDescriptor(num_tokens=8),
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+    )
+    with (
+        patch.object(bcg, "is_forward_context_available", return_value=True),
+        patch.object(bcg, "get_forward_context", return_value=context),
+        patch.object(bcg.current_platform, "get_global_graph_pool", return_value=1),
+        patch.object(bcg, "set_graph_pool_id"),
+        patch.object(bcg, "get_offloader", return_value=MagicMock()),
+        patch.object(bcg.torch.accelerator, "synchronize", calls.synchronize),
+        patch.object(bcg.gc, "collect", calls.collect),
+        patch.object(bcg.torch.accelerator, "empty_cache", calls.empty_cache),
+        patch.object(bcg, "BreakableCUDAGraphCapture") as capture_cls,
+    ):
+        wrapper = bcg.BreakableCUDAGraphWrapper(lambda: [], MagicMock())
+        for num_tokens in (8, 4):
+            context.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+            calls.reset_mock()
+            wrapper()
+            assert [call[0] for call in calls.mock_calls] == [
+                "synchronize",
+                "collect",
+                "empty_cache",
+            ]
+            calls.reset_mock()
+            wrapper()
+            wrapper()
+            assert not calls.mock_calls
+        assert capture_cls.return_value.replay.call_count == 4
+
+
+def test_capture_stream_writes_are_visible_to_caller(cuda_capture_stream, monkeypatch):
+    """Caller work must see capture writes without a host barrier between them."""
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils as cg
+
+    manager = cg.CudaGraphManager.__new__(cg.CudaGraphManager)
+    manager.device = torch.device("cuda")
+    manager.use_breakable_cg = True
+    manager._capture_descs = {
+        CUDAGraphMode.PIECEWISE: [
+            cg.BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 8, None)
+        ]
+    }
+    side_stream = torch.cuda.Stream()
+    output = torch.zeros(8, device="cuda")
+
+    @contextmanager
+    def capture_context(device):
+        side_stream.wait_stream(cuda_capture_stream)
+        with torch.cuda.stream(side_stream):
+            yield SimpleNamespace(stream=side_stream)
+
+    monkeypatch.setattr(cg, "graph_capture", capture_context)
+    monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
+
+    for value in (1, 7, 19):
+
+        def create_forward_fn(desc, warmup, value=value):
+            def forward(mode):
+                if mode == CUDAGraphMode.PIECEWISE:
+                    torch.cuda._sleep(10_000_000)
+                    output.fill_(value)
+
+            return forward
+
+        manager.capture(create_forward_fn)
+        observed = output.clone()
+        # Synchronization occurs only after the consumer has been submitted.
+        torch.testing.assert_close(observed.cpu(), torch.full((8,), float(value)))
 
 
 @pytest.fixture(autouse=True)

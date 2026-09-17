@@ -320,7 +320,8 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        caller_stream = torch.cuda.current_stream(self.device)
+        with graph_capture(device=self.device) as capture_context:
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -373,6 +374,9 @@ class CudaGraphManager:
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+        # Order subsequent setup (including MTP) after capture-stream buffer writes.
+        if caller_stream != capture_context.stream:
+            caller_stream.wait_stream(capture_context.stream)
         self._graphs_captured = True
 
     @torch.inference_mode()

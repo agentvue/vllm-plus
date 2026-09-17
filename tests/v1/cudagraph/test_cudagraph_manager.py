@@ -46,7 +46,8 @@ def _create_vllm_config() -> MagicMock:
     return vllm_config
 
 
-def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
+@pytest.mark.parametrize("same_stream", [False, True])
+def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch, same_stream):
     """FULL capture must set graph_pool_id before entering torch.cuda.graph().
 
     NCCL symmetric memory checks this global during graph capture; without
@@ -83,9 +84,21 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     def create_forward_fn(desc, warmup):
         return lambda _mode: None
 
+    caller_stream = MagicMock()
+    capture_stream = caller_stream if same_stream else MagicMock()
+    capture_exited = False
+
     @contextmanager
     def fake_graph_capture(*args, **kwargs):
-        yield SimpleNamespace(stream=MagicMock())
+        nonlocal capture_exited
+        yield SimpleNamespace(stream=capture_stream)
+        capture_exited = True
+
+    def wait_stream(stream):
+        assert capture_exited
+        assert not manager._graphs_captured
+
+    caller_stream.wait_stream.side_effect = wait_stream
 
     fake_offloader = MagicMock()
 
@@ -98,6 +111,9 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
 
     with (
         patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
+        patch.object(
+            gpu_cudagraph_utils.torch.cuda, "current_stream", return_value=caller_stream
+        ),
         patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
         patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
         patch.object(
@@ -109,3 +125,8 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
         manager.capture(create_forward_fn)
 
     mock_cuda_graph.assert_called_once()
+    if same_stream:
+        caller_stream.wait_stream.assert_not_called()
+    else:
+        caller_stream.wait_stream.assert_called_once_with(capture_stream)
+    assert manager._graphs_captured

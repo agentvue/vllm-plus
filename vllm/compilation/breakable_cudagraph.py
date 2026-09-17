@@ -367,11 +367,12 @@ class BreakableCUDAGraphWrapper:
 
         # Match torch.cuda.graph()'s pre-capture cleanup once per descriptor.
         # We drive capture_begin/end directly and bypass torch.cuda.graph(),
-        # so its built-in gc + empty_cache never fire. Run them here once
+        # so its built-in synchronize + gc + empty_cache never fire. Run them once
         # per _capture call -- NOT inside _begin_segment, since this capture
         # session may issue many begin/end pairs (one per layer's break),
         # and repeated gc would tank capture time the way it did for the
         # pre-`gc_disable` piecewise path.
+        torch.accelerator.synchronize()
         gc.collect()
         torch.accelerator.empty_cache()
         # Sync the offloader's copy stream before capture so any in-flight
