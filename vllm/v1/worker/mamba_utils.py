@@ -273,8 +273,7 @@ def postprocess_mamba_fused_kernel(
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
-    # per-request decision arrays are in req-state-slot order; the block table
-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
+    # decision arrays and block tables are both in req-state-slot order.
     idx_mapping_ptr,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
@@ -359,10 +358,9 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
         state_idx,
-        bt_row_idx,
+        req_idx,
         src_block_idx,
         dest_block_idx,
         accept_token_bias,
@@ -493,7 +491,7 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        req_idx,
         src_col,
         dst_col,
         token_bias,
@@ -749,7 +747,8 @@ class MambaSpecDecodeGPUContext:
             mamba_state_copy_funcs: Tuple of copy functions (one per state type)
                 used to determine whether each state is a conv or temporal state.
             block_tables: per-mamba-group persistent block-table tensors, in
-                the same order as `mamba_group_ids`. Their `data_ptr()` /
+                the same order as `mamba_group_ids`, with rows indexed by
+                request state slot (V2) or batch position (V1). Their `data_ptr()` /
                 `stride(0)` are captured once for the kernel to index into.
         """
         if self.is_initialized:

@@ -264,7 +264,11 @@ class PPHandler:
         if compute_need_sampled_mask(input_batch) is None:
             return
 
-        draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        # The speculator reuses its output buffer on the main stream while
+        # earlier batches may still be broadcasting on the side stream.
+        draft_tokens = draft_tokens.to(
+            dtype=torch.int64, copy=True, memory_format=torch.contiguous_format
+        )
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(

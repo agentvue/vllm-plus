@@ -135,12 +135,13 @@ class ModelState(ABC):
     def preprocess_state(
         self,
         input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
+        request_block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
         """Hook run on real batches before the forward pass (after block tables
-        are gathered). Used by mamba "align" prefix caching to pre-copy state
+        are gathered). Receives persistent tables indexed by request state slot,
+        not batch row. Used by mamba "align" prefix caching to pre-copy state
         across block boundaries. No-op by default."""
         return None
 

@@ -125,7 +125,7 @@ class MambaHybridModelState(DefaultModelState):
         self,
         kv_cache_config: KVCacheConfig,
         mamba_group_ids: list[int],
-        block_tables: tuple[torch.Tensor, ...],
+        request_block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
         if self._mamba_ctx is None:
             copy_funcs = self.model.get_mamba_state_copy_func()
@@ -146,21 +146,21 @@ class MambaHybridModelState(DefaultModelState):
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
             forward_context = self.vllm_config.compilation_config.static_forward_context
-            # block_tables are batch-order slices of the persistent
-            # input_block_tables (stable data_ptr), so the metadata is captured
-            # once here and reused across steps.
+            # Deferred PP postprocessing uses an older batch's idx_mapping.
+            # Keep tables in request-slot order so later batches cannot change
+            # which request owns a row.
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
                 self.model.get_mamba_state_copy_func(),
-                [block_tables[gid] for gid in mamba_group_ids],
+                [request_block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx
 
     def preprocess_state(
         self,
         input_batch: InputBatch,
-        block_tables: tuple[torch.Tensor, ...],
+        request_block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
@@ -176,7 +176,9 @@ class MambaHybridModelState(DefaultModelState):
         if num_reqs == 0:
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
-        ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        ctx = self._ensure_align_ctx(
+            kv_cache_config, mamba_group_ids, request_block_tables
+        )
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on

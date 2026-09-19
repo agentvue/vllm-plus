@@ -536,6 +536,64 @@ class TestPostprocessMambaFusedKernel:
     def test_config(self):
         return _TestConfig()
 
+    @pytest.mark.parametrize("precopy", [False, True])
+    @pytest.mark.parametrize("num_accepted", [1, 3])
+    def test_align_copy_uses_request_slots(
+        self, device, precopy, num_accepted, monkeypatch
+    ):
+        """Delayed PP results must copy the owning request's physical blocks."""
+        monkeypatch.setattr(
+            "vllm.v1.worker.mamba_utils.is_conv_state_dim_first", lambda: False
+        )
+        cfg = _TestConfig(num_layers=1, max_num_reqs=4)
+        kv_config = _make_kv_cache_config(cfg, ["layer_0"])
+        conv_ref, temporal_ref, conv, temporal, _, forward_ctx = _make_dual_layer_state(
+            cfg, device
+        )
+        ctx = _make_gpu_ctx(cfg, kv_config, device)
+        block_table = torch.arange(32, dtype=torch.int32, device=device).view(4, 8)
+        ctx.initialize_from_forward_context(
+            kv_config, forward_ctx, _COPY_FUNCS, [block_table]
+        )
+
+        # An older batch contains slots 3 and 1; its middle row was freed.
+        mapping = torch.tensor([3, -1, 1], dtype=torch.int32, device=device)
+        accepted = [1, num_accepted, 1, 2]
+        counts = torch.tensor(accepted, dtype=torch.int32, device=device)
+        src_col = 0 if precopy else 4
+        dst_col = 3
+        for slot in (3, 1):
+            bias = accepted[slot] - 1
+            src_block = slot * 8 + src_col
+            dst_block = slot * 8 + dst_col
+            conv_ref[dst_block, : cfg.conv_width - bias].copy_(conv[src_block, bias:])
+            temporal_ref[dst_block].copy_(temporal[src_block + bias])
+
+        if precopy:
+            ctx.run_fused_precopy(
+                len(mapping),
+                torch.full_like(counts, dst_col),
+                torch.full_like(counts, src_col),
+                counts - 1,
+                mapping,
+            )
+        else:
+            # End exactly at the fourth block boundary, with the running
+            # state in column 4 and accepted speculative states after it.
+            ctx.run_fused_postprocess_align(
+                len(mapping),
+                counts,
+                torch.full_like(counts, src_col),
+                torch.full_like(counts, 4 * cfg.block_size),
+                mapping,
+            )
+
+        torch.testing.assert_close(conv, conv_ref, rtol=0, atol=0)
+        torch.testing.assert_close(temporal, temporal_ref, rtol=0, atol=0)
+        torch.testing.assert_close(
+            counts, torch.tensor(accepted, dtype=torch.int32, device=device)
+        )
+
     def test_matches_python_postprocess_mamba(self, device, test_config):
         """
         Golden test: GPU kernel produces identical results to Python impl.

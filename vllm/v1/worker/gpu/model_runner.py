@@ -1605,7 +1605,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # boundary reset is visible to the attention metadata.
             self.model_state.preprocess_state(
                 input_batch,
-                block_tables,
+                tuple(table.gpu for table in self.block_tables.block_tables),
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
