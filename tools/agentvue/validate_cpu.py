@@ -328,6 +328,17 @@ def build_tests():
         "vllm/model_executor/models/utils.py",
         functions=("extract_layer_index",),
     )
+    layout = load(
+        "vllm.v1.kv_cache_layout",
+        "vllm/v1/kv_cache_layout.py",
+        classes={"KVCacheLayout": (None, None)},
+        Enum=enum.Enum,
+        _DIM_L=0,
+        _DIM_B=1,
+        _DIM_H=2,
+        _DIM_N=3,
+        _DIM_C=4,
+    ).KVCacheLayout
     spec_tree = ast.parse((ROOT / "vllm/v1/kv_cache_interface.py").read_text())
     specs_module = load(
         "vllm.v1.kv_cache_interface",
@@ -335,7 +346,15 @@ def build_tests():
         classes={
             n.name: (None, None) for n in spec_tree.body if isinstance(n, ast.ClassDef)
         },
-        functions=("_apply_alignment_padding",),
+        functions=(
+            "_apply_alignment_padding",
+            "compute_layer_kv_cache_shape_bytes",
+            "compute_layout_strides",
+            "create_kv_cache_views",
+        ),
+        KVCacheLayout=layout,
+        _DIM_L=0,
+        _DIM_B=1,
         dataclass=dataclasses.dataclass,
         field=dataclasses.field,
         fields=dataclasses.fields,
@@ -371,10 +390,27 @@ def build_tests():
             "get_kv_cache_groups",
             "is_kv_cache_spec_uniform",
             "is_kv_cache_type_attention_free",
+            "_get_per_layer_spec",
+            "validate_kv_cache_layout",
+            "get_kv_cache_config_from_groups",
+            "_project_kv_cache_groups_to_worker",
+            "may_override_num_blocks",
         ),
+        compute_layout_strides=specs_module.compute_layout_strides,
+        math=__import__("math"),
+        defaultdict=__import__("collections").defaultdict,
+        round_up=specs_module.round_up,
         cdiv=lambda a, b: (a + b - 1) // b,
         replace=dataclasses.replace,
         get_hisparse_kv_cache_groups=lambda *args: None,
+        **spec_globals,
+    )
+    load(
+        "vllm.v1.worker.utils",
+        "vllm/v1/worker/utils.py",
+        functions=("allocate_kv_cache",),
+        create_kv_cache_views=specs_module.create_kv_cache_views,
+        current_platform=SimpleNamespace(is_rocm=lambda: False),
         **spec_globals,
     )
     config_class = load(
@@ -609,12 +645,14 @@ def build_tests():
                 "test_glm5_draft_states_are_counted",
                 "test_glm5_empty_projected_groups",
                 "test_glm5_window_draft",
+                "test_projected_empty_wrapped_group",
                 "new_mamba_spec",
                 "new_mla_spec",
                 "_glm5_like_kv_cache_spec",
             ),
             {
                 "kv_cache_utils": kv,
+                "KVCacheLayout": layout,
                 **spec_globals,
                 "ModelConfig": lambda **kwargs: SimpleNamespace(**kwargs),
                 "VllmConfig": lambda **kwargs: SimpleNamespace(

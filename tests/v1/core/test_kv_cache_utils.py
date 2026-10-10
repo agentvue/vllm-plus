@@ -1806,6 +1806,62 @@ def test_project_kv_cache_groups_to_worker():
     assert set(proj_spec.kv_cache_specs.keys()) == {"layer1", "layer3"}
 
 
+@pytest.mark.parametrize("empty_kind", ["attention", "mamba"])
+@pytest.mark.parametrize("empty_index", [0, 2])
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBNHC, KVCacheLayout.BLNHC])
+def test_projected_empty_wrapped_group_allocates_only_stage_local_layers(
+    empty_kind, empty_index, layout
+):
+    """Retained global specs must not emit foreign tensors or consume local bytes."""
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    attention = FullAttentionSpec(
+        block_size=2, num_kv_heads=1, head_size=2, dtype=torch.bfloat16
+    )
+    mamba = MambaSpec(block_size=2, shapes=((4,),), dtypes=(torch.float32,))
+    foreign = attention if empty_kind == "attention" else mamba
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=2, kv_cache_specs={"foreign.0": foreign, "foreign.1": foreign}
+    )
+    groups = [
+        KVCacheGroupSpec(["local.attn"], attention),
+        KVCacheGroupSpec(["local.gdn"], mamba),
+    ]
+    groups.insert(empty_index, KVCacheGroupSpec(list(wrapped.kv_cache_specs), wrapped))
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(
+        groups, {"local.attn": attention, "local.gdn": mamba}
+    )
+    assert projected[empty_index].layer_names == []
+    assert projected[empty_index].kv_cache_spec is wrapped
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: layout,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+        ),
+    )
+    stage = kv_cache_utils.get_kv_cache_config_from_groups(
+        config, projected, available_memory=attention.page_size_bytes * 4
+    )
+    assert stage.num_blocks == 4
+    assert stage.kv_cache_groups == projected
+    assert {name for tensor in stage.kv_cache_tensors for name in tensor.layers} == {
+        "local.attn",
+        "local.gdn",
+    }
+    caches = allocate_kv_cache(stage, torch.device("cpu"), layout)
+    assert set(caches) == {"local.attn", "local.gdn"}
+    assert caches["local.attn"].shape == (4, 1, 2, 4)
+    assert caches["local.gdn"].numel() == attention.page_size_bytes * 4
+    assert caches["local.attn"].untyped_storage().data_ptr() == (
+        caches["local.gdn"].untyped_storage().data_ptr()
+    )
+    assert caches["local.attn"].untyped_storage().nbytes() == (
+        attention.page_size_bytes * 4
+    )
+
+
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("disable_hybrid", [False, True])
 @pytest.mark.parametrize("pcp_size", [1, 4])
