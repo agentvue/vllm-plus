@@ -79,8 +79,9 @@ class RegisteredHostMemory {
       }
     }
     if (safe) {
-      for (auto it = addresses_.rbegin(); it != addresses_.rend(); ++it) {
-        if (cudaHostUnregister(*it) != cudaSuccess) {
+      for (auto it = registrations_.rbegin(); it != registrations_.rend();
+           ++it) {
+        if (cudaHostUnregister(it->pointer) != cudaSuccess) {
           safe = false;
           break;
         }
@@ -117,9 +118,10 @@ class RegisteredHostMemory {
     void* base_device_ptr = nullptr;
     check_host_cuda(cudaHostGetDevicePointer(&base_device_ptr, data_, 0),
                     "cudaHostGetDevicePointer");
-    for (size_t offset = 0; offset < mapped_bytes_; offset += chunk_bytes_) {
-      size_t length = std::min(chunk_bytes_, mapped_bytes_ - offset);
-      for (size_t position : {offset, offset + length - 1}) {
+    for (const auto& registration : registrations_) {
+      size_t offset =
+          static_cast<char*>(registration.pointer) - static_cast<char*>(data_);
+      for (size_t position : {offset, offset + registration.bytes - 1}) {
         void* device_ptr = nullptr;
         check_host_cuda(
             cudaHostGetDevicePointer(&device_ptr,
@@ -148,11 +150,12 @@ class RegisteredHostMemory {
           "Invalid PLE allocation or registration size");
     }
     bytes_ = bytes;
-    chunk_bytes_ = chunk_bytes;
     mapped_bytes_ = ((bytes + page_size - 1) / page_size) * page_size;
+    size_t minimum_chunk_bytes =
+        std::min(chunk_bytes, std::max(size_t(page_size), size_t(1024 * 1024)));
     // Reserve metadata before registering anything: no allocation may fail
     // between a successful registration and recording its address.
-    addresses_.reserve((mapped_bytes_ - 1) / chunk_bytes_ + 1);
+    registrations_.reserve((mapped_bytes_ - 1) / minimum_chunk_bytes + 1);
     int device;
     check_host_cuda(cudaGetDevice(&device), "cudaGetDevice");
     data_ = mmap(nullptr, mapped_bytes_, PROT_READ | PROT_WRITE,
@@ -165,8 +168,8 @@ class RegisteredHostMemory {
     // This advice is allocation-local; never change system THP settings.
     madvise(data_, mapped_bytes_, MADV_NOHUGEPAGE);
   #endif
-    for (size_t offset = 0; offset < mapped_bytes_; offset += chunk_bytes_) {
-      size_t length = std::min(chunk_bytes_, mapped_bytes_ - offset);
+    for (size_t offset = 0; offset < mapped_bytes_;) {
+      size_t length = std::min(chunk_bytes, mapped_bytes_ - offset);
       auto* pointer = static_cast<char*>(data_) + offset;
       // Anonymous pages are zero-filled. Fault each page without rewriting
       // the entire embedding table before checkpoint loading.
@@ -178,11 +181,25 @@ class RegisteredHostMemory {
           pointer, length, cudaHostRegisterPortable | cudaHostRegisterMapped);
       if (result != cudaSuccess) {
         cudaGetLastError();
+        if ((result == cudaErrorInvalidValue ||
+             result == cudaErrorMemoryAllocation) &&
+            length > minimum_chunk_bytes) {
+          // Reduce kernel metadata pressure while keeping registered chunks.
+          size_t smaller = (length / 2 / page_size) * page_size;
+          chunk_bytes = std::max(smaller, minimum_chunk_bytes);
+          std::fprintf(stderr,
+                       "vLLM PLE: host registration failed at byte %zu (%s); "
+                       "retrying with %zu-byte chunks\n",
+                       offset, cudaGetErrorString(result), chunk_bytes);
+          continue;
+        }
         throw std::runtime_error("PLE cudaHostRegister failed at byte " +
-                                 std::to_string(offset) + ": " +
-                                 cudaGetErrorString(result));
+                                 std::to_string(offset) + " for " +
+                                 std::to_string(length) +
+                                 " bytes: " + cudaGetErrorString(result));
       }
-      addresses_.push_back(pointer);
+      registrations_.push_back({pointer, length});
+      offset += length;
     }
     track_current_device();
   }
@@ -196,8 +213,11 @@ class RegisteredHostMemory {
   void* data_ = MAP_FAILED;
   size_t bytes_ = 0;
   size_t mapped_bytes_ = 0;
-  size_t chunk_bytes_ = 0;
-  std::vector<void*> addresses_;
+  struct Registration {
+    void* pointer;
+    size_t bytes;
+  };
+  std::vector<Registration> registrations_;
   std::vector<int> devices_;
   std::vector<int> validated_devices_;
   std::mutex devices_mutex_;

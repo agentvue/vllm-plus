@@ -196,6 +196,11 @@ def test_registered_host_owner_rolls_back_and_drains_before_unmapping(tmp_path):
         "retry_mapping",
         "sync_failure",
         "unregister_failure",
+        "adaptive_invalid",
+        "adaptive_memory",
+        "adaptive_rollback",
+        "adaptive_no_retry",
+        "adaptive_mapping",
     ]:
         subprocess.run(
             [str(executable), scenario],
