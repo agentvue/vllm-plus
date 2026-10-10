@@ -10,9 +10,23 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.workspace import current_workspace_manager
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
+
+
+def get_qsa_prefill_workspace(
+    rows: int, logits_width: int
+) -> tuple[int, torch.Tensor, torch.Tensor]:
+    """Get shared scratch bounded by the batch size and logits memory cap."""
+    max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    rows_per_chunk = min(rows, max(1, max_logits_bytes // (logits_width * 4)))
+    logits_workspace, topk_workspace = current_workspace_manager().get_simultaneous(
+        ((rows_per_chunk * logits_width,), torch.float32),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    )
+    return rows_per_chunk, logits_workspace, topk_workspace
 
 
 @triton.jit
@@ -608,22 +622,16 @@ def qsa_select_paged_prefill(
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
     assert q.dtype == k_cache.dtype, "Q and the compressed K cache must match"
     rows = q.shape[0]
+    if rows == 0:
+        return
     # No row scores beyond cdiv(max_seq_len, compress_ratio) compressed
     # columns. Round up to 64 to keep the logits row stride
     # cooperative_topk-compatible.
     logits_width = triton.cdiv(triton.cdiv(max_seq_len, compress_ratio), 64) * 64
     logits_width = min(max(64, logits_width), page_table.shape[1] * k_cache.shape[1])
 
-    # chunk the inputs to keep temp logits below VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
-    # always allocate the worst case to avoid memory fragmentation.
-    max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-    rows_per_chunk = max(1, max_logits_bytes // (logits_width * 4))
-
-    budget_bytes = max(max_logits_bytes, page_table.shape[1] * k_cache.shape[1] * 4)
-    logits_workspace = q.new_empty(budget_bytes // 4, dtype=torch.float32)
-
-    topk_workspace = torch.empty(
-        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
+    rows_per_chunk, logits_workspace, topk_workspace = get_qsa_prefill_workspace(
+        rows, logits_width
     )
 
     for query_start in range(0, rows, rows_per_chunk):

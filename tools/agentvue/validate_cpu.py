@@ -525,7 +525,66 @@ def build_tests():
         _PLE_HOST_REGISTER_CHUNK_BYTES=512 * 1024**2,
         current_platform=SimpleNamespace(is_cuda=lambda: True),
     )
+    workspace = load(
+        "vllm.v1.worker.workspace",
+        "vllm/v1/worker/workspace.py",
+        functions=("_compute_bytes", "use_workspace_lane"),
+        classes={"WorkspaceManager": (None, None)},
+        prod=__import__("math").prod,
+        accumulate=__import__("itertools").accumulate,
+        _workspace_lane=__import__("contextvars").ContextVar(
+            "qsa_test_lane", default=0
+        ),
+        dbo_current_ubatch_id=lambda: 0,
+        round_up=specs_module.round_up,
+        envs=SimpleNamespace(VLLM_DEBUG_WORKSPACE=False),
+    )
+    qsa_ops = load(
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer",
+        "vllm/models/qwen4_exp/nvidia/ops/qsa_indexer.py",
+        functions=("get_qsa_prefill_workspace", "qsa_select_paged_prefill"),
+        triton=SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
+        envs=type(
+            "QSAEnv",
+            (),
+            {
+                "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": property(
+                    lambda _: int(
+                        os.environ.get("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+                    )
+                )
+            },
+        )(),
+        _TOPK_WORKSPACE_BYTES=1024**2,
+        current_workspace_manager=None,
+        _prefill_logits=None,
+        _topk=None,
+    )
+    qsa_indexer = load(
+        "vllm.models.qwen4_exp.nvidia.indexer_qsa",
+        "vllm/models/qwen4_exp/nvidia/indexer_qsa.py",
+        classes={"QSAIndexer": ([], ("reserve_prefill_workspace",))},
+        get_qsa_prefill_workspace=qsa_ops.get_qsa_prefill_workspace,
+    )
+    qsa_owner = load(
+        "vllm.models.qwen4_exp.nvidia.qsa",
+        "vllm/models/qwen4_exp/nvidia/qsa.py",
+        classes={"Qwen4ExpQSAAttention": ([], ("_run_qsa",))},
+        get_forward_context=None,
+        eager_break_during_capture=lambda fn: fn,
+    )
     specs = [
+        (
+            "tests/models/qwen4_exp/test_qsa_reference.py",
+            ("test_qsa_prefill_scratch", "test_qsa_profile_reserves"),
+            {
+                "qsa_indexer_ops": qsa_ops,
+                "indexer_qsa": qsa_indexer,
+                "qsa_owner": qsa_owner,
+                "WorkspaceManager": workspace.WorkspaceManager,
+                "use_workspace_lane": workspace.use_workspace_lane,
+            },
+        ),
         (
             "tests/utils_/test_torch_utils.py",
             ("test_registered_host_owner",),

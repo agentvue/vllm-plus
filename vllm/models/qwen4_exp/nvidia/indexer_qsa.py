@@ -23,6 +23,7 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+from .ops.qsa_indexer import get_qsa_prefill_workspace
 from .ops.qsa_pre_indexer import qsa_pre_indexer
 
 
@@ -116,6 +117,8 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
+        self.max_model_len = vllm_config.model_config.max_model_len
+        self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.rotary_emb = rotary_emb
         self.use_fused_pre_indexer = _supports_fused_pre_indexer(
             rotary_emb,
@@ -178,6 +181,12 @@ class QSAIndexer(nn.Module):
             cache_config=cache_config,
             vllm_config=vllm_config,
         )
+
+    def reserve_prefill_workspace(self) -> None:
+        """Account for peak selection scratch before allocating the KV cache."""
+        columns = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+        columns = (columns + 63) // 64 * 64
+        get_qsa_prefill_workspace(self.max_num_tokens, columns)
 
     @property
     def output_width(self) -> int:

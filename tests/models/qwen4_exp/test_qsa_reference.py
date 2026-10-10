@@ -13,16 +13,119 @@ from vllm.models.qwen4_exp.nvidia import indexer_qsa
 from vllm.models.qwen4_exp.nvidia import (
     model as _qwen4_exp_model,  # noqa: F401
 )
+from vllm.models.qwen4_exp.nvidia import qsa as qsa_owner
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.worker.utils import clear_layer_kv_caches
+from vllm.v1.worker.workspace import WorkspaceManager, use_workspace_lane
 
 requires_qsa_kernels = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
     reason="QSA kernels require CUDA and Triton",
 )
+
+
+@pytest.mark.parametrize("budget_mb", [0, 1, 512])
+def test_qsa_prefill_scratch_preserves_selection_across_chunks(
+    monkeypatch: pytest.MonkeyPatch, budget_mb: int
+) -> None:
+    """Reuse bounded scratch without losing or reordering query rows."""
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(qsa_indexer_ops, "current_workspace_manager", lambda: manager)
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", str(budget_mb))
+    rows, columns = 1031, 256
+    q = torch.arange(rows, dtype=torch.bfloat16).view(rows, 1, 1)
+    visible = torch.arange(rows, dtype=torch.int32) % (columns - 2) + 2
+    reference = torch.arange(columns, dtype=torch.float32).expand(rows, -1)
+    reference = (
+        reference.masked_fill(
+            torch.arange(columns)[None, :] >= visible[:, None], -torch.inf
+        )
+        .topk(2, dim=1)
+        .indices.to(torch.int32)
+    )
+    seen_rows = []
+    pointers = []
+
+    def logits(*args, query_offset, num_queries):
+        scratch = args[5]
+        pointers.append(scratch.data_ptr())
+        seen_rows.extend(range(query_offset, query_offset + num_queries))
+        result = scratch[: num_queries * columns].view(num_queries, columns)
+        result.copy_(torch.arange(columns, dtype=torch.float32))
+        return result
+
+    def topk(logits, lengths, token_topk, compress_ratio, out, scratch):
+        assert scratch.data_ptr() >= logits.data_ptr() + logits.numel() * 4
+        scores = logits.masked_fill(
+            torch.arange(columns)[None, :] >= lengths[:, None], -torch.inf
+        )
+        out.copy_(scores.topk(token_topk // compress_ratio, dim=1).indices)
+
+    monkeypatch.setattr(qsa_indexer_ops, "_prefill_logits", logits)
+    monkeypatch.setattr(qsa_indexer_ops, "_topk", topk)
+    actual = torch.empty(rows, 2, dtype=torch.int32)
+    qsa_indexer_ops.qsa_select_paged_prefill(
+        q,
+        torch.empty(1, columns, 1, 1, dtype=q.dtype),
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.tensor([0, rows], dtype=torch.int32),
+        visible,
+        8,
+        4,
+        rows,
+        actual,
+        columns * 4,
+    )
+    torch.testing.assert_close(actual, reference)
+    assert seen_rows == list(range(rows))
+    assert len(set(pointers)) == 1
+    max_rows = min(rows, max(1, budget_mb * 1024**2 // (columns * 4)))
+    _, scratch, _ = qsa_indexer_ops.get_qsa_prefill_workspace(rows, columns)
+    assert scratch.numel() == max_rows * columns
+
+
+def test_qsa_profile_reserves_scratch_for_target_and_mtp_before_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile both lanes; locked execution reuses their separate storage."""
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = WorkspaceManager(torch.device("cpu"), num_lanes=2)
+    monkeypatch.setattr(qsa_indexer_ops, "current_workspace_manager", lambda: manager)
+    monkeypatch.setenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    monkeypatch.setattr(
+        qsa_owner, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None)
+    )
+    indexer = SimpleNamespace(
+        max_model_len=32000, compress_ratio=4, max_num_tokens=2048
+    )
+    indexer.reserve_prefill_workspace = lambda: (
+        indexer_qsa.QSAIndexer.reserve_prefill_workspace(indexer)
+    )
+    owner = SimpleNamespace(indexer=indexer)
+    output = torch.ones(1)
+    pointers = []
+    for lane in (0, 1):
+        with use_workspace_lane(lane):
+            qsa_owner.Qwen4ExpQSAAttention._run_qsa(
+                owner, output, output, output, output, output, output, output
+            )
+            _, logits, scratch = qsa_indexer_ops.get_qsa_prefill_workspace(2048, 8000)
+            assert logits.numel() * 4 == 62.5 * 1024**2
+            assert scratch.numel() == 1024**2
+            pointers.append(logits.data_ptr())
+            logits[0] = lane + 1
+    assert output.item() == 0
+    assert pointers[0] != pointers[1]
+    manager.lock()
+    for lane in (0, 1):
+        with use_workspace_lane(lane):
+            _, logits, _ = qsa_indexer_ops.get_qsa_prefill_workspace(8, 512)
+            assert logits.data_ptr() == pointers[lane]
+            assert logits[0].item() == lane + 1
 
 
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
@@ -800,6 +903,7 @@ def test_qsa_decode_selection_correctness(
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
 def test_qsa_prefill_selection_correctness(
+    workspace_init,
     monkeypatch: pytest.MonkeyPatch,
     seq_len_slack: int,
     force_chunk: bool,
