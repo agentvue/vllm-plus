@@ -7,15 +7,15 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.attention.backend import (
-    AttentionLayer,
-    AttentionType,
-    MLAAttentionImpl,
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
 )
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseMetadata,
     _get_workspace_buffer,
 )
+from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
@@ -30,12 +30,11 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
     return "pow2_fp32"
 
 
-class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]):
+class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """SM120 FlashInfer sparse-MLA implementation."""
 
     is_sparse = True
     supports_dense_mha_prefill = False
-    # The packed FlashInfer ABI reserves a 64-element BF16 tail.
     _packed_rope_head_dim = 64
 
     def __init__(
@@ -63,49 +62,46 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 "FLASHINFER_MLA_SPARSE_SM120 only supports decoder self-attention"
             )
 
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = kv_cache_dtype
-        if self.kv_cache_dtype != "fp8_ds_mla":
+        if kv_cache_dtype != "fp8_ds_mla":
             raise NotImplementedError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "
                 f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
             )
 
-        self.kv_lora_rank: int = mla_args["kv_lora_rank"]
-        self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
-        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
-        if self.kv_lora_rank != 512 or self.qk_rope_head_dim not in (0, 64):
-            raise NotImplementedError(
-                "FLASHINFER_MLA_SPARSE_SM120 requires kv_lora_rank=512 and "
-                "qk_rope_head_dim in (0, 64); got "
-                f"kv_lora_rank={self.kv_lora_rank} and "
-                f"qk_rope_head_dim={self.qk_rope_head_dim}."
-            )
+        topk_indices_buffer = mla_args.pop("topk_indices_buffer", None)
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            indexer=indexer,
+            topk_indices_buffer=topk_indices_buffer,
+            **mla_args,
+        )
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
         model_type = None
         if vllm_config.model_config is not None:
-            hf_text_config = vllm_config.model_config.hf_text_config
-            model_type = getattr(hf_text_config, "model_type", None)
-            self.sparse_mla_top_k = int(getattr(hf_text_config, "index_topk", 2048))
-            self.index_kpool = int(getattr(hf_text_config, "index_kpool", 1) or 1)
-        else:
-            self.sparse_mla_top_k = 2048
-            self.index_kpool = 1
+            model_type = getattr(
+                vllm_config.model_config.hf_text_config, "model_type", None
+            )
         self.kv_scale_format = _kv_scale_format_for_model(model_type)
+        if self.kv_lora_rank != 512 or self.qk_rope_head_dim not in (0, 64):
+            raise NotImplementedError(
+                "FLASHINFER_MLA_SPARSE_SM120 requires kv_lora_rank=512 and "
+                "qk_rope_head_dim in (0, 64)."
+            )
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        self.sparse_mla_top_k = int(getattr(hf_config, "index_topk", 2048))
+        self.index_kpool = int(getattr(hf_config, "index_kpool", 1) or 1)
 
-        # Skip-topk layers are built with indexer=None and get the shared
-        # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
-        self._indexer = indexer
-        self._topk_indices_buffer: torch.Tensor | None = (
-            indexer.topk_indices_buffer
-            if indexer is not None
-            else mla_args.get("topk_indices_buffer")
-        )
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
         if not has_flashinfer_sparse_mla_sm120():
@@ -114,26 +110,14 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
                 "sparse MLA decode API."
             )
         assert self.topk_indices_buffer is not None
+
+        self.supports_quant_query_input = False
+        self._workspace_buffer: torch.Tensor | None = None
         self._topk_columns = torch.arange(
             self.sparse_mla_top_k,
             dtype=torch.int64,
             device=self.topk_indices_buffer.device,
         ).unsqueeze(0)
-
-        self.supports_quant_query_input = False
-        self._workspace_buffer: torch.Tensor | None = None
-
-    @property
-    def topk_indices_buffer(self) -> torch.Tensor | None:
-        if self._indexer is not None:
-            return self._indexer.topk_indices_buffer
-        return self._topk_indices_buffer
-
-    @topk_indices_buffer.setter
-    def topk_indices_buffer(self, buffer: torch.Tensor | None) -> None:
-        self._topk_indices_buffer = buffer
-        if self._indexer is not None:
-            self._indexer.topk_indices_buffer = buffer
 
     def _fit_topk_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
         topk = self.sparse_mla_top_k
@@ -144,15 +128,14 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         if tail_width <= 0:
             return topk_indices[:, :topk]
 
+        columns = self._topk_columns
         history = topk_indices[:, :topk]
         tail = topk_indices[:, topk : topk + tail_width]
         tail_counts = (tail >= 0).sum(dim=1, keepdim=True)
         history_limits = topk - tail_counts
-        tail_offsets = (self._topk_columns - history_limits).clamp(
-            min=0, max=tail_width - 1
-        )
+        tail_offsets = (columns - history_limits).clamp(min=0, max=tail_width - 1)
         tail_values = torch.gather(tail, 1, tail_offsets)
-        return torch.where(self._topk_columns < history_limits, history, tail_values)
+        return torch.where(columns < history_limits, history, tail_values)
 
     def do_kv_cache_update(
         self,
@@ -183,38 +166,114 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
-        if self.qk_rope_head_dim == 0:
-            q = F.pad(q, (0, self._packed_rope_head_dim))
 
         num_actual_toks = q.shape[0]
-        actual_num_heads = q.shape[1]
-        kernel_num_heads = max(8, 1 << (actual_num_heads - 1).bit_length())
-        if kernel_num_heads > 128:
-            raise ValueError(
-                "FLASHINFER_MLA_SPARSE_SM120 supports at most 128 attention "
-                f"heads per worker; got {actual_num_heads}."
-            )
-        if kernel_num_heads != actual_num_heads:
-            q_padded = q.new_zeros((num_actual_toks, kernel_num_heads, q.shape[-1]))
-            q_padded[:, :actual_num_heads].copy_(q)
-            q = q_padded
 
         assert self.topk_indices_buffer is not None
         topk_indices = self._fit_topk_indices(
             self.topk_indices_buffer[:num_actual_toks]
         )
+        index_group = self.index_group
+        if isinstance(index_group, HiSparseMLAIndexGroup):
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            outputs = []
+            if num_decode_tokens:
+                topk_indices_physical = cast(
+                    torch.Tensor,
+                    index_group.convert_logical_to_physical_topk(
+                        self.index_group_index,
+                        topk_indices[:num_decode_tokens],
+                        attn_metadata,
+                        block_stride_rows=None,
+                        return_valid_counts=False,
+                    ),
+                )
+                outputs.append(
+                    self._run_mqa_kernel(
+                        q[:num_decode_tokens],
+                        index_group.physical_kv_cache(self.index_group_index),
+                        topk_indices_physical,
+                    )
+                )
+            if num_decode_tokens < num_actual_toks:
+                cache = index_group.cache(self.index_group_index)
+                if num_decode_tokens == 0 and cache.all_context_pages_resident:
+                    topk_indices_physical = cast(
+                        torch.Tensor,
+                        index_group.convert_logical_to_physical_topk(
+                            self.index_group_index,
+                            topk_indices,
+                            attn_metadata,
+                            block_stride_rows=None,
+                            return_valid_counts=False,
+                        ),
+                    )
+                    prefill_cache = index_group.physical_kv_cache(
+                        self.index_group_index
+                    )
+                else:
+                    prefill_cache, block_table, req_ids = (
+                        index_group.stage_prefill_rows(
+                            self.index_group_index,
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                        )
+                    )
+                    topk_indices_physical = cast(
+                        torch.Tensor,
+                        triton_convert_req_index_to_global_index(
+                            req_ids,
+                            block_table,
+                            topk_indices[num_decode_tokens:],
+                            BLOCK_SIZE=attn_metadata.block_size,
+                            NUM_TOPK_TOKENS=topk_indices.shape[1],
+                        ),
+                    )
+                outputs.append(
+                    self._run_mqa_kernel(
+                        q[num_decode_tokens:],
+                        prefill_cache,
+                        topk_indices_physical,
+                    )
+                )
+            output = torch.cat(outputs) if len(outputs) > 1 else outputs[0]
+            return output, None
 
-        topk_indices_physical, topk_lengths = cast(
-            tuple[torch.Tensor, torch.Tensor],
+        topk_indices_physical = cast(
+            torch.Tensor,
             triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=self.sparse_mla_top_k,
-                return_valid_counts=True,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
             ),
         )
+        return (
+            self._run_mqa_kernel(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices_physical,
+            ),
+            None,
+        )
+
+    def _run_mqa_kernel(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_indices_physical: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.qk_rope_head_dim == 0:
+            q = F.pad(q, (0, self._packed_rope_head_dim))
+        num_actual_toks, actual_num_heads = q.shape[:2]
+        kernel_num_heads = max(8, 1 << (actual_num_heads - 1).bit_length())
+        if kernel_num_heads > 128:
+            raise ValueError("FLASHINFER_MLA_SPARSE_SM120 supports at most 128 heads.")
+        if kernel_num_heads != actual_num_heads:
+            padded = q.new_zeros((num_actual_toks, kernel_num_heads, q.shape[-1]))
+            padded[:, :actual_num_heads].copy_(q)
+            q = padded
 
         output = q.new_empty(
             (num_actual_toks, kernel_num_heads, self.kv_lora_rank),
@@ -228,24 +287,21 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
+        sparse_capacity = topk_indices_physical.shape[1]
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
-            kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+            kv_cache=kv_cache.view(torch.uint8).unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=(
-                self._packed_rope_head_dim
-                if self.qk_rope_head_dim == 0
-                else self.qk_rope_head_dim
-            ),
+            qk_rope_head_dim=self._packed_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=topk_lengths,
-            max_seq_len=self.sparse_mla_top_k,
+            seq_lens=(topk_indices_physical >= 0).sum(dim=1, dtype=torch.int32),
+            max_seq_len=sparse_capacity,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
-            sparse_mla_top_k=self.sparse_mla_top_k,
+            sparse_mla_top_k=sparse_capacity,
             kv_scale_format=self.kv_scale_format,
         )
-        return out.squeeze(1)[:, :actual_num_heads], None
+        return out.squeeze(1)[:, :actual_num_heads]

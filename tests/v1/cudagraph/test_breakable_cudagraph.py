@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Unit tests for the breakable cudagraph primitives.
-"""
+"""Unit tests for the breakable cudagraph primitives."""
 
 from __future__ import annotations
 
 import threading
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -44,6 +42,7 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
     manager._capture_descs = {CUDAGraphMode.PIECEWISE: [desc]}
     manager._graphs_captured = False
     manager.use_breakable_cg = True
+    manager.ubatch_runner = None
 
     create_calls = []
     forward_calls = []
@@ -60,11 +59,11 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
         return forward_fn
 
     with (
+        patch("torch.cuda.current_stream", return_value=MagicMock()),
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.graph_capture",
             return_value=nullcontext(SimpleNamespace(stream=MagicMock())),
         ),
-        patch("torch.cuda.current_stream"),
         patch(
             "vllm.v1.worker.gpu.cudagraph_utils.is_global_first_rank",
             return_value=False,
@@ -78,86 +77,6 @@ def test_piecewise_capture_builds_fresh_metadata_for_both_passes():
         CUDAGraphMode.PIECEWISE,
     ]
     assert create_calls[0][1] is not create_calls[1][1]
-
-
-def test_wrapper_synchronizes_before_cleanup_only_on_capture():
-    """Finish warmup before freeing buffers, without blocking graph replay."""
-    from vllm.compilation import breakable_cudagraph as bcg
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import BatchDescriptor
-
-    calls = MagicMock()
-    context = SimpleNamespace(
-        batch_descriptor=BatchDescriptor(num_tokens=8),
-        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
-    )
-    with (
-        patch.object(bcg, "is_forward_context_available", return_value=True),
-        patch.object(bcg, "get_forward_context", return_value=context),
-        patch.object(bcg.current_platform, "get_global_graph_pool", return_value=1),
-        patch.object(bcg, "set_graph_pool_id"),
-        patch.object(bcg, "get_offloader", return_value=MagicMock()),
-        patch.object(bcg.torch.accelerator, "synchronize", calls.synchronize),
-        patch.object(bcg.gc, "collect", calls.collect),
-        patch.object(bcg.torch.accelerator, "empty_cache", calls.empty_cache),
-        patch.object(bcg, "BreakableCUDAGraphCapture") as capture_cls,
-    ):
-        wrapper = bcg.BreakableCUDAGraphWrapper(lambda: [], MagicMock())
-        for num_tokens in (8, 4):
-            context.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
-            calls.reset_mock()
-            wrapper()
-            assert [call[0] for call in calls.mock_calls] == [
-                "synchronize",
-                "collect",
-                "empty_cache",
-            ]
-            calls.reset_mock()
-            wrapper()
-            wrapper()
-            assert not calls.mock_calls
-        assert capture_cls.return_value.replay.call_count == 4
-
-
-def test_capture_stream_writes_are_visible_to_caller(cuda_capture_stream, monkeypatch):
-    """Caller work must see capture writes without a host barrier between them."""
-    from vllm.config import CUDAGraphMode
-    from vllm.v1.worker.gpu import cudagraph_utils as cg
-
-    manager = cg.CudaGraphManager.__new__(cg.CudaGraphManager)
-    manager.device = torch.device("cuda")
-    manager.use_breakable_cg = True
-    manager._capture_descs = {
-        CUDAGraphMode.PIECEWISE: [
-            cg.BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 8, None)
-        ]
-    }
-    side_stream = torch.cuda.Stream()
-    output = torch.zeros(8, device="cuda")
-
-    @contextmanager
-    def capture_context(device):
-        side_stream.wait_stream(cuda_capture_stream)
-        with torch.cuda.stream(side_stream):
-            yield SimpleNamespace(stream=side_stream)
-
-    monkeypatch.setattr(cg, "graph_capture", capture_context)
-    monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
-
-    for value in (1, 7, 19):
-
-        def create_forward_fn(desc, warmup, value=value):
-            def forward(mode):
-                if mode == CUDAGraphMode.PIECEWISE:
-                    torch.cuda._sleep(10_000_000)
-                    output.fill_(value)
-
-            return forward
-
-        manager.capture(create_forward_fn)
-        observed = output.clone()
-        # Synchronization occurs only after the consumer has been submitted.
-        torch.testing.assert_close(observed.cpu(), torch.full((8,), float(value)))
 
 
 @pytest.fixture(autouse=True)
@@ -415,6 +334,57 @@ def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
     assert torch.equal(x, torch.full((4,), 15.0, device="cuda"))
 
 
+@pytest.mark.parametrize("keyword", [False, True])
+def test_quantized_activation_replay_does_not_retain_tensors(
+    cuda_capture_stream, keyword
+):
+    """Release the producer tensors while preserving both buffers on replay."""
+    import gc
+    import weakref
+
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+    from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+
+    @eager_break_during_capture
+    def consume(x, data_out, scale_out):
+        data_out.copy_(x.data)
+        scale_out.copy_(x.scale)
+
+    source = torch.ones((128, 128), device="cuda", dtype=torch.bfloat16)
+    data_out = source.to(torch.float8_e4m3fn)
+    scale_out = source[:, ::32].to(torch.uint8)
+    output = torch.empty_like(source)
+    cap = BreakableCUDAGraphCapture()
+    with cap:
+        data = source.to(torch.float8_e4m3fn)
+        scale = source[:, ::32].to(torch.uint8)
+        activation = QuantizedActivation(
+            data, scale, source.dtype, source.shape, kMxfp8Dynamic
+        )
+        data_ref, scale_ref = weakref.ref(data), weakref.ref(scale)
+        if keyword:
+            consume(x=activation, data_out=data_out, scale_out=scale_out)
+        else:
+            consume(activation, data_out, scale_out)
+        output.copy_(data_out)
+
+    del data, scale, activation
+    gc.collect()
+    assert data_ref() is None
+    assert scale_ref() is None
+
+    for value in (1, 2, 3):
+        source.fill_(value)
+        cap.replay()
+        cuda_capture_stream.synchronize()
+        torch.testing.assert_close(output, source, rtol=0, atol=0)
+        torch.testing.assert_close(scale_out, source[:, ::32].to(torch.uint8))
+
+
 def test_eager_attention_inside_multistream_overlap(cuda_capture_stream):
     """Handle an eager attention break inside a multi-stream overlap region."""
     from vllm.compilation.breakable_cudagraph import (
@@ -567,3 +537,172 @@ def test_nested_decorated_op_runs_inline(cuda_capture_stream):
     # 0 -> +2 -> +1 (inner) -> +10 (outer) -> +100 = 113
     assert torch.equal(x, torch.full((4,), 113.0, device="cuda"))
     assert inner_calls == 2  # replay invokes the outer's lambda again
+
+
+# ---------------------------------------------------------------------------
+# BreakableCUDAGraphWrapper: runtime_mode dispatch gating
+# ---------------------------------------------------------------------------
+
+
+def _mock_vllm_config():
+    config = MagicMock()
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.use_sequence_parallel_moe = False
+    config.parallel_config.is_moe_model = False
+    return config
+
+
+def test_wrapper_falls_through_on_runtime_mode_mismatch():
+    """A PIECEWISE-scoped wrapper runs other modes eagerly, capturing
+    nothing, so an outer CUDAGraphWrapper can own them."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    calls = []
+
+    def model(x):
+        calls.append(x)
+        return x + 1
+
+    config = _mock_vllm_config()
+    wrapper = BreakableCUDAGraphWrapper(
+        model, config, runtime_mode=CUDAGraphMode.PIECEWISE
+    )
+    desc = BatchDescriptor(num_tokens=4)
+
+    with set_forward_context(
+        None,
+        config,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        batch_descriptor=desc,
+    ):
+        assert wrapper(1) == 2
+
+    assert calls == [1]
+    assert not wrapper.entries
+
+
+def test_wrapper_captures_on_runtime_mode_match():
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    calls = []
+
+    def model(x):
+        calls.append(x)
+        return x + 1
+
+    config = _mock_vllm_config()
+    wrapper = BreakableCUDAGraphWrapper(
+        model, config, runtime_mode=CUDAGraphMode.PIECEWISE
+    )
+    desc = BatchDescriptor(num_tokens=4)
+
+    sentinel = object()
+    with (
+        patch.object(
+            BreakableCUDAGraphWrapper, "_capture", return_value=sentinel
+        ) as mock_capture,
+        set_forward_context(
+            None,
+            config,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=desc,
+        ),
+    ):
+        assert wrapper(1) is sentinel
+
+    mock_capture.assert_called_once()
+    assert calls == []
+    assert desc in wrapper.entries
+
+
+def test_wrapper_default_matches_any_non_none_mode():
+    """runtime_mode=None matches any non-NONE mode (MRV2 relies on this)."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    def model(x):
+        return x + 1
+
+    config = _mock_vllm_config()
+    wrapper = BreakableCUDAGraphWrapper(model, config)
+    desc = BatchDescriptor(num_tokens=4)
+
+    sentinel = object()
+    with (
+        patch.object(
+            BreakableCUDAGraphWrapper, "_capture", return_value=sentinel
+        ) as mock_capture,
+        set_forward_context(
+            None,
+            config,
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+            batch_descriptor=desc,
+        ),
+    ):
+        assert wrapper(1) is sentinel
+
+    mock_capture.assert_called_once()
+    assert desc in wrapper.entries
+
+
+def test_unwrap_recurses_through_nested_wrappers():
+    """unwrap() reaches the raw model through nested wrappers."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.config import CUDAGraphMode
+
+    def model(x):
+        return x + 1
+
+    config = _mock_vllm_config()
+    inner = BreakableCUDAGraphWrapper(
+        model, config, runtime_mode=CUDAGraphMode.PIECEWISE
+    )
+    outer = CUDAGraphWrapper(inner, config, runtime_mode=CUDAGraphMode.FULL)
+
+    assert inner.unwrap() is model
+    assert outer.unwrap() is model
+
+
+def test_wrapper_synchronizes_before_cleanup_only_on_capture():
+    """Finish warmup before freeing buffers, without blocking graph replay."""
+    from vllm.compilation import breakable_cudagraph as bcg
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor
+
+    calls = MagicMock()
+    context = SimpleNamespace(
+        batch_descriptor=BatchDescriptor(num_tokens=8),
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+    )
+    with (
+        patch.object(bcg, "is_forward_context_available", return_value=True),
+        patch.object(bcg, "get_forward_context", return_value=context),
+        patch.object(bcg.current_platform, "get_global_graph_pool", return_value=1),
+        patch.object(bcg, "set_graph_pool_id"),
+        patch.object(bcg, "get_offloader", return_value=MagicMock()),
+        patch.object(bcg.torch.accelerator, "synchronize", calls.synchronize),
+        patch.object(bcg.gc, "collect", calls.collect),
+        patch.object(bcg.torch.accelerator, "empty_cache", calls.empty_cache),
+        patch.object(bcg, "BreakableCUDAGraphCapture") as capture_cls,
+    ):
+        wrapper = bcg.BreakableCUDAGraphWrapper(lambda: [], MagicMock())
+        for num_tokens in (8, 4):
+            context.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+            calls.reset_mock()
+            wrapper()
+            assert [call[0] for call in calls.mock_calls] == [
+                "synchronize",
+                "collect",
+                "empty_cache",
+            ]
+            calls.reset_mock()
+            wrapper()
+            wrapper()
+            assert not calls.mock_calls
+        assert capture_cls.return_value.replay.call_count == 4

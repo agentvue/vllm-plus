@@ -11,10 +11,10 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     AttentionState,
     BatchExecutionDescriptor,
-    CreateForwardFn,
     CudaGraphManager,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -42,6 +42,16 @@ def _prepare_dflash_inputs_to_capture(
     attn_metadata = None
     if not skip_attn:
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        if block_tables.cp_size > 1:
+            input_batch.dcp_local_seq_lens = prepare_dcp_local_seq_lens(
+                input_buffers.dcp_local_seq_lens,
+                input_batch.seq_lens,
+                input_batch.num_reqs,
+                block_tables.cp_size,
+                block_tables.cp_rank,
+                block_tables.cp_interleave,
+                num_reqs_padded=input_batch.num_reqs_after_padding,
+            )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -50,6 +60,7 @@ def _prepare_dflash_inputs_to_capture(
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=num_tokens // num_reqs,
             seq_lens=input_batch.seq_lens,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             max_seq_len=max_model_len,
             block_tables=input_block_tables,
             slot_mappings=slot_mappings,
@@ -64,7 +75,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
-    def _build_forward_fn_factory(
+    def capture(
         self,
         forward_fn: Callable,
         input_buffers: InputBuffers,
@@ -73,7 +84,12 @@ class DFlashCudaGraphManager(CudaGraphManager):
         kv_cache_config: KVCacheConfig,
         max_model_len: int,
         causal: bool | Mapping[int, bool],
-    ) -> CreateForwardFn:
+        precompute_context_kv: Callable[[int], None],
+        progress_bar_desc: str = "Capturing CUDA graphs",
+    ) -> None:
+        """``precompute_context_kv(num_reqs)`` is captured ahead of the query
+        forward."""
+
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
             warmup: bool,
@@ -98,56 +114,17 @@ class DFlashCudaGraphManager(CudaGraphManager):
             )
             attn_metadata, slot_mappings = attn_state
 
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
-            )
+            def forward(cg_mode: CUDAGraphMode) -> None:
+                precompute_context_kv(num_reqs)
+                forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                )
 
-        return create_forward_fn
+            return forward
 
-    def capture(
-        self,
-        forward_fn: Callable,
-        input_buffers: InputBuffers,
-        block_tables: BlockTables,
-        attn_groups: list[list[AttentionGroup]],
-        kv_cache_config: KVCacheConfig,
-        max_model_len: int,
-        causal: bool | Mapping[int, bool],
-        progress_bar_desc: str = "Capturing CUDA graphs",
-    ) -> None:
-        create_forward_fn = self._build_forward_fn_factory(
-            forward_fn,
-            input_buffers,
-            block_tables,
-            attn_groups,
-            kv_cache_config,
-            max_model_len,
-            causal,
-        )
         super().capture(create_forward_fn, progress_bar_desc)
-
-    def profile_memory(
-        self,
-        forward_fn: Callable,
-        input_buffers: InputBuffers,
-        block_tables: BlockTables,
-        attn_groups: list[list[AttentionGroup]],
-        kv_cache_config: KVCacheConfig,
-        max_model_len: int,
-        causal: bool | Mapping[int, bool],
-    ) -> dict[CUDAGraphMode, tuple[int, int]]:
-        create_forward_fn = self._build_forward_fn_factory(
-            forward_fn,
-            input_buffers,
-            block_tables,
-            attn_groups,
-            kv_cache_config,
-            max_model_len,
-            causal,
-        )
-        return super().profile_memory(create_forward_fn)

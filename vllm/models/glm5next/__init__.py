@@ -3,13 +3,11 @@
 
 from vllm.platforms import current_platform
 
-if current_platform.is_rocm() or current_platform.is_xpu():
-    raise NotImplementedError(
-        "GLM-5.3-Flash currently supports NVIDIA SM90 and above only."
-    )
+if current_platform.is_xpu():
+    raise NotImplementedError("GLM-5.3-Flash does not currently support XPU.")
 
-from .nvidia.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
-from .nvidia.mtp import Glm5NextMTP
+from .common.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
+from .common.mtp import Glm5NextMTP
 
 __all__ = [
     "Glm5NextForCausalLM",

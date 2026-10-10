@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -28,21 +28,20 @@ class ModelSpecificAttnMetadata:
     """Base class for model-specific attention metadata."""
 
     def get_extra_common_attn_kwargs(
-        self,
-        kv_cache_group_id: int,
-        num_reqs: int,
+        self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
         return {}
 
     def get_extra_attn_kwargs(
-        self,
-        attn_metadata_builder: Any,
-        num_reqs: int,
+        self, attn_metadata_builder: Any, num_reqs: int
     ) -> dict[str, Any]:
         return {}
 
 
 class ModelState(ABC):
+    supports_prompt_embeds: ClassVar[bool] = False
+    """Whether this state implements user-provided prompt embeddings."""
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -50,13 +49,13 @@ class ModelState(ABC):
         encoder_cache: EncoderCache | None,
         device: torch.device,
     ) -> None:
+        self.request_block_tables: tuple[torch.Tensor, ...] | None = None
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
         self.model = model
         self.device = device
 
-        self.max_model_len = self.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.inputs_embeds_size = self.model_config.get_inputs_embeds_size()
@@ -95,6 +94,11 @@ class ModelState(ABC):
                     and observability_config.enable_mm_processor_stats
                 ),
             )
+
+    @property
+    def max_model_len(self) -> int:
+        # Auto-fit can reduce the limit after model state initialization.
+        return self.model_config.max_model_len
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (
@@ -135,13 +139,12 @@ class ModelState(ABC):
     def preprocess_state(
         self,
         input_batch: InputBatch,
-        request_block_tables: tuple[torch.Tensor, ...],
+        block_tables: tuple[torch.Tensor, ...],
         kv_cache_config: KVCacheConfig,
         num_computed_tokens: torch.Tensor,
     ) -> None:
         """Hook run on real batches before the forward pass (after block tables
-        are gathered). Receives persistent tables indexed by request state slot,
-        not batch row. Used by mamba "align" prefix caching to pre-copy state
+        are gathered). Used by mamba "align" prefix caching to pre-copy state
         across block boundaries. No-op by default."""
         return None
 
@@ -154,12 +157,13 @@ class ModelState(ABC):
         return None
 
     @abstractmethod
-    def get_mm_embeddings(
+    def prepare_inputs_embeds(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
         input_batch: InputBatch,
         req_states: RequestState,
     ) -> torch.Tensor | None:
+        """Prepare the ``inputs_embeds`` tensor for the current forward pass."""
         raise NotImplementedError
 
     def dummy_inputs_embeds(self, num_tokens: int) -> torch.Tensor | None:
@@ -218,6 +222,7 @@ class ModelState(ABC):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        ubatch_idx: int = 0,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
