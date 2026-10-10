@@ -181,6 +181,12 @@ torch::stable::Tensor awq_dequantize(torch::stable::Tensor _kernel,
 torch::stable::Tensor get_cuda_view_from_cpu_tensor(
     torch::stable::Tensor& cpu_tensor);
 
+#if defined(__linux__) && !defined(USE_ROCM)
+torch::stable::Tensor allocate_registered_cpu_tensor(
+    const std::vector<int64_t>& shape, torch::headeronly::ScalarType dtype,
+    int64_t chunk_bytes);
+#endif
+
 // Attention kernels (shared CUDA/ROCm)
 void merge_attn_states(
     torch::stable::Tensor& output,

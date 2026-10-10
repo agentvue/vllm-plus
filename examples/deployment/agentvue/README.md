@@ -11,6 +11,12 @@ memory fit are pending. This upgrade is not certified “no regression.”**
 
 ## Preservation review
 
+The follow-up [Qwen NVFP4 padding and chunked PLE fixes](qwen_fixes.md) include
+native rebuild instructions, focused tests, exact host-table accounting and the
+eight-request balanced performance gate. The original preservation inventory
+below remains the record of AgentVue changes; the Qwen report describes the
+additional fixes.
+
 The first AgentVue commit replaced a large upstream tree. Its stated GLM import
 base, `933876c388fb129ad82590660e6506614559cb86`, was fetched and compared with
 the final AgentVue head. [feature_inventory.tsv](feature_inventory.tsv) classifies

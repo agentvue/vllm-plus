@@ -33,6 +33,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
     parser.add_argument("candidate", type=Path)
+    parser.add_argument(
+        "--balanced",
+        action="store_true",
+        help="Gate Qwen throughput and p99 TTFT/TPOT; default retains strict GLM gates",
+    )
     args = parser.parse_args()
     baseline, candidate = read_runs(args.baseline), read_runs(args.candidate)
     signature = (
@@ -59,6 +64,14 @@ def main():
         "median_e2el_ms": False,
         "p99_e2el_ms": False,
     }
+    if args.balanced:
+        if expected[-1] != 8:
+            raise ValueError("The balanced Qwen profile requires concurrency 8")
+        metrics = {
+            metric: higher_is_better
+            for metric, higher_is_better in metrics.items()
+            if metric in ("output_throughput", "p99_ttft_ms", "p99_tpot_ms")
+        }
     failures = []
     for metric, higher_is_better in metrics.items():
         before = statistics.median(run[metric] for run in baseline)

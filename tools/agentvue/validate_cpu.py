@@ -3,8 +3,9 @@
 """Run isolated CPU contract tests when the vLLM native runtime is unavailable.
 
 Compiles selected definitions from the working tree unchanged. External runtime
-services are replaced by mocks. This checks Python behavior only; it does not
-validate package imports, CUDA/Triton kernels, checkpoints, or serving.
+services are replaced by mocks. The optional C++ owner test mocks CUDA and,
+on Windows, adapts POSIX mappings. This does not validate package imports,
+native extension ABI, actual CUDA/Triton kernels, checkpoints, or serving.
 Run in a fresh process: this deliberately installs temporary module stubs.
 """
 
@@ -16,9 +17,12 @@ import copy
 import dataclasses
 import enum
 import gc
+import importlib.util
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import weakref
 from collections import Counter, deque, namedtuple
@@ -38,6 +42,9 @@ RUNTIME_GLOBALS = dict(
     copy=copy,
     enum=enum,
     gc=gc,
+    importlib=importlib,
+    shutil=shutil,
+    subprocess=subprocess,
     json=json,
     logging=logging,
     weakref=weakref,
@@ -389,7 +396,83 @@ def build_tests():
         DefaultModelLoader=None,
         PPMissingLayer=type("Missing", (), {}),
     )
+    quant_helpers = load(
+        "vllm.model_executor.layers.quantization.utils.flashinfer_utils",
+        "vllm/model_executor/layers/quantization/utils/flashinfer_utils.py",
+        functions=(
+            "align_fp4_moe_weights_for_fi",
+            "align_trtllm_fp4_moe_hidden_dim_for_fi",
+        ),
+        round_up=lambda value, alignment: (value + alignment - 1)
+        // alignment
+        * alignment,
+        logger=MagicMock(),
+    )
+    quant_utils = load(
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+        "vllm/model_executor/layers/quantization/utils/quant_utils.py",
+        functions=("amax_for_moe_activation_quant",),
+    )
+    nvfp4 = load(
+        "vllm.model_executor.layers.fused_moe.oracle.nvfp4",
+        "vllm/model_executor/layers/fused_moe/oracle/nvfp4.py",
+        functions=("is_global_sf_supported_for_nvfp4_backend",),
+        classes={"NvFp4MoeBackend": (None, None)},
+        Enum=enum.Enum,
+    )
+    nvfp4.FLASHINFER_NVFP4_MOE_BACKENDS = [
+        backend
+        for backend in nvfp4.NvFp4MoeBackend
+        if backend.name.startswith("FLASHINFER")
+    ]
+    quant = load(
+        "vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe",
+        "vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py",
+        functions=("reorder_w1w3_to_w3w1", "prepare_nvfp4_moe_layer_for_fi_or_cutlass"),
+        align_fp4_moe_weights_for_fi=quant_helpers.align_fp4_moe_weights_for_fi,
+        amax_for_moe_activation_quant=quant_utils.amax_for_moe_activation_quant,
+        swizzle_blockscale=None,
+    )
+    ple = load(
+        "vllm.models.qwen4_exp.common.ngram_embedding",
+        "vllm/models/qwen4_exp/common/ngram_embedding.py",
+        classes={
+            "Qwen4ExpPLEPinnedHostEmbedding": ([], ("allocate_embedding_weight",))
+        },
+        _PLE_HOST_REGISTER_CHUNK_BYTES=512 * 1024**2,
+        current_platform=SimpleNamespace(is_cuda=lambda: True),
+    )
     specs = [
+        (
+            "tests/utils_/test_torch_utils.py",
+            ("test_registered_host_owner",),
+            {"__file__": str(ROOT / "tests/utils_/test_torch_utils.py")},
+        ),
+        (
+            "tests/quantization/test_trtllm_nvfp4_hidden_dim_padding.py",
+            ("test_cutlass_padding", "test_shared_nvfp4", "test_align_trtllm"),
+            {
+                "flashinfer_fp4_moe": quant,
+                "NvFp4MoeBackend": nvfp4.NvFp4MoeBackend,
+                "prepare_nvfp4_moe_layer_for_fi_or_cutlass": (
+                    quant.prepare_nvfp4_moe_layer_for_fi_or_cutlass
+                ),
+                "align_fp4_moe_weights_for_fi": (
+                    quant_helpers.align_fp4_moe_weights_for_fi
+                ),
+                "align_trtllm_fp4_moe_hidden_dim_for_fi": (
+                    quant_helpers.align_trtllm_fp4_moe_hidden_dim_for_fi
+                ),
+            },
+        ),
+        (
+            "tests/models/qwen4_exp/test_ple.py",
+            ("test_large_cuda_ple", "test_small_or_non_cuda_ple"),
+            {
+                "ngram_embedding_module": ple,
+                "Qwen4ExpPLEPinnedHostEmbedding": ple.Qwen4ExpPLEPinnedHostEmbedding,
+            },
+        ),
         ("tests/test_config.py", ("test_dflash_candidate_rejects_v1",), {}),
         (
             "tests/v1/spec_decode/test_dflash_profile.py",

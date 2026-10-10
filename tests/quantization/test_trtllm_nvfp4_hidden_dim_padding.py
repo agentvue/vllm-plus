@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
@@ -26,10 +27,13 @@ def test_shared_nvfp4_input_scales_have_writable_storage(monkeypatch):
             moe_parallel_config=SimpleNamespace(enable_eplb=False)
         ),
     )
-    w13 = torch.zeros((num_experts, 2, 1), dtype=torch.uint8)
-    w2 = torch.zeros((num_experts, 2, 1), dtype=torch.uint8)
-    w13_scale = torch.zeros((num_experts, 2, 1), dtype=torch.float8_e4m3fn)
-    w2_scale = torch.zeros((num_experts, 2, 1), dtype=torch.float8_e4m3fn)
+    hidden_dim = 32
+    w13 = torch.zeros((num_experts, 2, hidden_dim // 2), dtype=torch.uint8)
+    w2 = torch.zeros((num_experts, hidden_dim, 1), dtype=torch.uint8)
+    w13_scale = torch.zeros(
+        (num_experts, 2, hidden_dim // 16), dtype=torch.float8_e4m3fn
+    )
+    w2_scale = torch.zeros((num_experts, hidden_dim, 1), dtype=torch.float8_e4m3fn)
     weight_scale = torch.ones(num_experts)
 
     outputs = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
@@ -158,3 +162,81 @@ def test_align_trtllm_fp4_moe_intermediate_pads_gate_and_up_separately():
     torch.testing.assert_close(out_w2_scale[:, :, : intermediate // 16], w2_scale)
     assert torch.count_nonzero(out_w2[:, :, intermediate // 2 :]) == 0
     assert torch.count_nonzero(out_w2_scale[:, :, intermediate // 16 :]) == 0
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize(
+    "backend",
+    [NvFp4MoeBackend.FLASHINFER_CUTLASS, NvFp4MoeBackend.VLLM_CUTLASS],
+)
+def test_cutlass_padding_preserves_each_projection_and_scale(
+    monkeypatch, tp, gated, backend
+):
+    """Qwen TP shards retain both projections when scale rows need padding."""
+
+    def swizzle_pad_rows(scale):
+        assert scale.size(1) % 128 == 0
+        return scale
+
+    monkeypatch.setattr(flashinfer_fp4_moe, "swizzle_blockscale", swizzle_pad_rows)
+    intermediate = 640 // tp
+    alignment = 64 if gated else 128
+    padded = (intermediate + alignment - 1) // alignment * alignment
+    hidden_dim = 128
+    multiplier = 2 if gated else 1
+    w13 = torch.ones((1, multiplier * intermediate, hidden_dim // 2), dtype=torch.uint8)
+    w13_scale = torch.full(
+        (1, multiplier * intermediate, hidden_dim // 16), 3, dtype=torch.uint8
+    )
+    if gated:
+        w13[:, intermediate:] = 2
+        w13_scale[:, intermediate:] = 4
+    w2 = torch.full((1, hidden_dim, intermediate // 2), 5, dtype=torch.uint8)
+    w2_scale = torch.full((1, hidden_dim, intermediate // 16), 6, dtype=torch.uint8)
+    layer = SimpleNamespace(
+        activation=SimpleNamespace(is_gated=gated),
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=False),
+            intermediate_size_per_partition=intermediate,
+        ),
+    )
+    weight_scale = torch.ones(1)
+    original13, original_scale13 = w13.clone(), w13_scale.clone()
+    outputs = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+        backend,
+        layer,
+        w13,
+        w13_scale,
+        weight_scale,
+        torch.ones(1, 2),
+        w2,
+        w2_scale,
+        weight_scale,
+        weight_scale,
+        gated,
+    )
+    out13, scale13, _, _, out2, scale2, _, _ = outputs
+    assert layer.moe_config.intermediate_size_per_partition == padded
+    assert out13.shape == (1, multiplier * padded, hidden_dim // 2)
+    reordered = gated and backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+    for projection in range(multiplier):
+        source = (1 - projection) if reordered else projection
+        destination = slice(projection * padded, projection * padded + intermediate)
+        original = slice(source * intermediate, (source + 1) * intermediate)
+        torch.testing.assert_close(out13[:, destination], original13[:, original])
+        torch.testing.assert_close(
+            scale13[:, destination], original_scale13[:, original]
+        )
+        tail = slice(projection * padded + intermediate, (projection + 1) * padded)
+        assert torch.count_nonzero(out13[:, tail]) == 0
+        assert torch.count_nonzero(scale13[:, tail]) == 0
+    torch.testing.assert_close(out2[:, :, : intermediate // 2], w2)
+    torch.testing.assert_close(scale2[:, :, : intermediate // 16], w2_scale)
+    assert torch.count_nonzero(out2[:, :, intermediate // 2 :]) == 0
+    assert torch.count_nonzero(scale2[:, :, intermediate // 16 :]) == 0
+    torch.testing.assert_close(outputs[2], weight_scale)
+    torch.testing.assert_close(outputs[6], weight_scale)
+    if padded == intermediate:
+        assert out2 is w2
+        assert scale2 is w2_scale

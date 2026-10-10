@@ -28,6 +28,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "output_s, int group_size, float eps, float int8_min, float int8_max) -> "
       "()");
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+#if defined(__linux__) && !defined(USE_ROCM)
+  ops.def(
+      "allocate_registered_cpu_tensor(int[] shape, ScalarType dtype, "
+      "int chunk_bytes) -> Tensor");
+#endif
 
 #ifndef USE_ROCM
 
@@ -923,6 +928,10 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
 // available for all backends. This is the stable ABI equivalent of calling
 // ops.impl("op_name", &func) without a dispatch key in the non-stable API.
 STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
+#if defined(__linux__) && !defined(USE_ROCM)
+  ops.impl("allocate_registered_cpu_tensor",
+           TORCH_BOX(&allocate_registered_cpu_tensor));
+#endif
 #ifndef USE_ROCM
   ops.impl("cutlass_scaled_mm_supports_fp8",
            TORCH_BOX(&cutlass_scaled_mm_supports_fp8));

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
+from tests.utils import create_new_process_for_each_test
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -659,12 +661,24 @@ def test_ple_device_embedding_allocates_on_active_device(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("fp8_checkpoint", [False, True])
+@pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("lookup_rows", [[[3, 0], [1, 2]], [[1, 2], [3, 0], [1, 2]]])
 def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
     monkeypatch: pytest.MonkeyPatch,
     fp8_checkpoint: bool,
+    chunked: bool,
     lookup_rows: list[list[int]],
 ) -> None:
+    if chunked:
+        if (
+            ngram_embedding_module.sys.platform != "linux"
+            or not ngram_embedding_module.current_platform.is_cuda()
+        ):
+            pytest.skip("chunked PLE requires Linux/CUDA")
+        monkeypatch.setattr(
+            ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096
+        )
+    rows = 4096 if chunked else 4
     _mock_etp_group(monkeypatch)
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -682,7 +696,7 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
             else Qwen4ExpPLEUnquantizedEmbeddingMethod()
         )
         embedding = Qwen4ExpPLEPinnedHostEmbedding(
-            4,
+            rows,
             3,
             params_dtype=torch.bfloat16,
             padding_size=1,
@@ -692,14 +706,16 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
 
     storage_dtype = torch.float8_e4m3fn if fp8_checkpoint else torch.bfloat16
     loaded_weight = (
-        torch.arange(12, dtype=torch.float32).reshape(4, 3).to(storage_dtype)
+        (torch.arange(rows * 3, dtype=torch.float32) % 12)
+        .reshape(rows, 3)
+        .to(storage_dtype)
     )
     copied = copy_ple_embedding_shard_(
         embedding.weight,
         loaded_weight,
         checkpoint_start=0,
         tp_start=0,
-        tp_end=4,
+        tp_end=rows,
     )
     input_ids = torch.tensor(lookup_rows, device="cuda:0")
     output = embedding._lookup(input_ids)
@@ -710,7 +726,7 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
     assert embedding.weight.data_ptr() == weight_ptr
     dequantized = embedding.dequantize(output, torch.bfloat16)
 
-    assert copied == 4
+    assert copied == rows
     assert embedding.weight.device.type == "cpu"
     assert embedding.weight.is_pinned()
     assert output.dtype == storage_dtype
@@ -723,6 +739,165 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_large_cuda_ple_uses_registered_storage_without_dtype_conversion(
+    monkeypatch, dtype
+):
+    monkeypatch.setattr(
+        ngram_embedding_module, "sys", SimpleNamespace(platform="linux")
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    monkeypatch.setattr(ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096)
+    storage = torch.empty((4096, 2), dtype=dtype)
+    allocate = Mock(return_value=storage)
+    monkeypatch.setattr(
+        torch.ops._C, "allocate_registered_cpu_tensor", allocate, raising=False
+    )
+    result = Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight(
+        None, 4096, 2, dtype
+    )
+    assert result is storage
+    allocate.assert_called_once_with([4096, 2], dtype, 4096)
+
+
+def test_large_cuda_ple_propagates_registration_failure(monkeypatch):
+    monkeypatch.setattr(
+        ngram_embedding_module, "sys", SimpleNamespace(platform="linux")
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    monkeypatch.setattr(ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096)
+    allocate = Mock(side_effect=RuntimeError("cudaHostRegister failed at byte 4096"))
+    monkeypatch.setattr(
+        torch.ops._C, "allocate_registered_cpu_tensor", allocate, raising=False
+    )
+    with pytest.raises(RuntimeError, match="cudaHostRegister failed"):
+        Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight(
+            None, 4096, 2, torch.bfloat16
+        )
+
+
+def test_large_cuda_ple_requires_rebuilt_extension(monkeypatch):
+    monkeypatch.setattr(
+        ngram_embedding_module, "sys", SimpleNamespace(platform="linux")
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: True),
+    )
+    monkeypatch.setattr(ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+    with pytest.raises(RuntimeError, match="requires rebuilding"):
+        Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight(
+            None, 4096, 2, torch.bfloat16
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires Linux/CUDA sleep allocator"
+)
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize("fp8_checkpoint", [False, True])
+@create_new_process_for_each_test("spawn")
+def test_chunk_registered_ple_survives_sleep_wake_and_checkpoint_reload(
+    level, fp8_checkpoint
+):
+    if (
+        ngram_embedding_module.sys.platform != "linux"
+        or not ngram_embedding_module.current_platform.is_cuda()
+    ):
+        pytest.skip("chunked PLE requires Linux/CUDA")
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    allocator = CuMemAllocator.get_instance()
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _mock_etp_group(monkeypatch)
+        monkeypatch.setattr(
+            embedding_module, "get_tensor_model_parallel_rank", lambda: 0
+        )
+        monkeypatch.setattr(
+            embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+        )
+        monkeypatch.setattr(
+            parameter_module, "get_tensor_model_parallel_rank", lambda: 0
+        )
+        monkeypatch.setattr(
+            ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096
+        )
+        method = (
+            Qwen4ExpPLEFp8EmbeddingMethod()
+            if fp8_checkpoint
+            else Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        )
+        with torch.device("cuda:0"), allocator.use_memory_pool(tag="weights"):
+            embedding = Qwen4ExpPLEPinnedHostEmbedding(
+                4096,
+                3,
+                params_dtype=torch.bfloat16,
+                padding_size=1,
+                prefix="test.ple_embedding",
+                embedding_method=method,
+            )
+        pointer = embedding.weight.data_ptr()
+        values = (torch.arange(12288) % 7).reshape(4096, 3).to(embedding.weight.dtype)
+        embedding.weight.data.copy_(values)
+        allocator.sleep(offload_tags=("weights",) if level == 1 else ())
+        allocator.wake_up()
+        # Level 2 requires loading checkpoint weights/scales after waking.
+        embedding.weight_loader(embedding.weight, values)
+        if fp8_checkpoint:
+            embedding.weight_scale.data.fill_(0.25)
+        embedding.quant_method.process_weights_after_loading(embedding)
+        assert embedding.weight.data_ptr() == pointer
+        assert embedding.weight.is_pinned()
+        ids = torch.tensor([[0, 1365, 2731, 4095]], device="cuda:0")
+        output = embedding.dequantize(embedding._lookup(ids), torch.bfloat16)
+        expected = values[ids.cpu()].to(device="cuda:0", dtype=torch.bfloat16)
+        torch.testing.assert_close(
+            output, expected * (0.25 if fp8_checkpoint else 1), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    "platform,cuda,rows",
+    [("linux", True, 4), ("linux", False, 4096), ("win32", True, 4096)],
+)
+def test_small_or_non_cuda_ple_keeps_platform_pinned_allocator(
+    monkeypatch, platform, cuda, rows
+):
+    monkeypatch.setattr(
+        ngram_embedding_module, "sys", SimpleNamespace(platform=platform)
+    )
+    monkeypatch.setattr(
+        ngram_embedding_module,
+        "current_platform",
+        SimpleNamespace(is_cuda=lambda: cuda),
+    )
+    monkeypatch.setattr(ngram_embedding_module, "_PLE_HOST_REGISTER_CHUNK_BYTES", 4096)
+    original_empty = torch.empty
+    calls = []
+
+    def empty(*args, **kwargs):
+        if kwargs.pop("pin_memory", False):
+            calls.append((args, kwargs))
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    result = Qwen4ExpPLEPinnedHostEmbedding.allocate_embedding_weight(
+        None, rows, 2, torch.bfloat16
+    )
+    assert result.shape == (rows, 2)
+    assert calls == [((rows, 2), {"dtype": torch.bfloat16, "device": "cpu"})]
 
 
 def test_ple_fp8_embedding_supports_mixed_precision_config() -> None:

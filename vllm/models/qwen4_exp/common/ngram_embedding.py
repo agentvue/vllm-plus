@@ -7,6 +7,7 @@ n-gram embedding table can be kept in pinned host memory and looked up through
 Unified Virtual Addressing on any CUDA-alike platform.
 """
 
+import sys
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
@@ -38,6 +39,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -45,6 +47,7 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ple import PLEVocabParallelEmbedding
 
 logger = init_logger(__name__)
+_PLE_HOST_REGISTER_CHUNK_BYTES = 512 * 1024**2
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -431,7 +434,22 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         embedding_dim: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Allocate the complete PLE weight directly in pinned CPU memory."""
+        """Allocate storage-owned, chunk-registered memory for large CUDA tables."""
+        element_size = torch.empty(0, dtype=dtype, device="cpu").element_size()
+        nbytes = num_embeddings * embedding_dim * element_size
+        if (
+            sys.platform == "linux"
+            and current_platform.is_cuda()
+            and nbytes >= _PLE_HOST_REGISTER_CHUNK_BYTES
+        ):
+            if not hasattr(torch.ops._C, "allocate_registered_cpu_tensor"):
+                raise RuntimeError(
+                    "Large PLE CPU offload requires rebuilding the vLLM CUDA "
+                    "extension with allocate_registered_cpu_tensor"
+                )
+            return torch.ops._C.allocate_registered_cpu_tensor(
+                [num_embeddings, embedding_dim], dtype, _PLE_HOST_REGISTER_CHUNK_BYTES
+            )
         return torch.empty(
             num_embeddings,
             embedding_dim,

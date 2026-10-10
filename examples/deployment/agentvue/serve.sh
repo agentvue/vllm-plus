@@ -28,6 +28,10 @@ if (( depth > 0 )); then
 fi
 eager=()
 if [[ ${EAGER:-0} == 1 ]]; then eager=(--enforce-eager); fi
+backend=()
+if [[ ${MOE_BACKEND:-auto} != auto ]]; then
+  backend=(--moe-backend "$MOE_BACKEND")
+fi
 
 exec .venv/bin/vllm serve "$model" \
   --revision "$CHECKPOINT_REVISION" --code-revision "$CHECKPOINT_REVISION" \
@@ -39,4 +43,4 @@ exec .venv/bin/vllm serve "$model" \
   --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-2048}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.85}" \
   --enable-prefix-caching --host "${SERVER_HOST:-127.0.0.1}" --port "${PORT:-8000}" \
-  "${offload[@]}" "${mtp[@]}" "${eager[@]}"
+  "${offload[@]}" "${mtp[@]}" "${eager[@]}" "${backend[@]}"
