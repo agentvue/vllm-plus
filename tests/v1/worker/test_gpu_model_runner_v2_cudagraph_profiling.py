@@ -14,6 +14,7 @@ import contextlib
 import gc
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,11 +22,66 @@ import torch
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
+
+
+@pytest.mark.parametrize("requires_tokens", [False, True])
+def test_pipeline_capture_preserves_required_raw_tokens(monkeypatch, requires_tokens):
+    """Capture must bind PLE to the token buffer that replay updates."""
+    tokens = torch.tensor([20, 21, 22])
+    hidden = torch.ones(3, 8)
+    inputs = SimpleNamespace(
+        input_ids=tokens,
+        positions=torch.arange(3),
+        is_padding=torch.zeros(3, dtype=torch.bool),
+    )
+    state = SimpleNamespace(
+        model_config=SimpleNamespace(requires_raw_input_tokens=requires_tokens),
+        prepare_dummy_inputs=lambda *a: {},
+    )
+    manager = cgu.ModelCudaGraphManager.__new__(cgu.ModelCudaGraphManager)
+    manager.use_breakable_cg = False
+    manager.cudagraph_mode = CUDAGraphMode.FULL
+    manager.max_num_reqs = 8
+    manager.dp_size = 1
+    manager.is_first_pp_rank = False
+    manager.is_last_pp_rank = True
+    manager.vllm_config = SimpleNamespace()
+    manager.hidden_states = None
+    model = Mock(return_value=hidden)
+    desc = cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, 3, 2)
+
+    def capture(_manager, create_forward, _description):
+        create_forward(desc, False)(CUDAGraphMode.FULL)
+
+    monkeypatch.setattr(cgu.CudaGraphManager, "capture", capture)
+    monkeypatch.setattr(cgu, "prepare_inputs_to_capture", lambda *a, **k: (None, {}))
+    monkeypatch.setattr(
+        cgu, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+    manager.capture(
+        model,
+        state,
+        inputs,
+        IntermediateTensors({"hidden_states": hidden}),
+        Mock(),
+        [],
+        Mock(),
+    )
+    kwargs = model.call_args.kwargs
+    assert kwargs["inputs_embeds"] is None
+    if requires_tokens:
+        assert kwargs["input_ids"].data_ptr() == tokens.data_ptr()
+        tokens[0] = 42
+        assert kwargs["input_ids"][0] == 42
+    else:
+        assert kwargs["input_ids"] is None
+    torch.testing.assert_close(kwargs["intermediate_tensors"]["hidden_states"], hidden)
 
 
 class _FakeCudaGraphManager:

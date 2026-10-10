@@ -3,12 +3,15 @@
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -19,6 +22,101 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+@pytest.mark.parametrize("requires_tokens", [False, True])
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("dummy_run", [False, True])
+def test_pipeline_forward_preserves_required_raw_tokens(
+    monkeypatch, requires_tokens, mode, dummy_run
+):
+    """PLE must see current tokens even when its layer is on a later stage."""
+    tokens = torch.tensor([20, 21, 22])
+    hidden = torch.arange(24).reshape(3, 8)
+    query_starts = torch.tensor([0, 2, 3])
+    context = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    inputs = SimpleNamespace(
+        input_ids=tokens,
+        positions=torch.arange(3),
+        num_tokens=3,
+        num_tokens_after_padding=3,
+        idx_mapping=torch.tensor([1, 0]),
+        req_ids=["second", "first"],
+        is_padding=torch.zeros(3, dtype=torch.bool),
+    )
+    desc = SimpleNamespace(
+        num_tokens=3,
+        num_reqs=2,
+        cg_mode=mode,
+        num_ubatches=1,
+        max_query_len=None,
+        num_active_loras=0,
+    )
+    runner = Mock()
+    runner.gather_batch_req_state.return_value = (
+        SimpleNamespace(num_tokens=3, has_prefill=True),
+        1,
+    )
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.ubatch_runner = None
+    runner.pcp_manager = None
+    runner.dcp_size = 1
+    runner.uses_inputs_embeds = False
+    runner.is_first_pp_rank = False
+    runner.aux_output_connector = None
+    runner.observability_config.cudagraph_metrics = False
+    runner.block_tables.block_tables = []
+    runner.attn_groups = []
+    runner.prepare_inputs.return_value = inputs
+    runner.prepare_attn.return_value = ({}, {})
+    runner.input_buffers = inputs
+    runner.intermediate_tensors = IntermediateTensors({"hidden_states": hidden.clone()})
+    runner.model_state.prepare_inputs.return_value = {
+        "query_start_loc": query_starts,
+        "ngram_context": context,
+    }
+    runner.model = Mock(
+        requires_raw_input_tokens=requires_tokens,
+        side_effect=RuntimeError("model forward reached"),
+    )
+    runner.cudagraph_manager.run_pw_graph.side_effect = lambda model, kwargs: model(
+        **kwargs
+    )
+    monkeypatch.setattr(
+        model_runner_module, "dispatch_cg_and_sync_dp", lambda *a, **k: (desc, None)
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "InputBatch",
+        SimpleNamespace(make_dummy=lambda *a, **k: inputs),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "set_forward_context",
+        lambda *a, **k: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        model_runner_module, "build_slot_mappings_by_layer", lambda *a: {}
+    )
+    scheduler = SimpleNamespace(
+        num_scheduled_tokens={"second": 2, "first": 1}, total_num_scheduled_tokens=3
+    )
+    with pytest.raises(RuntimeError, match="model forward reached"):
+        GPUModelRunner.execute_model(
+            runner,
+            scheduler,
+            IntermediateTensors({"hidden_states": hidden}),
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=dummy_run,
+        )
+
+    kwargs = runner.model.call_args.kwargs
+    assert kwargs["input_ids"] is (tokens if requires_tokens else None)
+    assert kwargs["inputs_embeds"] is None
+    assert kwargs["query_start_loc"] is query_starts
+    assert kwargs["ngram_context"] is context
+    torch.testing.assert_close(kwargs["intermediate_tensors"]["hidden_states"], hidden)
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

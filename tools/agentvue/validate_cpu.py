@@ -121,6 +121,7 @@ def build_tests():
     interfaces = load(
         "vllm.model_executor.models.interfaces",
         "vllm/model_executor/models/interfaces.py",
+        functions=("requires_raw_input_tokens",),
         classes={"EagleModelMixin": (None, None)},
     )
     ray_utils = load(
@@ -216,6 +217,36 @@ def build_tests():
         get_pp_group=None,
         **common,
     )
+    qwen_config = load(
+        "vllm.model_executor.models.config",
+        "vllm/model_executor/models/config.py",
+        classes={
+            "Qwen3_5ForConditionalGenerationConfig": (
+                [],
+                ("verify_and_update_config",),
+            ),
+            "Qwen4ExpForConditionalGenerationConfig": (
+                [],
+                ("verify_and_update_config",),
+            ),
+        },
+        **common,
+    )
+    hybrid = module("vllm.v1.worker.gpu.model_states.mamba_hybrid")
+    hybrid.MambaHybridModelState = type(
+        "MambaHybridModelState",
+        (),
+        {"prepare_inputs": Mock(), "prepare_dummy_inputs": Mock()},
+    )
+    qwen_states = {}
+    for backend in ("amd", "nvidia"):
+        qwen_states[backend] = load(
+            f"vllm.models.qwen4_exp.{backend}.model_state",
+            f"vllm/models/qwen4_exp/{backend}/model_state.py",
+            classes={"Qwen4ExpModelState": (["MambaHybridModelState"], None)},
+            MambaHybridModelState=hybrid.MambaHybridModelState,
+            **common,
+        )
     compilation = load(
         "vllm.config",
         "vllm/config/compilation.py",
@@ -226,12 +257,27 @@ def build_tests():
         "vllm/v1/worker/gpu/cudagraph_utils.py",
         classes={
             "CudaGraphManager": ([], ("capture",)),
+            "ModelCudaGraphManager": (["CudaGraphManager"], ("capture",)),
             "BatchExecutionDescriptor": (None, None),
         },
         CUDAGraphMode=compilation.CUDAGraphMode,
         dataclass=dataclasses.dataclass,
         graph_capture=None,
         is_global_first_rank=None,
+        prepare_inputs_to_capture=None,
+        set_forward_context=None,
+        **common,
+    )
+    runner = load(
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm/v1/worker/gpu/model_runner.py",
+        classes={"GPUModelRunner": ([], ("execute_model",))},
+        CUDAGraphMode=compilation.CUDAGraphMode,
+        requires_raw_input_tokens=interfaces.requires_raw_input_tokens,
+        dispatch_cg_and_sync_dp=None,
+        InputBatch=None,
+        build_slot_mappings_by_layer=None,
+        set_forward_context=None,
         **common,
     )
     descriptor = load(
@@ -240,6 +286,7 @@ def build_tests():
         classes={"BatchDescriptor": (None, None)},
         dataclass=dataclasses.dataclass,
     )
+    runner.BatchDescriptor = descriptor.BatchDescriptor
     bcg = load(
         "vllm.compilation.breakable_cudagraph",
         "vllm/compilation/breakable_cudagraph.py",
@@ -515,8 +562,46 @@ def build_tests():
         ),
         (
             "tests/models/qwen4_exp/test_config.py",
-            ("test_qwen4_exp_mtp_returns_sample", "test_local_mtp_on_last"),
-            {},
+            (
+                "test_qwen4_exp_mtp_returns_sample",
+                "test_local_mtp_on_last",
+                "test_qwen4_exp_accepts_pipeline",
+                "test_qwen4_exp_pipeline_state",
+                "test_qwen4_exp_model_state_prepares",
+            ),
+            {
+                "_text_config": lambda **kwargs: SimpleNamespace(hc_count=2, **kwargs),
+                "Qwen3_5ForConditionalGenerationConfig": (
+                    qwen_config.Qwen3_5ForConditionalGenerationConfig
+                ),
+                "Qwen4ExpForConditionalGenerationConfig": (
+                    qwen_config.Qwen4ExpForConditionalGenerationConfig
+                ),
+                "MambaHybridModelState": hybrid.MambaHybridModelState,
+                "Qwen4ExpModelState": qwen_states["nvidia"].Qwen4ExpModelState,
+                "import_module": importlib.import_module,
+            },
+        ),
+        (
+            "tests/v1/worker/test_gpu_model_runner_v2.py",
+            ("test_pipeline_forward_preserves",),
+            {
+                "model_runner_module": runner,
+                "GPUModelRunner": runner.GPUModelRunner,
+                "CUDAGraphMode": compilation.CUDAGraphMode,
+                "IntermediateTensors": sequence.IntermediateTensors,
+                "contextlib": SimpleNamespace(nullcontext=nullcontext),
+            },
+        ),
+        (
+            "tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py",
+            ("test_pipeline_capture_preserves",),
+            {
+                "cgu": graph,
+                "CUDAGraphMode": compilation.CUDAGraphMode,
+                "IntermediateTensors": sequence.IntermediateTensors,
+                "contextlib": SimpleNamespace(nullcontext=nullcontext),
+            },
         ),
         (
             "tests/v1/core/test_kv_cache_utils.py",

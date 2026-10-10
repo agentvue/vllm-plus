@@ -142,30 +142,45 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
 
 
 @pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
+@pytest.mark.parametrize("pp_size", [1, 2, 8])
+def test_qwen4_exp_accepts_pipeline_parallel_with_ple(ple_layer_ids, pp_size):
+    """PLE uses the synchronized raw tokens available on every PP rank."""
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
             multimodal_config=None,
         ),
         parallel_config=SimpleNamespace(
-            pipeline_parallel_size=2, enable_dbo=False, ubatch_size=1
+            pipeline_parallel_size=pp_size, enable_dbo=False, ubatch_size=1
         ),
         speculative_config=None,
     )
     with patch.object(
         Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
-            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("backend", ["amd", "nvidia"])
+def test_qwen4_exp_pipeline_state_allocates_ngram_buffers(backend):
+    state_module = import_module(f"vllm.models.qwen4_exp.{backend}.model_state")
+    config = SimpleNamespace(ple_layer_ids=[1], ngram_size=4, eos_token_id=99)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=8)
+    )
+
+    def initialize(state, *_args):
+        state.model_config = SimpleNamespace(hf_text_config=config)
+        state.max_num_reqs = 8
+        state.device = torch.device("cpu")
+
+    with patch.object(MambaHybridModelState, "__init__", initialize):
+        state = state_module.Qwen4ExpModelState(
+            vllm_config, torch.nn.Identity(), None, torch.device("cpu")
+        )
+    assert state.ngram_context.shape == (8, 3)
+    assert state.ple_query_start_loc.shape == (9,)
+    assert torch.all(state.ngram_context == 99)
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
