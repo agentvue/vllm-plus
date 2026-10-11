@@ -2403,6 +2403,12 @@ class EngineCoreActorMixin:
 
     def _set_visible_devices(self, vllm_config: VllmConfig, local_dp_rank: int):
         from vllm.platforms import current_platform
+        from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+        if issubclass(Executor.get_class(vllm_config), RayExecutorV2):
+            # This actor is CPU-only; remote workers discover their GPUs via Ray.
+            vllm_config.parallel_config.assigned_physical_gpu_ids = None
+            return
 
         if current_platform.is_xpu():
             pass

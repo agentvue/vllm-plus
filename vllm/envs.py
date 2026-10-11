@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_RAY_ORDERED_NODE_IPS: str = ""
+    VLLM_RAY_DP_ORDERED_NODE_IPS_JSON: str = ""
     VLLM_RAY_NODE_ENV_VARS_JSON: str = ""
     VLLM_RAY_WORKER_START_TIMEOUT_S: int = 120
     VLLM_RAY_WORKER_INIT_TIMEOUT_S: int = 900
@@ -1434,14 +1435,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAY_BUNDLE_INDICES": lambda: os.getenv("VLLM_RAY_BUNDLE_INDICES", ""),
     # Ordered Ray node IPs for Ray worker placement. The list must have one
     # entry per worker rank.
-    "VLLM_RAY_ORDERED_NODE_IPS": lambda: os.getenv(
-        "VLLM_RAY_ORDERED_NODE_IPS", ""
+    "VLLM_RAY_ORDERED_NODE_IPS": lambda: os.getenv("VLLM_RAY_ORDERED_NODE_IPS", ""),
+    # JSON mapping from DP rank to an ordered list of worker node IPs.
+    "VLLM_RAY_DP_ORDERED_NODE_IPS_JSON": lambda: os.getenv(
+        "VLLM_RAY_DP_ORDERED_NODE_IPS_JSON", ""
     ),
     # JSON mapping from Ray node IP to environment variables applied to actors
     # on that node before worker initialization.
-    "VLLM_RAY_NODE_ENV_VARS_JSON": lambda: os.getenv(
-        "VLLM_RAY_NODE_ENV_VARS_JSON", ""
-    ),
+    "VLLM_RAY_NODE_ENV_VARS_JSON": lambda: os.getenv("VLLM_RAY_NODE_ENV_VARS_JSON", ""),
     # Timeout for Ray actors to start and report their assigned accelerators.
     "VLLM_RAY_WORKER_START_TIMEOUT_S": lambda: int(
         os.getenv("VLLM_RAY_WORKER_START_TIMEOUT_S", "120")

@@ -398,6 +398,34 @@ def parse_ray_ordered_node_ips(value: str) -> list[str]:
     return [ip.strip() for ip in value.split(",") if ip.strip()]
 
 
+def parse_ray_dp_ordered_node_ips_json(
+    value: str, dp_size: int, world_size: int
+) -> list[list[str]]:
+    """Parse explicit worker placement for every data parallel rank."""
+    if not value.strip():
+        return []
+    name = "VLLM_RAY_DP_ORDERED_NODE_IPS_JSON"
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{name} must be valid JSON.") from e
+    if not isinstance(raw, dict) or set(raw) != {str(i) for i in range(dp_size)}:
+        raise ValueError(f"{name} must map every DP rank 0..{dp_size - 1}.")
+    placements = []
+    for rank in range(dp_size):
+        ips = raw[str(rank)]
+        if (
+            not isinstance(ips, list)
+            or len(ips) != world_size
+            or any(not isinstance(ip, str) or not ip.strip() for ip in ips)
+        ):
+            raise ValueError(
+                f"{name} rank {rank} must contain {world_size} non-empty node IPs."
+            )
+        placements.append([ip.strip() for ip in ips])
+    return placements
+
+
 def parse_ray_node_env_vars_json(value: str) -> dict[str, dict[str, str]]:
     """Parse a mapping from Ray node IPs to worker environment variables."""
     if not value.strip():
@@ -406,9 +434,7 @@ def parse_ray_node_env_vars_json(value: str) -> dict[str, dict[str, str]]:
     try:
         raw = json.loads(value)
     except json.JSONDecodeError as e:
-        raise ValueError(
-            "VLLM_RAY_NODE_ENV_VARS_JSON must be valid JSON."
-        ) from e
+        raise ValueError("VLLM_RAY_NODE_ENV_VARS_JSON must be valid JSON.") from e
 
     if not isinstance(raw, dict):
         raise ValueError("VLLM_RAY_NODE_ENV_VARS_JSON must be a JSON object.")
@@ -800,9 +826,7 @@ def initialize_ray_cluster(
             {device_str: 1.0} for _ in range(parallel_config.world_size)
         ]
 
-        ordered_node_ips = parse_ray_ordered_node_ips(
-            envs.VLLM_RAY_ORDERED_NODE_IPS
-        )
+        ordered_node_ips = parse_ray_ordered_node_ips(envs.VLLM_RAY_ORDERED_NODE_IPS)
         if ordered_node_ips:
             _validate_ray_ordered_node_ips(
                 ordered_node_ips, parallel_config.world_size, device_str

@@ -72,6 +72,28 @@ There are several notable differences when using Ray:
 - When a single DP group requires multiple nodes, *e.g.* in case a single model replica needs to run on at least two nodes, make sure to set `VLLM_RAY_DP_PACK_STRATEGY="span"` in which case `--data-parallel-size-local` is ignored and will be automatically determined
 - Remote DP ranks will be allocated based on node resources of the Ray cluster
 
+For explicit placement on heterogeneous nodes, use `RayExecutorV2`
+(`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`) and set
+`VLLM_RAY_DP_ORDERED_NODE_IPS_JSON` to a JSON object mapping every DP rank
+(`"0"`, `"1"`, ...) to an ordered array of worker node IPs. Each array must have
+`TP × PP × PCP` entries. Consecutive entries define the worker ranks within that
+engine; repeat an IP to allocate multiple GPUs on that node.
+
+The first IP also hosts that engine's CPU control actor. Put engines controlled
+on the DP master node first and set `--data-parallel-size-local` to their count.
+Explicit placement takes precedence over automatic packing, including `span`'s
+homogeneous-node requirement. GPU demand is checked across all DP ranks before
+reservation. Do not also set `VLLM_RAY_ORDERED_NODE_IPS` or
+`VLLM_RAY_BUNDLE_INDICES`; those settings cannot describe multiple engines.
+
+`VLLM_RAY_NODE_ENV_VARS_JSON` supplies node-specific environment variables to
+both control actors and GPU workers. Use it for `GLOO_SOCKET_IFNAME`,
+`NCCL_SOCKET_IFNAME`, `VLLM_HOST_IP`, and node-local NCCL library paths. When
+provided, include every worker node in the mapping. Existing Ray node GPU
+visibility determines eligible physical devices; the IP mapping selects nodes,
+not physical GPU IDs. Explicit placement currently supports fixed DP sizes,
+not elastic EP.
+
 Currently, the internal DP load balancing is done within the API server process(es) and is based on the running and waiting queues in each of the engines. This could be made more sophisticated in future by incorporating KV cache aware logic.
 
 When deploying large DP sizes using this method, the API server process can become a bottleneck. In this case, the orthogonal `--api-server-count` command line option can be used to scale this out (for example `--api-server-count=4`). This is transparent to users - a single HTTP endpoint / port is still exposed. Note that this API server scale-out is "internal" and still confined to the "head" node.

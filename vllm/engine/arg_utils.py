@@ -2519,6 +2519,13 @@ class EngineArgs:
 
     def _check_feature_supported(self):
         """Raise an error if the feature is not supported."""
+        if (
+            envs.VLLM_RAY_DP_ORDERED_NODE_IPS_JSON
+            and self.data_parallel_backend != "ray"
+        ):
+            raise ValueError(
+                "VLLM_RAY_DP_ORDERED_NODE_IPS_JSON requires data-parallel-backend=ray."
+            )
         if self.pipeline_parallel_size > 1:
             supports_pp = getattr(
                 self.distributed_executor_backend, "supports_pp", False

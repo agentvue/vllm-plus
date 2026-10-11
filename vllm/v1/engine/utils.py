@@ -5,6 +5,7 @@ import contextlib
 import os
 import threading
 import weakref
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -31,7 +32,11 @@ from vllm.utils.network_utils import (
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
-from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+from vllm.v1.executor.ray_utils import (
+    WORKER_SPECIFIC_ENV_VARS,
+    parse_ray_dp_ordered_node_ips_json,
+    parse_ray_node_env_vars_json,
+)
 from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdown
 
 if TYPE_CHECKING:
@@ -364,6 +369,117 @@ def _apply_dp_identity_suffix(dp_vllm_config, dp_rank: int) -> None:
         )
 
 
+def _get_dp_ordered_node_ips(vllm_config: VllmConfig) -> list[list[str]]:
+    parallel = vllm_config.parallel_config
+    placements = parse_ray_dp_ordered_node_ips_json(
+        envs.VLLM_RAY_DP_ORDERED_NODE_IPS_JSON,
+        parallel.data_parallel_size,
+        parallel.world_size,
+    )
+    if not placements:
+        return []
+    if parallel.data_parallel_backend != "ray":
+        raise ValueError(
+            "Explicit Ray DP placement requires data-parallel-backend=ray."
+        )
+    if parallel.enable_elastic_ep:
+        raise ValueError("Explicit Ray DP placement does not support elastic EP.")
+    if envs.VLLM_RAY_ORDERED_NODE_IPS or envs.VLLM_RAY_BUNDLE_INDICES:
+        raise ValueError(
+            "VLLM_RAY_DP_ORDERED_NODE_IPS_JSON cannot be combined with "
+            "VLLM_RAY_ORDERED_NODE_IPS or VLLM_RAY_BUNDLE_INDICES."
+        )
+    local_count = sum(ips[0] == parallel.data_parallel_master_ip for ips in placements)
+    if local_count != parallel.data_parallel_size_local or any(
+        (rank < local_count) != (ips[0] == parallel.data_parallel_master_ip)
+        for rank, ips in enumerate(placements)
+    ):
+        raise ValueError(
+            "Explicit Ray DP placement must put local control actors first; "
+            f"set --data-parallel-size-local {local_count} to match the mapping."
+        )
+    return placements
+
+
+def _create_pinned_dp_placement_groups(
+    placements: list[list[str]],
+    available_resources: dict,
+    device_str: str,
+) -> tuple[list["PlacementGroup"], list[int]]:
+    import ray
+
+    resources_by_ip = {
+        _node_ip_from_resources(resources): resources
+        for resources in available_resources.values()
+    }
+    requested = Counter(ip for ips in placements for ip in ips)
+    controls = Counter(ips[0] for ips in placements)
+    allowed = {
+        ip.strip()
+        for ip in envs.VLLM_RAY_DP_PLACEMENT_NODE_IPS.split(",")
+        if ip.strip()
+    }
+    for ip, count in requested.items():
+        if allowed and ip not in allowed:
+            raise ValueError(
+                f"Explicit DP placement node {ip} is outside the allowlist."
+            )
+        resources = resources_by_ip.get(ip)
+        if resources is None:
+            raise ValueError(f"Explicit DP placement node {ip} is unavailable.")
+        if resources.get(device_str, 0) < count:
+            raise ValueError(
+                f"Explicit DP placement requests {count} {device_str}s on {ip}, "
+                f"but only {resources.get(device_str, 0)} are available."
+            )
+        if resources.get("CPU", 0) < controls[ip]:
+            raise ValueError(
+                f"Explicit DP placement needs {controls[ip]} control CPUs on {ip}."
+            )
+
+    groups = []
+    local_ranks = []
+    next_local_rank: Counter[str] = Counter()
+    try:
+        for rank, ips in enumerate(placements):
+            bundles = [{device_str: 1.0, f"node:{ip}": 0.001} for ip in ips]
+            bundles.append(_make_control_bundle(ips[0]))
+            groups.append(
+                ray.util.placement_group(
+                    name=f"dp_rank_{rank}", strategy="PACK", bundles=bundles
+                )
+            )
+            local_ranks.append(next_local_rank[ips[0]])
+            next_local_rank[ips[0]] += 1
+            logger.info("Pinned DP rank %d worker node IPs: %s", rank, ips)
+    except Exception:
+        for pg in groups:
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
+        raise
+    return groups, local_ranks
+
+
+def _get_dp_actor_env_vars(
+    base_env: dict[str, str],
+    placement_group: "PlacementGroup",
+    world_size: int,
+    node_env: dict[str, dict[str, str]],
+    ordered_ips: list[str] | None,
+) -> dict[str, str]:
+    actor_env = base_env.copy()
+    control_bundle = placement_group.bundle_specs[world_size]
+    control_ip = next(
+        (key[5:] for key in control_bundle if key.startswith("node:")), None
+    )
+    if control_ip is not None:
+        actor_env.update(node_env.get(control_ip, {}))
+    actor_env.pop("VLLM_RAY_DP_ORDERED_NODE_IPS_JSON", None)
+    if ordered_ips is not None:
+        actor_env["VLLM_RAY_ORDERED_NODE_IPS"] = ",".join(ordered_ips)
+    return actor_env
+
+
 class CoreEngineActorManager:
     """
     Utility class to handle creation, readiness, and shutdown
@@ -390,6 +506,19 @@ class CoreEngineActorManager:
 
         from vllm.v1.engine.core import DPMoEEngineCoreActor, EngineCoreActor
 
+        ordered_placements = _get_dp_ordered_node_ips(vllm_config)
+        node_env = parse_ray_node_env_vars_json(envs.VLLM_RAY_NODE_ENV_VARS_JSON)
+        if ordered_placements:
+            from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
+            if not issubclass(executor_class, RayExecutorV2):
+                raise ValueError("Explicit Ray DP placement requires RayExecutorV2.")
+            missing_env = {
+                ip for ips in ordered_placements for ip in ips if ip not in node_env
+            }
+            if node_env and missing_env:
+                raise ValueError(f"Missing node environment overrides: {missing_env}")
+
         dp_size = vllm_config.parallel_config.data_parallel_size
         actor_class = (
             DPMoEEngineCoreActor
@@ -407,7 +536,6 @@ class CoreEngineActorManager:
         self.env_vars_dict = {
             name: os.environ[name] for name in env_vars_list if name in os.environ
         }
-        runtime_env = RuntimeEnv(env_vars=self.env_vars_dict)
 
         self.addresses = addresses
         self.executor_class = executor_class
@@ -458,61 +586,74 @@ class CoreEngineActorManager:
 
         self.placement_group_is_local = []
         refs = []
-        for index, local_index, pg in zip(
-            range(dp_size), local_dp_ranks, placement_groups
-        ):
-            dp_vllm_config = copy.deepcopy(vllm_config)
-            if dp_size > 1:
-                _apply_dp_identity_suffix(dp_vllm_config, index)
-            dp_vllm_config.parallel_config.placement_group = pg
-            local_client = index < local_engine_count
-
-            # Ray XPU known issue: dpctl initializes the GPU runtime early, so
-            # setting device env vars in Ray actor's initialization method
-            # will not affect device selection. See:
-            # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
-            if current_platform.is_xpu():
-                device_evar = current_platform.device_control_env_var
-                physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
-                    device_evar, local_index, world_size
+        try:
+            for index, local_index, pg in zip(
+                range(dp_size), local_dp_ranks, placement_groups
+            ):
+                dp_vllm_config = copy.deepcopy(vllm_config)
+                if dp_size > 1:
+                    _apply_dp_identity_suffix(dp_vllm_config, index)
+                dp_vllm_config.parallel_config.placement_group = pg
+                local_client = index < local_engine_count
+                actor_env_vars = _get_dp_actor_env_vars(
+                    self.env_vars_dict,
+                    pg,
+                    world_size,
+                    node_env,
+                    ordered_placements[index] if ordered_placements else None,
                 )
-                actor_env_vars = self.env_vars_dict.copy()
-                actor_env_vars[device_evar] = ",".join(str(d) for d in physical_gpu_ids)
+
+                # Ray XPU known issue: dpctl initializes the GPU runtime early, so
+                # setting device env vars in Ray actor's initialization method
+                # will not affect device selection. See:
+                # https://github.com/ray-project/ray/blob/master/python/ray/_private/accelerators/intel_gpu.py#L56 # noqa: E501
+                if current_platform.is_xpu():
+                    device_evar = current_platform.device_control_env_var
+                    physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
+                        device_evar, local_index, world_size
+                    )
+                    actor_env_vars[device_evar] = ",".join(
+                        str(d) for d in physical_gpu_ids
+                    )
+
                 runtime_env = RuntimeEnv(env_vars=actor_env_vars)
 
-            actor = (
-                ray.remote(actor_class)
-                .options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=world_size,
-                    ),
-                    runtime_env=runtime_env,
+                actor = (
+                    ray.remote(actor_class)
+                    .options(
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=pg,
+                            placement_group_bundle_index=world_size,
+                        ),
+                        runtime_env=runtime_env,
+                    )
+                    .remote(
+                        vllm_config=dp_vllm_config,
+                        executor_class=executor_class,
+                        log_stats=log_stats,
+                        local_client=local_client,
+                        addresses=addresses,
+                        dp_rank=index,
+                        local_dp_rank=local_index,
+                    )
                 )
-                .remote(
-                    vllm_config=dp_vllm_config,
-                    executor_class=executor_class,
-                    log_stats=log_stats,
-                    local_client=local_client,
-                    addresses=addresses,
-                    dp_rank=index,
-                    local_dp_rank=local_index,
-                )
-            )
-            if local_client:
-                self.local_engine_actors.append(actor)
-            else:
-                self.remote_engine_actors.append(actor)
-            self.placement_group_is_local.append(local_client)
-            refs.append(actor.wait_for_init.remote())
+                if local_client:
+                    self.local_engine_actors.append(actor)
+                else:
+                    self.remote_engine_actors.append(actor)
+                self.placement_group_is_local.append(local_client)
+                refs.append(actor.wait_for_init.remote())
 
-        ray.get(refs)
-        self.run_refs = []
-        self.actor_run_ref_dict = dict()
-        for actor in self.local_engine_actors + self.remote_engine_actors:
-            ref = actor.run.remote()
-            self.run_refs.append(ref)
-            self.actor_run_ref_dict[actor] = ref
+            ray.get(refs)
+            self.run_refs = []
+            self.actor_run_ref_dict = dict()
+            for actor in self.local_engine_actors + self.remote_engine_actors:
+                ref = actor.run.remote()
+                self.run_refs.append(ref)
+                self.actor_run_ref_dict[actor] = ref
+        except Exception:
+            self.shutdown()
+            raise
 
     @staticmethod
     def create_dp_placement_groups(
@@ -532,6 +673,11 @@ class CoreEngineActorManager:
 
         available_resources = available_resources_per_node()
         world_size = vllm_config.parallel_config.world_size
+        ordered_placements = _get_dp_ordered_node_ips(vllm_config)
+        if ordered_placements:
+            return _create_pinned_dp_placement_groups(
+                ordered_placements, available_resources, current_platform.ray_device_key
+            )
         placement_groups: list[PlacementGroup] = []
         local_dp_ranks: list[int] = []
 
@@ -997,9 +1143,11 @@ class CoreEngineActorManager:
 
         self.manager_stopped.set()
         for actor in self.local_engine_actors + self.remote_engine_actors:
-            ray.kill(actor)
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
         for pg in self.created_placement_groups:
-            ray.util.remove_placement_group(pg)
+            with contextlib.suppress(Exception):
+                ray.util.remove_placement_group(pg)
 
 
 def get_engine_zmq_addresses(
