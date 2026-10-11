@@ -457,6 +457,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
             self.indexer.reserve_prefill_workspace()
+            from .ops.qsa import reserve_qsa_attention_workspace
+
+            reserve_qsa_attention_workspace(
+                self.indexer.max_num_tokens,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.indexer.packed_output_width - 1,
+                self.kv_cache_torch_dtype == torch.float8_e4m3fn,
+            )
             output.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])

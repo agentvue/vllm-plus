@@ -14,6 +14,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.worker.workspace import current_workspace_manager
 
 
 @lru_cache(maxsize=1)
@@ -591,6 +592,40 @@ def _select_config(
     return BLOCK_N, num_warps, num_tiles, num_splits
 
 
+def _get_qsa_attention_workspace(
+    rows: int, num_heads: int, head_dim: int, num_splits: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output, lse = current_workspace_manager().get_simultaneous(
+        ((num_splits, rows, num_heads, head_dim), torch.float32),
+        ((num_splits, rows, num_heads), torch.float32),
+    )
+    return output, lse
+
+
+@lru_cache(maxsize=64)
+def _qsa_max_split_rows(
+    max_rows: int, num_kv_heads: int, num_columns: int, is_fp8: bool
+) -> tuple[int, int]:
+    candidates = (
+        (rows, _select_config(rows, num_kv_heads, prefill, num_columns, is_fp8)[3])
+        for rows in range(1, max_rows + 1)
+        for prefill in (False, True)
+    )
+    return max(candidates, key=lambda shape: shape[0] * shape[1])
+
+
+def reserve_qsa_attention_workspace(
+    max_rows: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    num_columns: int,
+    is_fp8: bool,
+) -> None:
+    rows, splits = _qsa_max_split_rows(max_rows, num_kv_heads, num_columns, is_fp8)
+    _get_qsa_attention_workspace(rows, num_heads, head_dim, splits)
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -681,13 +716,8 @@ def qsa_sparse_paged_attention(
     else:
         # FP32 partials preserve accuracy when merging independently normalized
         # splits.
-        partial_output = torch.empty(
-            (num_splits, *q.shape), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (num_splits, q.shape[0], q.shape[1]),
-            dtype=torch.float32,
-            device=q.device,
+        partial_output, partial_lse = _get_qsa_attention_workspace(
+            q.shape[0], q.shape[1], head_dim, num_splits
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)

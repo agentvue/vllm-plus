@@ -509,6 +509,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._prefill_profile_num_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self._prefill_profile_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -1053,33 +1057,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return self._output_projection(core_attn_out, z)
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
-
-        During V1 profile runs, ``_forward_core`` returns early because
-        ``attn_metadata`` is ``None``, so the autotuned kernels used by
-        ``chunk_gated_delta_rule`` (e.g. ``solve_tril``,
-        ``chunk_scaled_dot_kkt``) are never invoked.  After profiling,
-        vLLM allocates KV cache using most of the remaining GPU memory.
-        When the first real inference triggers the autotuner it OOMs
-        because there is not enough memory left for benchmarking.
-
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` with small dummy tensors to force
-        autotuning while GPU memory is still plentiful.  The autotuner
-        results are cached globally, so only the first layer incurs
-        actual benchmarking cost.
-
-        All kernels including ``chunk_fwd_kernel_o`` now use a fixed
-        ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
-
-        The decode path uses ``gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule``
-        which has fixed kernel parameters (no autotuning), so only the
-        prefill (chunked) path needs warming up.
-        """
+        """Measure full-batch GDN prefill and warm kernels before KV allocation."""
         if self._prefill_kernels_warmed_up:
             return
-        self._prefill_kernels_warmed_up = True
 
         device = qkv_or_qkvz.device
         dtype = qkv_or_qkvz.dtype
@@ -1087,11 +1067,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Mirror the real
-        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
-        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
-        T = FLA_CHUNK_SIZE
+        # Speculative dummy batches can be smaller than the scheduler limit.
+        T = max(FLA_CHUNK_SIZE, self._prefill_profile_num_tokens)
+        num_reqs = min(T, self._prefill_profile_num_reqs)
         dummy_mixed_qkv = torch.randn(
             T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
         )
@@ -1115,14 +1093,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
         state = torch.zeros(
-            1,
+            num_reqs,
             num_v_heads,
             self.head_v_dim,
             self.head_k_dim,
             device=device,
             dtype=state_dtype,
         )
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+        cu_seqlens = torch.tensor(
+            [i * T // num_reqs for i in range(num_reqs + 1)],
+            device=device,
+            dtype=torch.int32,
+        )
 
         # CuteDSL kernels require metadata
         chunk_indices = None
@@ -1149,15 +1131,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
         except Exception:
-            logger.warning(
+            logger.exception(
                 "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
+                "layer %s; cannot safely size the KV cache.",
                 T,
                 self.prefix,
-                exc_info=True,
             )
+            raise
         else:
+            self._prefill_kernels_warmed_up = True
             logger.debug(
                 "GDN prefill kernel warmup (T=%d) completed for layer %s",
                 T,

@@ -100,12 +100,22 @@ def test_qsa_profile_reserves_scratch_for_target_and_mtp_before_cache(
         qsa_owner, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None)
     )
     indexer = SimpleNamespace(
-        max_model_len=32000, compress_ratio=4, max_num_tokens=2048
+        max_model_len=32000,
+        compress_ratio=4,
+        max_num_tokens=2048,
+        packed_output_width=2052,
     )
     indexer.reserve_prefill_workspace = lambda: (
         indexer_qsa.QSAIndexer.reserve_prefill_workspace(indexer)
     )
-    owner = SimpleNamespace(indexer=indexer)
+    owner = SimpleNamespace(
+        indexer=indexer,
+        num_heads=6,
+        num_kv_heads=1,
+        head_dim=256,
+        kv_cache_torch_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(qsa_ops, "current_workspace_manager", lambda: manager)
     output = torch.ones(1)
     pointers = []
     for lane in (0, 1):
@@ -126,6 +136,35 @@ def test_qsa_profile_reserves_scratch_for_target_and_mtp_before_cache(
             _, logits, _ = qsa_indexer_ops.get_qsa_prefill_workspace(8, 512)
             assert logits.data_ptr() == pointers[lane]
             assert logits[0].item() == lane + 1
+
+
+def test_qsa_split_scratch_profiles_intermediate_batch_peaks(monkeypatch):
+    """The largest split allocation can occur below the maximum batch size."""
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = WorkspaceManager(torch.device("cpu"))
+    monkeypatch.setattr(qsa_ops, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(
+        qsa_ops,
+        "_select_config",
+        lambda rows, *args: (32, 4, 16, 8 if rows <= 4 else 2),
+    )
+    qsa_ops._qsa_max_split_rows.cache_clear()
+    try:
+        qsa_ops.reserve_qsa_attention_workspace(10, 2, 1, 16, 512, False)
+        manager.lock()
+        pointers = []
+        for rows in range(1, 11):
+            splits = 8 if rows <= 4 else 2
+            output, lse = qsa_ops._get_qsa_attention_workspace(rows, 2, 16, splits)
+            output.fill_(7)
+            lse.fill_(42)
+            assert torch.all(output == 7)
+            assert output.shape == (splits, rows, 2, 16)
+            assert lse.shape == (splits, rows, 2)
+            pointers.append(output.data_ptr())
+        assert len(set(pointers)) == 1
+    finally:
+        qsa_ops._qsa_max_split_rows.cache_clear()
 
 
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
@@ -1065,6 +1104,7 @@ def test_qsa_block_expansion_correctness() -> None:
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(
+    workspace_init,
     num_rows: int,
     num_query_heads: int,
     num_kv_heads: int,

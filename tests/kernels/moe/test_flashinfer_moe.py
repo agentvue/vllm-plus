@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.experts import flashinfer_cutlass_moe
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
     FlashInferExperts,
     is_valid_flashinfer_cutlass_fused_moe,
@@ -51,6 +52,157 @@ MNK_FACTORS = [
     (224, 1024, 1024),
     (224, 1024, 1536),
 ]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SILU_NO_MUL])
+@pytest.mark.parametrize(
+    "quant_dtype,weight_dtype,block",
+    [
+        ("nvfp4", "nvfp4", False),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, False),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, True),
+        (None, None, False),
+        ("mxfp8", "mxfp4", False),
+        (None, "mxfp4", False),
+    ],
+)
+def test_flashinfer_workspace_accounts_for_full_batch_and_reuses_storage(
+    monkeypatch, legacy, activation, quant_dtype, weight_dtype, block
+):
+    """Profile the scheduler limit even when the MTP dummy batch is smaller."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = WorkspaceManager(torch.device("cpu"))
+    expert = type("ExpertParams", (), {})()
+    expert.quant_dtype = quant_dtype
+    expert.weight_quant_dtype = weight_dtype
+    expert.expects_unquantized_inputs = block
+    expert.use_deepseek_fp8_block_scale = block
+    expert.out_dtype = torch.bfloat16
+    expert.device = torch.device("cpu")
+    expert.tp_size, expert.tp_rank = 1, 0
+    expert.ep_size, expert.ep_rank = 4, 2
+    expert.moe_config = SimpleNamespace(max_num_tokens=32, dp_size=1)
+    expert.workspace_dtype = lambda dtype: dtype
+    expert._workspace_sizes = {}
+    expert._workspace_size = lambda *args: FlashInferExperts._workspace_size(
+        expert, *args
+    )
+    calls = []
+
+    def query(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None if legacy else 1025
+
+    monkeypatch.setattr(
+        flashinfer_cutlass_moe, "flashinfer_cutlass_fused_moe_workspace_size", query
+    )
+    K = 64 if quant_dtype == "nvfp4" else 128
+    N = 160 if activation.is_gated else 80
+    shapes = FlashInferExperts.workspace_shapes(
+        expert, 30, N, K, 10, 512, 128, None, activation
+    )
+    assert calls[0][0] == (32, 128, 80, 512, 10)
+    expected_input_dtype = (
+        torch.uint8
+        if quant_dtype == "nvfp4"
+        else torch.bfloat16
+        if block or quant_dtype is None
+        else torch.float8_e4m3fn
+    )
+    assert calls[0][1]["x_dtype"] == expected_input_dtype
+    assert calls[0][1]["ep_size"] == 4
+    assert calls[0][1]["ep_rank"] == 2
+    assert calls[0][1]["use_deepseek_fp8_block_scale"] == block
+    expected_weight_dtype = (
+        torch.long
+        if quant_dtype in ("nvfp4", "mxfp8")
+        else torch.uint8
+        if weight_dtype == "mxfp4"
+        else weight_dtype or torch.bfloat16
+    )
+    assert calls[0][1]["weight_dtype"] == expected_weight_dtype
+    if legacy:
+        assert shapes == ((30, K), (0,), (30, 128))
+        return
+    assert shapes == ((32, 128), (513,), (30, 128))
+    output, scratch = manager.get_simultaneous(
+        (shapes[0], torch.bfloat16), (shapes[1], torch.bfloat16)
+    )
+    pointer = scratch.data_ptr()
+    output.fill_(7)
+    scratch.view(torch.uint8).fill_(42)
+    assert torch.all(output == 7)
+    assert pointer >= output.data_ptr() + output.numel() * output.element_size()
+    manager.lock()
+    shapes = FlashInferExperts.workspace_shapes(
+        expert, 32, N, K, 10, 512, 128, None, activation
+    )
+    _, scratch = manager.get_simultaneous(
+        (shapes[0], torch.bfloat16), (shapes[1], torch.bfloat16)
+    )
+    assert scratch.data_ptr() == pointer
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_flashinfer_workspace_is_passed_without_overlapping_output(monkeypatch, legacy):
+    """Native scratch must be separate from the returned MoE activations."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.workspace import WorkspaceManager
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    manager = WorkspaceManager(torch.device("cpu"))
+    output, scratch = manager.get_simultaneous(
+        ((3, 16), torch.bfloat16), ((0 if legacy else 513,), torch.bfloat16)
+    )
+    owner = SimpleNamespace(
+        quant_dtype=None,
+        weight_quant_dtype=None,
+        out_dtype=torch.bfloat16,
+        use_deepseek_fp8_block_scale=False,
+        gemm1_clamp_limit=None,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+    )
+
+    def native(**kwargs):
+        if legacy:
+            assert "workspace_buffer" not in kwargs
+        else:
+            buffer = kwargs["workspace_buffer"]
+            assert buffer.dtype == torch.uint8
+            assert buffer.shape == (1026,)
+            buffer.fill_(42)
+        kwargs["output"].fill_(7)
+
+    monkeypatch.setattr(flashinfer_cutlass_moe, "flashinfer_cutlass_fused_moe", native)
+    FlashInferExperts.apply(
+        owner,
+        output,
+        torch.zeros_like(output),
+        torch.empty(1, 32, 16),
+        torch.empty(1, 16, 16),
+        torch.ones(3, 1),
+        torch.zeros(3, 1, dtype=torch.long),
+        MoEActivation.SILU,
+        1,
+        None,
+        None,
+        None,
+        None,
+        scratch,
+        None,
+        False,
+    )
+    assert torch.all(output == 7)
 
 
 @pytest.mark.parametrize(

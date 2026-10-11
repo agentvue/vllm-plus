@@ -566,24 +566,89 @@ def build_tests():
         classes={"QSAIndexer": ([], ("reserve_prefill_workspace",))},
         get_qsa_prefill_workspace=qsa_ops.get_qsa_prefill_workspace,
     )
+    qsa_attention = load(
+        "vllm.models.qwen4_exp.nvidia.ops.qsa",
+        "vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+        functions=(
+            "_get_qsa_attention_workspace",
+            "_qsa_max_split_rows",
+            "reserve_qsa_attention_workspace",
+            "_select_config",
+            "_select_sm120_config",
+            "_select_sm90_config",
+        ),
+        lru_cache=__import__("functools").lru_cache,
+        _is_sm120=lambda: True,
+        _is_sm90=lambda: False,
+        triton=SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
+        current_workspace_manager=None,
+    )
+    activation = load(
+        "vllm.model_executor.layers.fused_moe.activation",
+        "vllm/model_executor/layers/fused_moe/activation.py",
+        classes={"MoEActivation": (None, None)},
+        Enum=enum.Enum,
+    )
+    fi_experts = load(
+        "vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe",
+        "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py",
+        classes={
+            "FlashInferExperts": ([], ("workspace_shapes", "_workspace_size", "apply"))
+        },
+        functools=__import__("functools"),
+        logger=MagicMock(),
+        flashinfer_cutlass_fused_moe_workspace_size=None,
+        flashinfer_cutlass_fused_moe=None,
+        activation_to_flashinfer_type=lambda value: value,
+        MoEActivation=activation.MoEActivation,
+    )
+    gdn = load(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn",
+        "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+        classes={"QwenGatedDeltaNetAttention": ([], ("_warmup_prefill_kernels",))},
+        FLA_CHUNK_SIZE=64,
+        fused_post_conv_prep=None,
+        logger=MagicMock(),
+        PluggableLayer=SimpleNamespace(register=lambda _: lambda cls: cls),
+    )
     qsa_owner = load(
         "vllm.models.qwen4_exp.nvidia.qsa",
         "vllm/models/qwen4_exp/nvidia/qsa.py",
         classes={"Qwen4ExpQSAAttention": ([], ("_run_qsa",))},
         get_forward_context=None,
         eager_break_during_capture=lambda fn: fn,
+        __package__="vllm.models.qwen4_exp.nvidia",
     )
     specs = [
         (
             "tests/models/qwen4_exp/test_qsa_reference.py",
-            ("test_qsa_prefill_scratch", "test_qsa_profile_reserves"),
+            (
+                "test_qsa_prefill_scratch",
+                "test_qsa_profile_reserves",
+                "test_qsa_split_scratch",
+            ),
             {
                 "qsa_indexer_ops": qsa_ops,
                 "indexer_qsa": qsa_indexer,
                 "qsa_owner": qsa_owner,
+                "qsa_ops": qsa_attention,
                 "WorkspaceManager": workspace.WorkspaceManager,
                 "use_workspace_lane": workspace.use_workspace_lane,
             },
+        ),
+        (
+            "tests/kernels/moe/test_flashinfer_moe.py",
+            ("test_flashinfer_workspace",),
+            {
+                "flashinfer_cutlass_moe": fi_experts,
+                "FlashInferExperts": fi_experts.FlashInferExperts,
+                "MoEActivation": activation.MoEActivation,
+            },
+        ),
+        (
+            "tests/kernels/mamba/test_gdn_prefill_flashinfer.py",
+            ("test_gdn_warmup_profiles",),
+            {"QwenGatedDeltaNetAttention": gdn.QwenGatedDeltaNetAttention},
         ),
         (
             "tests/utils_/test_torch_utils.py",
