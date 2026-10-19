@@ -285,6 +285,10 @@ def test_diagnostic_hooks_skip_profile_and_stop_after_two_real_forwards(monkeypa
     model(values, positions)
     assert probe.step == 0
     context.is_padding.zero_()
+    context.additional_kwargs = {"is_dummy_run": True}
+    model(values, positions)
+    assert probe.step == 0
+    context.additional_kwargs = {"is_dummy_run": False}
     model(values, positions)
     model(values, positions)
     assert probe.step == 2
@@ -292,3 +296,108 @@ def test_diagnostic_hooks_skip_profile_and_stop_after_two_real_forwards(monkeypa
     model(values, positions)
     assert len(records) == count
     assert not probe.active
+
+
+def test_sparse_reference_reads_footer_scales_and_ignores_poisoned_padding():
+    """A masked slot must contribute zero even if the reserved row contains NaNs."""
+    from vllm.models.deepseek_v41.nvidia.diagnostics import (
+        read_packed_v4_rows,
+        sparse_attention_reference,
+    )
+
+    page_size = 64
+    stride = page_size * 584 + 576
+    backing = torch.full((3, stride), 255, dtype=torch.uint8)
+    cache = backing.as_strided((3, page_size, 584), (stride, 584, 1))
+    slots = torch.tensor([64, 65, 128])
+    values = []
+    for row, slot in enumerate(slots.tolist()):
+        page, offset = divmod(slot, page_size)
+        fp8 = torch.full((448,), float(row + 1)).to(torch.float8_e4m3fn)
+        rope = torch.full((64,), float(row + 4), dtype=torch.bfloat16)
+        backing[page, offset * 576 : offset * 576 + 448] = fp8.view(torch.uint8)
+        backing[page, offset * 576 + 448 : (offset + 1) * 576] = rope.view(torch.uint8)
+        scales = torch.arange(124, 131, dtype=torch.uint8)
+        start = page_size * 576 + offset * 8
+        backing[page, start : start + 7] = scales
+        values.append(
+            torch.cat(
+                (
+                    fp8.float()
+                    * torch.exp2(scales.float() - 127).repeat_interleave(64),
+                    rope.float(),
+                )
+            )
+        )
+    values = torch.stack(values)
+    torch.testing.assert_close(read_packed_v4_rows(cache, slots), values)
+    assert not torch.isfinite(read_packed_v4_rows(cache, torch.tensor([0]))).all()
+    query = torch.randn(2, 8, 512) / 100
+    indices = torch.tensor([[64, -1, 65, 128], [128, 65, -1, 64]])
+    lengths = torch.tensor([3, 2])
+    sink = torch.linspace(-1, 1, 8)
+    actual = sparse_attention_reference(query, cache, indices, lengths, 0.1, sink)
+    assert torch.isfinite(actual).all()
+    for row, selected in enumerate(([0, 1], [2, 1])):
+        v = values[selected]
+        scores = query[row] @ v.T * 0.1
+        probabilities = torch.cat((scores, sink[:, None]), -1).softmax(-1)
+        torch.testing.assert_close(actual[row], probabilities[:, :-1] @ v)
+    # A kernel that gathers the poisoned null row despite its zero probability
+    # reproduces the failure; masking the score alone cannot prevent it.
+    bad_values = read_packed_v4_rows(cache, torch.tensor([64, 0]))
+    assert not torch.isfinite(torch.tensor([[1.0, 0.0]]) @ bad_values).all()
+    assert (backing[:, page_size * 584 :] == 255).all()
+
+    from vllm.models.deepseek_v41.nvidia.diagnostics import DiagnosticProbe
+
+    probe = DiagnosticProbe(stage=0, rank=0)
+    probe.active = True
+    probe.emit = lambda *args, **kwargs: None
+    layer = SimpleNamespace(
+        prefix="layers.0.attn",
+        swa_cache_layer=SimpleNamespace(kv_cache=cache),
+        rotary_emb=SimpleNamespace(
+            cos_sin_cache=torch.cat((torch.ones(1, 32), torch.zeros(1, 32)), -1)
+        ),
+    )
+    kv = torch.stack((values[0], values[1], values[2]))
+    metadata = SimpleNamespace(slot_mapping=slots)
+    probe.packed_kv(layer, kv, torch.zeros(3, dtype=torch.long), metadata)
+    backing[1, page_size * 576] = 255
+    with pytest.raises(RuntimeError, match="kv_insert.output"):
+        probe.packed_kv(layer, kv, torch.zeros(3, dtype=torch.long), metadata)
+
+
+def test_inverse_rope_reference_preserves_nope_and_group_order():
+    from vllm.models.deepseek_v41.nvidia.diagnostics import inverse_rope_reference
+
+    values = torch.randn(3, 8, 512)
+    phase = torch.randn(5, 32)
+    rope = torch.cat((phase.cos(), phase.sin()), -1)
+    positions = torch.tensor([4, 1, 3])
+    actual = inverse_rope_reference(values, positions, rope, 2).reshape(2, 8, 512)
+    torch.testing.assert_close(actual[..., :448], values[:2, ..., :448])
+    # Rotate the result forward; it must recover the original values.
+    angle = phase[positions[:2], None]
+    paired = actual[..., 448:].reshape(2, 8, 32, 2)
+    x, y = paired[..., 0], paired[..., 1]
+    forward = torch.stack(
+        (x * angle.cos() - y * angle.sin(), x * angle.sin() + y * angle.cos()), -1
+    )
+    torch.testing.assert_close(forward.flatten(-2), values[:2, ..., 448:])
+
+
+def test_numerical_comparison_reports_finite_reference_before_nan_failure():
+    from vllm.models.deepseek_v41.nvidia.diagnostics import DiagnosticProbe
+
+    probe = DiagnosticProbe(stage=0, rank=0)
+    probe.active = True
+    records = []
+    probe.emit = lambda event, **values: records.append(dict(event=event, **values))
+    probe.compare("mla", torch.full((2, 8, 512), float("nan")), torch.ones(2, 8, 512))
+    event = records[-1]
+    assert event["event"] == "numerical_reference"
+    assert event["actual"]["nonfinite"] == 8192
+    assert event["max_abs_error"] is None
+    assert event["relative_l2"] is None

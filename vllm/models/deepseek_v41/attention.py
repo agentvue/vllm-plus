@@ -670,6 +670,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             hidden_states
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        probe = getattr(self, "diagnostic_probe", None)
+        if probe is not None and probe.active:
+            probe.record(self.prefix + ".normalized_kv", kv)
+            probe.record(
+                self.prefix + ".rope", self.rotary_emb.cos_sin_cache[positions]
+            )
 
         self._prepare_and_attn_fn(
             hidden_states,
@@ -976,6 +982,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
+        probe = getattr(self, "diagnostic_probe", None)
+        if probe is not None and probe.active:
+            probe.record(self.prefix + ".mla.output", out)
 
     def _fused_qnorm_rope_kv_insert(
         self,

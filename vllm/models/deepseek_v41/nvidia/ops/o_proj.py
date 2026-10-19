@@ -92,4 +92,5 @@ def dsv41_o_proj(
         o_lora_rank=layer.o_lora_rank,
         einsum_recipe=layer._einsum_recipe,
         tma_aligned_scales=layer._tma_aligned_scales,
+        diagnostic_probe=getattr(layer, "diagnostic_probe", None),
     )

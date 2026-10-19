@@ -46,6 +46,7 @@ def deep_gemm_fp8_o_proj(
     o_lora_rank: int,
     einsum_recipe: tuple[int, int, int],
     tma_aligned_scales: bool,
+    diagnostic_probe=None,
 ) -> torch.Tensor:
     """O projection: inverse RoPE + grouped wo_a + wo_b.
 
@@ -80,6 +81,15 @@ def deep_gemm_fp8_o_proj(
         device=o_proj_input.device,
         dtype=torch.bfloat16,
     )
+    if diagnostic_probe is not None and diagnostic_probe.active:
+        if not use_fp8:
+            diagnostic_probe.inverse_rope(
+                o, positions, cos_sin_cache, n_groups, o_proj_input
+            )
+        diagnostic_probe.record("wo_a.input", o_proj_input)
+        if id(wo_a) not in diagnostic_probe.checked_weights:
+            diagnostic_probe.record("wo_a.weight", wo_a.weight)
+            diagnostic_probe.checked_weights.add(id(wo_a))
     if use_fp8:
         weight_scale = (
             wo_a.weight_scale
@@ -100,6 +110,14 @@ def deep_gemm_fp8_o_proj(
             grouped_weight.transpose(1, 2),
             out=z.transpose(0, 1),
         )
+        if diagnostic_probe is not None and diagnostic_probe.active:
+            reference = torch.bmm(
+                o_proj_input[:2].transpose(0, 1).float(),
+                grouped_weight[:, :8].transpose(1, 2).float(),
+            ).transpose(0, 1)
+            diagnostic_probe.compare("wo_a", z[:2, :, :8], reference)
+    if diagnostic_probe is not None and diagnostic_probe.active:
+        diagnostic_probe.record("wo_a.output", z)
     return wo_b(z.flatten(1))
 
 

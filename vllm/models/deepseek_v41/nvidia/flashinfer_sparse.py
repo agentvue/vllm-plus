@@ -739,6 +739,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self_kv_cache = None if swa_only else self._compressed_kv_cache()
         swa_kv_cache = self.swa_cache_layer.kv_cache
 
+        probe = getattr(self, "diagnostic_probe", None)
+        if probe is not None and probe.active:
+            probe.record(self.prefix + ".mla.query", q)
+            probe.packed_kv(self, kv, positions, swa_metadata)
         self._forward_sparse_impl(
             q=q,
             output=output,
@@ -748,6 +752,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_kv_cache=swa_kv_cache,
             swa_only=swa_only,
         )
+
+        if probe is not None and probe.active and swa_only:
+            count = swa_metadata.num_decode_tokens
+            if count:
+                probe.sparse_attention(
+                    self,
+                    q[:count],
+                    swa_metadata.decode_swa_indices,
+                    swa_metadata.decode_swa_lens,
+                    output[:count],
+                )
+            if swa_metadata.num_prefills:
+                probe.sparse_attention(
+                    self,
+                    q[count:],
+                    swa_metadata.prefill_swa_indices,
+                    swa_metadata.prefill_swa_lens,
+                    output[count:],
+                )
 
     def _prepare_query(self, q: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         if self.kv_cache_torch_dtype == torch.float8_e4m3fn:

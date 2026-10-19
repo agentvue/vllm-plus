@@ -87,6 +87,62 @@ def _tensors(value, prefix=""):
             yield from _tensors(item, f"{prefix}.{index}")
 
 
+def read_packed_v4_rows(cache, indices):
+    """Decode selected 584-byte footer-scale records, preserving page strides."""
+    cache = cache.view(cache.shape[0], cache.shape[1], -1)
+    if cache.dtype != torch.uint8 or cache.shape[-1] != 584:
+        raise ValueError("Expected the SM120 V4 packed FP8 cache")
+    page_size = cache.shape[1]
+    raw = cache.as_strided((cache.shape[0], page_size * 584), (cache.stride(0), 1))
+    indices = indices.long()
+    if indices.numel() and (
+        indices.min().item() < 0 or indices.max().item() >= cache.shape[0] * page_size
+    ):
+        raise ValueError("Packed KV reference received an out-of-range slot")
+    pages, slots = indices // page_size, indices % page_size
+    data = raw[
+        pages[:, None], slots[:, None] * 576 + torch.arange(576, device=cache.device)
+    ]
+    scales = raw[
+        pages[:, None],
+        page_size * 576 + slots[:, None] * 8 + torch.arange(7, device=cache.device),
+    ]
+    nope = data[:, :448].contiguous().view(torch.float8_e4m3fn).float()
+    nope *= torch.exp2(scales.float() - 127).repeat_interleave(64, 1)
+    rope = data[:, 448:].contiguous().view(torch.bfloat16).float()
+    return torch.cat((nope, rope), dim=-1)
+
+
+def sparse_attention_reference(query, cache, indices, lengths, scale, sinks):
+    """Bounded FP32 reference over actual packed rows, excluding invalid slots."""
+    results = []
+    indices = indices.reshape(query.shape[0], -1)
+    for row in range(min(2, query.shape[0])):
+        count = int(lengths.reshape(-1)[row].item())
+        if count < 0 or count > indices.shape[-1] or count > 256:
+            raise ValueError(f"Reference sparse length outside [0, 256]: {count}")
+        slots = indices[row, :count]
+        slots = slots[slots >= 0]
+        values = read_packed_v4_rows(cache, slots)
+        scores = query[row].float() @ values.T * scale
+        if sinks is not None:
+            scores = torch.cat((scores, sinks.float().reshape(-1, 1)), dim=-1)
+        probabilities = scores.softmax(-1)[:, : values.shape[0]]
+        results.append(probabilities @ values)
+    return torch.stack(results)
+
+
+def inverse_rope_reference(output, positions, rope, n_groups):
+    """Rotate two attention rows in FP32 before the grouped output projection."""
+    values = output[:2].float().clone()
+    phase = rope[positions[:2]].float().unsqueeze(1)
+    even, odd = values[..., 448::2].clone(), values[..., 449::2].clone()
+    cosine, sine = phase[..., :32], phase[..., 32:]
+    values[..., 448::2] = even * cosine + odd * sine
+    values[..., 449::2] = odd * cosine - even * sine
+    return values.reshape(values.shape[0], n_groups, -1)
+
+
 class DiagnosticProbe:
     def __init__(self, stage, rank, max_steps=2):
         self.stage = stage
@@ -96,6 +152,7 @@ class DiagnosticProbe:
         self.active = False
         self.references = {}
         self.reference_bytes = 0
+        self.checked_weights = set()
 
     def emit(self, event, **values):
         logger.info(
@@ -112,6 +169,8 @@ class DiagnosticProbe:
         if self.step >= self.max_steps or not is_forward_context_available():
             return
         context = get_forward_context()
+        if getattr(context, "additional_kwargs", {}).get("is_dummy_run", False):
+            return
         if not isinstance(context.attn_metadata, dict) or not context.attn_metadata:
             return
         padding = context.is_padding
@@ -141,6 +200,64 @@ class DiagnosticProbe:
                 raise RuntimeError(
                     f"DeepSeek first non-finite activation: {name}{suffix}"
                 )
+
+    def compare(self, name, actual, reference):
+        """Log reference statistics before a failing activation stops execution."""
+        self.record(name + ".reference", reference)
+        stats = tensor_statistics(actual)
+        error = actual.double() - reference.double()
+        self.emit(
+            "numerical_reference",
+            name=name,
+            actual=stats,
+            max_abs_error=None if stats["nonfinite"] else error.abs().max().item(),
+            relative_l2=(
+                None
+                if stats["nonfinite"]
+                else (error.norm() / reference.double().norm().clamp_min(1e-12)).item()
+            ),
+        )
+
+    def inverse_rope(self, output, positions, rope, n_groups, actual):
+        reference = inverse_rope_reference(output, positions, rope, n_groups)
+        self.compare("inverse_rope", actual[: reference.shape[0]], reference)
+
+    def packed_kv(self, layer, kv, positions, metadata):
+        slots = metadata.slot_mapping
+        rows = (slots >= 0).nonzero().flatten()[:2]
+        if not rows.numel():
+            return
+        expected = kv[rows].float().clone()
+        phase = layer.rotary_emb.cos_sin_cache[positions[rows]]
+        even, odd = expected[:, 448::2].clone(), expected[:, 449::2].clone()
+        expected[:, 448::2] = even * phase[:, :32] - odd * phase[:, 32:]
+        expected[:, 449::2] = odd * phase[:, :32] + even * phase[:, 32:]
+        actual = read_packed_v4_rows(layer.swa_cache_layer.kv_cache, slots[rows])
+        self.compare(layer.prefix + ".kv_insert", actual, expected)
+        self.record(layer.prefix + ".kv_insert.output", actual)
+
+    def sparse_attention(self, layer, query, indices, lengths, output):
+        if not self.active or layer.compress_ratio != 0:
+            return
+        cache = layer.swa_cache_layer.kv_cache
+        self.emit(
+            "sparse_geometry",
+            name=layer.prefix,
+            cache_shape=list(cache.shape),
+            cache_stride=list(cache.stride()),
+            indices=indices[:2]
+            .reshape(min(2, query.shape[0]), -1)[:, :256]
+            .cpu()
+            .tolist(),
+            lengths=lengths.reshape(-1)[:2].cpu().tolist(),
+            null_row=tensor_statistics(
+                read_packed_v4_rows(cache, indices.new_zeros(1).reshape(-1))
+            ),
+        )
+        reference = sparse_attention_reference(
+            query, cache, indices, lengths, layer.scale, layer.attn_sink
+        )
+        self.compare(layer.prefix + ".mla", output[: reference.shape[0]], reference)
 
     def packet(self, direction, boundary, tensors):
         if self.active:
@@ -252,6 +369,8 @@ class DiagnosticProbe:
             ) or (name.startswith("layers.") and name.count(".") == 1)
             if name != "norm" and not (name.startswith("layers.") and observed):
                 continue
+            if leaf == "attn":
+                module.diagnostic_probe = self
 
             def before(module, args, name=name):
                 self.record(name + ".input", args)

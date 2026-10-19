@@ -96,6 +96,10 @@ def test_pipeline_forward_preserves_required_raw_tokens(
         "set_forward_context",
         lambda *a, **k: contextlib.nullcontext(),
     )
+    forward_context = SimpleNamespace(additional_kwargs={})
+    monkeypatch.setattr(
+        model_runner_module, "get_forward_context", lambda: forward_context
+    )
     monkeypatch.setattr(
         model_runner_module, "build_slot_mappings_by_layer", lambda *a: {}
     )
@@ -112,6 +116,7 @@ def test_pipeline_forward_preserves_required_raw_tokens(
         )
 
     kwargs = runner.model.call_args.kwargs
+    assert forward_context.additional_kwargs["is_dummy_run"] == dummy_run
     assert kwargs["input_ids"] is (tokens if requires_tokens else None)
     assert kwargs["inputs_embeds"] is None
     assert kwargs["query_start_loc"] is query_starts

@@ -282,6 +282,7 @@ def build_tests():
         InputBatch=None,
         build_slot_mappings_by_layer=None,
         set_forward_context=None,
+        get_forward_context=None,
         **common,
     )
     descriptor = load(
@@ -897,6 +898,9 @@ def build_tests():
             "tensor_statistics",
             "check_received_rows",
             "_tensors",
+            "read_packed_v4_rows",
+            "sparse_attention_reference",
+            "inverse_rope_reference",
         ),
         classes={"DiagnosticProbe": (None, None)},
         CHUNK=65536,
