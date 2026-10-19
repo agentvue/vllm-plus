@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Packed cache transport preserves bytes across distinct physical page layouts."""
+
+import pytest
+import torch
+
+from vllm.models.deepseek_v41.nvidia.pp import copy_packed_rows
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.mark.parametrize("data,scales", [(576, 8), (512, 16), (128, 4)])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("capture", [False, True])
+def test_cache_updates_preserve_values_scales_and_skipped_slots(
+    data, scales, ratio, capture
+):
+    src_page, dst_page = 128, 64
+    width = data + scales
+    src_stride, dst_stride = src_page * width + 256, dst_page * width + 512
+    src_raw = (torch.arange(3 * src_stride, device="cuda") % 251).to(torch.uint8)
+    dst_raw = torch.full((5 * dst_stride,), 253, dtype=torch.uint8, device="cuda")
+    source = src_raw.as_strided((3, src_page, width), (src_stride, width, 1))
+    target = dst_raw.as_strided((5, dst_page, width), (dst_stride, width, 1))
+    slots = torch.tensor([0, 127, -1, 128, 129, 256, 257, 258], device="cuda")
+    target_slots = torch.tensor([63, 64, 65, 128, -1, 191, 192, 193], device="cuda")
+    positions = torch.tensor([1, 2, 3, 4, 5, 127, 128, 129], device="cuda")
+    packed = torch.empty((8, width + 1), dtype=torch.uint8, device="cuda")
+
+    def update():
+        copy_packed_rows(source, slots, positions, packed, data, ratio, insert=False)
+        copy_packed_rows(
+            target, target_slots, positions, packed, data, ratio, insert=True
+        )
+
+    update()
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            update()
+        for _ in range(3):
+            graph.replay()
+    # Reused request slots and new compression boundaries must use current data.
+    dst_raw.fill_(253)
+    slots.copy_(slots.roll(1))
+    target_slots.copy_(target_slots.roll(1))
+    positions.add_(1)
+    if capture:
+        graph.replay()
+    else:
+        update()
+    torch.cuda.synchronize()
+    expected = torch.full_like(dst_raw, 253).cpu()
+    src = src_raw.cpu()
+    for src_slot, dst_slot, pos in zip(
+        slots.tolist(), target_slots.tolist(), positions.tolist()
+    ):
+        if src_slot < 0 or dst_slot < 0 or (pos + 1) % ratio:
+            continue
+        for count, src_offset, dst_offset in (
+            (data, (src_slot % src_page) * data, (dst_slot % dst_page) * data),
+            (
+                scales,
+                src_page * data + (src_slot % src_page) * scales,
+                dst_page * data + (dst_slot % dst_page) * scales,
+            ),
+        ):
+            src_offset += src_slot // src_page * src_stride
+            dst_offset += dst_slot // dst_page * dst_stride
+            expected[dst_offset : dst_offset + count] = src[
+                src_offset : src_offset + count
+            ]
+    assert torch.equal(dst_raw.cpu(), expected)

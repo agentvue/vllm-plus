@@ -87,13 +87,11 @@ class AttentionConfig:
     support in the backend."""
 
     indexer_sparse_logits: bool = False
-    """DeepSeek V4.1 two-level indexer: score only the candidate blocks with
-    DeepGEMM's sparse MQA-logits kernels instead of computing dense logits over
-    the whole context and masking them. Requires `indexer_kv_dtype="mxfp4"`,
-    an SM100-class GPU, DeepGEMM >= 2.8 and the DeepSelect top-k extension
-    (the top-k runs on the kernels' bf16 logits). The sparse path costs
-    O(candidate blocks) per query regardless of context length, so it pays off
-    for long contexts (roughly 32K tokens and beyond) and is slower below."""
+    """Score only DeepSeek V4.1's candidate blocks. SM100 uses an MXFP4 index
+    cache, DeepGEMM >= 2.8 and DeepSelect. SM120 uses an FP8 index cache and
+    Triton FP32 scoring for flat decode at 32K or longer; other batches retain
+    dense scoring. Both paths preserve the checkpoint's candidate selection.
+    SM120's candidate path is opt-in pending hardware accuracy qualification."""
 
     hisparse_config: HiSparseConfig | None = None
     """HiSparse host-resident KV configuration. Setting this enables experimental

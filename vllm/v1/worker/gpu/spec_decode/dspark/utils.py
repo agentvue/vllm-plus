@@ -116,6 +116,11 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
     if draft_model_config.get_vocab_size() <= target_vocab_size:
+        from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+            _load_pp_target_embedding,
+        )
+
+        _load_pp_target_embedding(draft_model, draft_inner, target_inner, vllm_config)
         maybe_share_target_embed(draft_model, draft_inner, target_inner)
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)

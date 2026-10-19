@@ -37,12 +37,17 @@ def _load_pp_target_embedding(
     draft_embedding = cast(Any, draft_inner).embed_tokens
     loader = DefaultModelLoader(vllm_config.load_config)
     source = DefaultModelLoader.Source(
-        vllm_config.model_config.model, vllm_config.model_config.revision
+        getattr(vllm_config.model_config, "model_weights", None)
+        or vllm_config.model_config.model,
+        vllm_config.model_config.revision,
     )
     embedding_names = {
         "model.embed_tokens.weight",
         "model.language_model.embed_tokens.weight",
         "language_model.model.embed_tokens.weight",
+        "embed.weight",
+        "model.embed.weight",
+        "language_model.embed.weight",
     }
     for name, weight in loader._get_weights_iterator(source):
         if name in embedding_names:
@@ -50,7 +55,7 @@ def _load_pp_target_embedding(
             param.weight_loader(param, weight)
             draft.has_own_embed_tokens = True
             return
-    raise ValueError("DFlash under PP requires target or draft embedding weights.")
+    raise ValueError("The PP drafter requires target or draft embedding weights.")
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:

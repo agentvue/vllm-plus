@@ -22,7 +22,7 @@ from typing import Annotated
 import torch
 from torch import nn
 
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -32,6 +32,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
@@ -150,12 +151,14 @@ class DeepseekV41ForCausalLM(
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
-        # The tower is always built; _mark_tower_model stubs it out
-        # (StageMissingLayer, weights skipped) when the image limit is 0.
         with self._mark_tower_model(vllm_config, {"image"}):
             self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
-            self.vision = DeepseekV4ViT(config)
-            self.aligner = DeepseekV4Aligner(config)
+            if get_pp_group().is_first_rank:
+                self.vision = DeepseekV4ViT(config)
+                self.aligner = DeepseekV4Aligner(config)
+            else:
+                self.vision = PPMissingLayer()
+                self.aligner = PPMissingLayer()
             self.image_start = nn.Parameter(
                 torch.empty(config.hidden_size, dtype=torch.float32)
             )
@@ -312,15 +315,20 @@ class DeepseekV41ForCausalLM(
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        # Keep one streaming decoder load even when vision weights interleave;
+        # decoder finalization must run only after its last weight is loaded.
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
+        loaded_params: set[str] = set()
+
+        def decoder_weights():
+            for name, weight in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name.removeprefix("language_model."), weight
+                else:
+                    loaded_params.update(loader.load_weights(((name, weight),)))
+
+        decoder_loaded = self.language_model.load_weights(decoder_weights())
+        loaded_params.update(f"language_model.{name}" for name in decoder_loaded)
         self._weights_finalized = True
         return loaded_params
 

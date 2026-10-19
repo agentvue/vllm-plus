@@ -25,8 +25,10 @@ import shutil
 import subprocess
 import sys
 import weakref
+from bisect import bisect_right
 from collections import Counter, deque, namedtuple
 from contextlib import ExitStack, contextmanager, nullcontext
+from itertools import islice
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -39,6 +41,8 @@ from torch import nn
 
 # These names are globals of the unchanged source definitions compiled below.
 RUNTIME_GLOBALS = dict(
+    bisect_right=bisect_right,
+    islice=islice,
     copy=copy,
     enum=enum,
     gc=gc,
@@ -471,7 +475,7 @@ def build_tests():
         },
         TensorMetadata=namedtuple("TensorMetadata", "device dtype size"),
     )
-    load(
+    dflash_utils = load(
         "vllm.v1.worker.gpu.spec_decode.dflash.utils",
         "vllm/v1/worker/gpu/spec_decode/dflash/utils.py",
         functions=("_load_pp_target_embedding",),
@@ -479,6 +483,9 @@ def build_tests():
         DefaultModelLoader=None,
         PPMissingLayer=type("Missing", (), {}),
     )
+    module(
+        "vllm.model_executor.models.utils"
+    ).PPMissingLayer = dflash_utils.PPMissingLayer
     quant_helpers = load(
         "vllm.model_executor.layers.quantization.utils.flashinfer_utils",
         "vllm/model_executor/layers/quantization/utils/flashinfer_utils.py",
@@ -814,6 +821,58 @@ def build_tests():
             {"GroupCoordinator": comm.GroupCoordinator},
         ),
     ]
+    dsv_dependencies = load(
+        "vllm.models.deepseek_v41.common.pp",
+        "vllm/models/deepseek_v41/common/pp.py",
+        functions=("shared_cache_dependency",),
+        classes={"SharedCacheDependency": (None, None)},
+        dataclass=dataclasses.dataclass,
+    )
+    dsv_model = load(
+        "vllm.models.deepseek_v41.nvidia.model",
+        "vllm/models/deepseek_v41/nvidia/model.py",
+        classes={
+            "DeepseekV4Model": (
+                ["nn.Module", "EagleModelMixin"],
+                ("forward", "_set_aux_hidden_state_layers"),
+            )
+        },
+        EagleModelMixin=interfaces.EagleModelMixin,
+        get_pp_group=None,
+        mhc_post_tilelang=None,
+        hc_collapse_triton=None,
+        **common,
+    )
+    dsv_vl = load(
+        "vllm.models.deepseek_v41.nvidia.vl_model",
+        "vllm/models/deepseek_v41/nvidia/vl_model.py",
+        classes={"DeepseekV41ForCausalLM": (["nn.Module"], ("load_weights",))},
+        MULTIMODAL_REGISTRY=SimpleNamespace(
+            register_processor=lambda *a, **kw: lambda cls: cls
+        ),
+        DeepseekV4VLMultiModalProcessor=None,
+        DeepseekV4VLProcessingInfo=None,
+        DeepseekV4VLDummyInputsBuilder=None,
+        AutoWeightsLoader=None,
+    )
+    specs.extend(
+        [
+            (
+                "tests/models/test_deepseek_v41_pipeline_parallel.py",
+                ("test_", "config", "_model"),
+                {
+                    "dsv41": dsv_model,
+                    "vl_model": dsv_vl,
+                    "shared_cache_dependency": dsv_dependencies.shared_cache_dependency,
+                },
+            ),
+            (
+                "tests/v1/worker/test_dspark_utils.py",
+                ("test_pp_dspark_loads_only",),
+                {},
+            ),
+        ]
+    )
     output = {}
     for index, (path, prefixes, extra) in enumerate(specs):
         tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
@@ -841,7 +900,9 @@ def build_tests():
 
 
 if __name__ == "__main__":
-    scratch = ROOT / ".cache" / "agentvue-cpu-tests"
+    scratch = Path(
+        os.environ.get("AGENTVUE_CPU_TEST_DIR", ROOT / ".cache" / "agentvue-cpu-tests")
+    )
     scratch.mkdir(parents=True, exist_ok=True)
     test_file = scratch / "test_contracts.py"
     test_file.write_text(

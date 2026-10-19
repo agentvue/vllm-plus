@@ -6,6 +6,7 @@ import ctypes
 import mmap
 import os
 import shutil
+import sys
 import tempfile
 import weakref
 from contextlib import ExitStack
@@ -46,6 +47,22 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
+
+
+def allocate_engram_cpu_tensor(rows, dim, dtype):
+    """Use storage-owned chunk registration for multi-GiB Linux host tables."""
+    chunk_bytes = 512 * 1024**2
+    size = rows * dim * torch.empty(0, dtype=dtype, device="cpu").element_size()
+    if sys.platform == "linux" and size >= chunk_bytes:
+        if not hasattr(torch.ops._C, "allocate_registered_cpu_tensor"):
+            raise RuntimeError(
+                "Large Engram CPU offload requires rebuilding the vLLM CUDA "
+                "extension with allocate_registered_cpu_tensor"
+            )
+        return torch.ops._C.allocate_registered_cpu_tensor(
+            [rows, dim], dtype, chunk_bytes
+        )
+    return torch.empty(rows, dim, dtype=dtype, device="cpu", pin_memory=True)
 
 
 def _allocate_huge_page_storage(num_bytes: int) -> torch.Tensor | None:
@@ -344,19 +361,15 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 )
         # Model initialization may be inside a CUDA device context.
         return (
-            torch.empty(
+            allocate_engram_cpu_tensor(
                 self.part_num_embeddings,
                 self.dim,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=True,
+                torch.float8_e4m3fn,
             ),
-            torch.empty(
+            allocate_engram_cpu_tensor(
                 self.part_num_embeddings,
                 self.dim // self.block_size,
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
+                torch.uint8,
             ),
         )
 

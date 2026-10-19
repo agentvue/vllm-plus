@@ -141,3 +141,46 @@ def test_runner_marks_only_replicated_draft_caches(monkeypatch, draft_dcp_size):
 
     assert specs["target"].dcp_sharded
     assert specs["draft"].dcp_sharded == (draft_dcp_size == 4)
+
+
+def test_pp_dspark_loads_only_the_missing_checkpoint_embedding(monkeypatch):
+    from torch import nn
+
+    from vllm.model_executor.models.utils import PPMissingLayer
+    from vllm.v1.worker.gpu.spec_decode.dflash import utils
+
+    monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=5))
+    seen = []
+
+    class Loader:
+        Source = staticmethod(lambda *args: args)
+
+        def __init__(self, config):
+            pass
+
+        def _get_weights_iterator(self, source):
+            yield "vision.weight", torch.full((1,), 7.0)
+            yield "embed.weight", torch.arange(16.0).view(4, 4)
+            raise AssertionError(
+                "The embedding loader must stop after finding its weight"
+            )
+
+    monkeypatch.setattr(utils, "DefaultModelLoader", Loader)
+    weight = nn.Parameter(torch.zeros(2, 4), requires_grad=False)
+    weight.weight_loader = lambda param, value: (
+        seen.append(value.shape),
+        param.copy_(value[:2]),
+    )
+    draft = SimpleNamespace(has_own_embed_tokens=False)
+    inner = SimpleNamespace(embed_tokens=SimpleNamespace(weight=weight))
+    target = SimpleNamespace(embed_tokens=PPMissingLayer())
+    config = SimpleNamespace(
+        load_config=None,
+        model_config=SimpleNamespace(
+            model_weights=None, model="checkpoint", revision="pinned"
+        ),
+    )
+    utils._load_pp_target_embedding(draft, inner, target, config)
+    assert draft.has_own_embed_tokens
+    assert seen == [torch.Size([4, 4])]
+    torch.testing.assert_close(weight, torch.arange(8.0).view(2, 4))

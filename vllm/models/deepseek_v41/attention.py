@@ -442,10 +442,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 )
                 index_k_cache = self._static_forward_context.get(k_cache_prefix)
                 if index_k_cache is None:
-                    raise NotImplementedError(
-                        f"Indexer K cache source {k_cache_prefix} not found on "
-                        "this rank; PP splits inside a v4.1 kv-sharing group "
-                        "are not supported."
+                    index_k_cache = self._make_pp_index_cache(
+                        vllm_config, k_cache_prefix
                     )
             is_candidate_source = layer_id == self.candidate_source_layer
             uses_candidates = 0 <= self.candidate_source_layer < layer_id
@@ -551,7 +549,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
             backend_cls=self.swa_backend_cls,
-            block_size=32,
+            block_size=(
+                64 if current_platform.is_device_capability_family(120) else 32
+            ),
             packed_bytes_per_token=self.swa_bytes_per_token,
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
@@ -584,11 +584,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.is_kv_source
                 and self.compressed_cache_prefix not in self._static_forward_context
             ):
-                raise NotImplementedError(
-                    f"Compressed-KV source {self.compressed_cache_prefix} not "
-                    "found on this rank; PP splits inside a v4.1 kv-sharing "
-                    "group are not supported."
+                self._validate_pp_cache_mirror(vllm_config)
+                from vllm.models.deepseek_v41.nvidia.pp import SharedKVCache
+
+                self.pp_kv_cache = SharedKVCache(
+                    self.compressed_cache_prefix,
+                    self._get_compressed_cache_spec(vllm_config),
+                    self.backend_cls,
+                    compilation_config,
                 )
+                k_cache_prefix = self.compressed_cache_prefix + ".indexer.k_cache"
+                if k_cache_prefix not in self._static_forward_context:
+                    self._make_pp_index_cache(vllm_config, k_cache_prefix)
         else:
             self.compressed_cache_prefix = None
 
@@ -1097,6 +1104,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
+    def _validate_pp_cache_mirror(self, vllm_config: VllmConfig) -> None:
+        if not (
+            current_platform.is_cuda()
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+            and vllm_config.use_v2_model_runner
+        ):
+            raise NotImplementedError(
+                "Cross-stage DeepSeek V4.1 cache sharing requires CUDA, PP and V2"
+            )
+
+    def _make_pp_index_cache(self, vllm_config, prefix):
+        self._validate_pp_cache_mirror(vllm_config)
+        self.pp_index_cache = DeepseekV4IndexerCache(
+            head_dim=_indexer_k_cache_head_dim(
+                vllm_config.model_config.hf_config.index_head_dim,
+                dsa_indexer_uses_fp4(vllm_config),
+            ),
+            dtype=torch.uint8,
+            prefix=prefix,
+            cache_config=vllm_config.cache_config,
+            compress_ratio=self.compress_ratio,
+        )
+        return self.pp_index_cache
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Only kv-source layers own a compressed-KV cache; consumers read the
         # source's cache through the forward context, and cr==0 layers are
@@ -1104,6 +1135,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # DeepseekV4SWACache.
         if not self.is_kv_source:
             return None
+        return self._get_compressed_cache_spec(vllm_config)
+
+    def _get_compressed_cache_spec(self, vllm_config: VllmConfig) -> MLAAttentionSpec:
         # fp8_ds_mla is a UE8M0 block-scaled uint8 layout whose page rounds up
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.
@@ -1151,7 +1185,10 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.dtype = dtype
         self.compress_ratio = compress_ratio
         vllm_config = get_current_vllm_config()
-        self.sparse_logits = vllm_config.attention_config.indexer_sparse_logits
+        self.sparse_logits = (
+            vllm_config.attention_config.indexer_sparse_logits
+            and not current_platform.is_device_capability_family(120)
+        )
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -1175,7 +1212,12 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
         )
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=(
+                64
+                if current_platform.is_device_capability_family(120)
+                and self.compress_ratio == 1
+                else self.cache_config.block_size
+            ),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
@@ -1305,8 +1347,12 @@ class DeepseekV4Indexer(nn.Module):
             and candidate_block_buffer is not None
             and not candidate_write
         )
+        use_sm120_sparse_logits = (
+            use_sparse_logits and current_platform.is_device_capability_family(120)
+        )
+        use_deepgemm_sparse_logits = use_sparse_logits and not use_sm120_sparse_logits
         self.indexer_op: SparseAttnIndexer | SparseMQAIndexer
-        if use_sparse_logits:
+        if use_deepgemm_sparse_logits:
             if not self.use_fp4_kv:
                 raise ValueError(
                     "attention_config.indexer_sparse_logits requires the MXFP4 "
@@ -1324,7 +1370,14 @@ class DeepseekV4Indexer(nn.Module):
                 candidate_block_size,
             )
         else:
-            self.indexer_op = SparseAttnIndexer(
+            indexer_cls = SparseAttnIndexer
+            if use_sm120_sparse_logits:
+                from vllm.models.deepseek_v41.nvidia.fp8_indexer import (
+                    FP8CandidateIndexer,
+                )
+
+                indexer_cls = FP8CandidateIndexer
+            self.indexer_op = indexer_cls(
                 self.k_cache,
                 self.quant_block_size,
                 self.scale_fmt,
@@ -1343,7 +1396,9 @@ class DeepseekV4Indexer(nn.Module):
         # The fused Q kernel writes the per-head weights in the dtype the
         # scoring kernels take, so no cast runs per step.
         self.indexer_weights_dtype = (
-            SparseMQAIndexer.weights_dtype if use_sparse_logits else torch.float32
+            SparseMQAIndexer.weights_dtype
+            if use_deepgemm_sparse_logits
+            else torch.float32
         )
 
     def _produce_k(

@@ -108,6 +108,7 @@ from .ops.mhc import (
     supports_mhc_all_reduce,
     supports_mhc_overlap,
 )
+from .pp import PPSharedState
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -617,6 +618,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if any(layer < 1 or layer > self.config.num_hidden_layers for layer in layers):
+            raise ValueError("Invalid DeepSeek V4.1 auxiliary layer boundaries")
+        super()._set_aux_hidden_state_layers(layers)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -730,6 +738,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        self.pp_shared_state = PPSharedState(
+            vllm_config, config, prefix, self.start_layer, self.end_layer
+        )
         if self.fuse_mhc_all_reduce:
             # A MoE's top-k finalize folds into the next layer's first mHC
             # boundary, which the last local layer lacks and an engram layer
@@ -811,6 +822,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     device=device,
                 ),
             }
+            | self.pp_shared_state.empty_tensors(
+                self.pp_shared_state.incoming,
+                batch_size,
+                self.config.index_topk,
+                getattr(self.config, "candidate_topk_blocks", 0),
+                device,
+            )
         )
 
     def forward(
@@ -829,6 +847,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            self.pp_shared_state.receive(
+                intermediate_tensors,
+                positions,
+                self.topk_indices_buffer,
+                self.candidate_block_buffer,
+            )
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -922,6 +946,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -953,7 +978,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
             )
-            if self.end_layer in self.aux_hidden_state_layers:
+            if (
+                self.end_layer > self.start_layer
+                and self.end_layer in self.aux_hidden_state_layers
+            ):
                 final_aux = hidden_states.mean(dim=1)
                 if self.use_sequence_parallel:
                     final_aux = sp_all_gather(final_aux)[:full_num_tokens]
@@ -963,11 +991,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer[layer_id]
             for layer_id in self.aux_hidden_state_layers
             if layer_id in aux_hidden_by_layer
+            and self.start_layer < layer_id <= self.end_layer
         ]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                | self.pack_local_aux_hidden_states(aux_hidden_states)
+                | self.pp_shared_state.send(
+                    positions, self.topk_indices_buffer, self.candidate_block_buffer
+                )
             )
 
         # MTP needs full HC states; otherwise collapse and normalize locally
@@ -988,8 +1021,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
+        if remote_aux or aux_hidden_states:
+            return hidden_states, remote_aux + aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1307,6 +1340,7 @@ class DeepseekV41LLMForCausalLM(
     DeepseekV4MixtureOfExperts,
 ):
     model_cls = DeepseekV4Model
+    requires_raw_input_tokens = True
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
