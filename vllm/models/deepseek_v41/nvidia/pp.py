@@ -190,6 +190,28 @@ class PPSharedState(nn.Module):
                 dependency.compress_ratio,
                 insert=insert,
             )
+            probe = getattr(self, "diagnostic_probe", None)
+            if insert and probe is not None and probe.active:
+                from .diagnostics import check_received_rows
+
+                replay = torch.empty_like(tensors[key])
+                copy_packed_rows(
+                    cache,
+                    metadata[name].slot_mapping,
+                    positions,
+                    replay,
+                    data,
+                    dependency.compress_ratio,
+                    insert=False,
+                )
+                compared = check_received_rows(
+                    tensors[key],
+                    replay,
+                    metadata[name].slot_mapping,
+                    positions,
+                    dependency.compress_ratio,
+                )
+                probe.emit("cache_insert", name=name, byte_identical_rows=compared)
 
     def receive(self, intermediate, positions, topk, candidates):
         if self.incoming is None:
@@ -199,6 +221,14 @@ class PPSharedState(nn.Module):
         topk[:count].copy_(intermediate[self.TOPK])
         if self.incoming.candidates:
             candidates[:count].copy_(intermediate[self.CANDIDATES])
+        probe = getattr(self, "diagnostic_probe", None)
+        if probe is not None and probe.active:
+            if not torch.equal(topk[:count], intermediate[self.TOPK]):
+                raise RuntimeError("DeepSeek received top-k selection differs")
+            if self.incoming.candidates and not torch.equal(
+                candidates[:count], intermediate[self.CANDIDATES]
+            ):
+                raise RuntimeError("DeepSeek received candidate selection differs")
 
     def send(self, positions, topk, candidates):
         if self.outgoing is None:

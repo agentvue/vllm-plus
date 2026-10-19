@@ -888,6 +888,23 @@ def build_tests():
         DeepseekV4VLDummyInputsBuilder=None,
         AutoWeightsLoader=None,
     )
+    load(
+        "vllm.models.deepseek_v41.nvidia.diagnostics",
+        "vllm/models/deepseek_v41/nvidia/diagnostics.py",
+        functions=(
+            "diagnostic_enabled",
+            "tensor_digest",
+            "tensor_statistics",
+            "check_received_rows",
+            "_tensors",
+        ),
+        classes={"DiagnosticProbe": (None, None)},
+        CHUNK=65536,
+        hashlib=__import__("hashlib"),
+        get_forward_context=None,
+        is_forward_context_available=None,
+        logger=MagicMock(),
+    )
     specs.extend(
         [
             (

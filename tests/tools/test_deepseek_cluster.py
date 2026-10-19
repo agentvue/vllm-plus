@@ -3,6 +3,7 @@
 """Launch profiles preserve hardware exclusions, precision and qualification gates."""
 
 import importlib.util
+import io
 import json
 from collections import Counter
 from pathlib import Path
@@ -181,3 +182,57 @@ def test_checkpoint_preflight_rejects_partial_shard(tmp_path):
     shard.write_bytes(shard.read_bytes()[:-1])
     with pytest.raises(ValueError, match="Incomplete"):
         cluster.checkpoint_info(tmp_path)
+
+
+def test_correctness_launch_keeps_precision_and_bypasses_graphs_and_prefix_cache():
+    env, command = cluster.serve_command(arguments(correctness=True, speculation="off"))
+    assert "--enforce-eager" in command
+    assert "--no-enable-prefix-caching" in command
+    assert "--enable-prefix-caching" not in command
+    assert env["VLLM_DEEPSEEK_V41_DIAGNOSTICS"] == "1"
+    assert command[command.index("--cpu-offload-gb") + 1] == "0"
+
+
+def test_diagnostic_report_detects_pp_corruption_and_missing_peer(tmp_path):
+    path = tmp_path / "server.log"
+    packet = dict(
+        event="packet",
+        boundary=10,
+        tp=0,
+        step=1,
+        tensors={"pre_mix": {"shape": [1, 4], "sha256": "one"}},
+    )
+    records = [
+        packet | {"direction": "send"},
+        packet | {"direction": "receive", "tensors": {"pre_mix": {"sha256": "two"}}},
+        packet | {"direction": "send", "boundary": 30},
+    ]
+    path.write_text("\n".join("prefix DSV41_DIAG " + json.dumps(r) for r in records))
+    report = cluster.diagnostic_report(path)
+    assert len(report["packet_mismatches"]) == 1
+    assert report["packet_comparisons"] == 1
+    assert len(report["unpaired_packets"]) == 1
+    assert not report["quality_qualified"]
+
+
+def test_correctness_requests_capture_raw_tokens_and_stop_on_corruption(
+    tmp_path, monkeypatch
+):
+    requests = []
+    response = {"choices": [{"message": {"reasoning": "\ufffd"}, "token_ids": [1]}]}
+
+    class Opener:
+        def open(self, request, timeout):
+            requests.append(json.loads(request.data))
+            return io.StringIO(json.dumps(response))
+
+    monkeypatch.setattr(cluster.urllib.request, "build_opener", lambda *a: Opener())
+    args = arguments(output=tmp_path / "server.log")
+    cluster.correctness_requests(args)
+    assert len(requests) == 1
+    assert requests[0]["return_token_ids"]
+    assert requests[0]["logprobs"]
+    assert not requests[0]["stream"]
+    artifact = json.loads((tmp_path / "server.responses.json").read_text())
+    assert artifact["responses"][0]["choices"][0]["token_ids"] == [1]
+    assert not artifact["quality_qualified"]

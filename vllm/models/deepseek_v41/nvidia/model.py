@@ -794,6 +794,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self._mtp_hidden_buffer = None
 
+        from .diagnostics import DiagnosticProbe, diagnostic_enabled
+
+        self.diagnostic_probe = None
+        if diagnostic_enabled():
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError(
+                    "DeepSeek correctness diagnostics require --enforce-eager"
+                )
+            self.diagnostic_probe = DiagnosticProbe(
+                self.start_layer, get_tensor_model_parallel_rank()
+            )
+            self.diagnostic_probe.install(self)
+            self.pp_shared_state.diagnostic_probe = self.diagnostic_probe
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -995,13 +1009,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            intermediate_output = IntermediateTensors(
                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
                 | self.pack_local_aux_hidden_states(aux_hidden_states)
                 | self.pp_shared_state.send(
                     positions, self.topk_indices_buffer, self.candidate_block_buffer
                 )
             )
+            probe = getattr(self, "diagnostic_probe", None)
+            if probe is not None:
+                probe.record("stage.output", (hidden_states, pre_mix))
+                probe.packet("send", self.end_layer, intermediate_output.tensors)
+            return intermediate_output
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -1410,13 +1429,20 @@ class DeepseekV41LLMForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        probe = getattr(self.model, "diagnostic_probe", None)
+        if probe is not None:
+            probe.record("logits", logits)
         return logits
 
     def compute_logits_local(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        probe = getattr(self.model, "diagnostic_probe", None)
+        if probe is not None:
+            probe.record("logits.local", logits)
+        return logits
 
     @staticmethod
     def get_model_state_cls():

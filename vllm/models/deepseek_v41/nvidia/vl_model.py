@@ -329,6 +329,11 @@ class DeepseekV41ForCausalLM(
 
         decoder_loaded = self.language_model.load_weights(decoder_weights())
         loaded_params.update(f"language_model.{name}" for name in decoder_loaded)
+        probe = getattr(
+            getattr(self.language_model, "model", None), "diagnostic_probe", None
+        )
+        if probe is not None:
+            probe.capture_weights(self, loaded_params)
         self._weights_finalized = True
         return loaded_params
 
