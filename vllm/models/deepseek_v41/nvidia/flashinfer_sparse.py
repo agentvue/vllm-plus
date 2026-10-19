@@ -602,6 +602,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def _as_sparse_cache(kv_cache: torch.Tensor) -> torch.Tensor:
         if kv_cache.dtype == torch.float8_e4m3fn:
             kv_cache = kv_cache.view(torch.uint8)
+        # Older FlashInfer kernels gather masked entries from reserved block 0.
+        # Keep it finite even after warmup: zero probability cannot mask NaNs.
+        kv_cache[0].zero_()
         if kv_cache.dim() == 4:
             return kv_cache
         return kv_cache.unsqueeze(-2)

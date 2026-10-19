@@ -349,6 +349,30 @@ def test_sparse_reference_reads_footer_scales_and_ignores_poisoned_padding():
     assert not torch.isfinite(torch.tensor([[1.0, 0.0]]) @ bad_values).all()
     assert (backing[:, page_size * 584 :] == 255).all()
 
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferSM120Attention,
+    )
+
+    live = backing[1:].clone()
+    prepared = DeepseekV4FlashInferSM120Attention._as_sparse_cache(cache)
+    assert prepared.data_ptr() == cache.data_ptr()
+    assert not cache[0].any()
+    assert torch.equal(backing[1:], live)
+    assert (backing[0, page_size * 584 :] == 255).all()
+    masked_values = read_packed_v4_rows(cache, torch.tensor([64, 0]))
+    repaired = torch.tensor([[1.0, 0.0]]) @ masked_values
+    torch.testing.assert_close(repaired, values[:1])
+    # Re-poison only two RoPE values, matching the observed 32 * 8 * 2 NaNs.
+    backing[0, 448:452].view(torch.bfloat16).fill_(float("nan"))
+    probabilities = torch.zeros(32, 8, 2)
+    probabilities[..., 0] = 1
+    poisoned = read_packed_v4_rows(cache, torch.tensor([64, 0]))
+    assert (~torch.isfinite(probabilities @ poisoned)).sum().item() == 512
+    DeepseekV4FlashInferSM120Attention._as_sparse_cache(prepared)
+    repaired = probabilities @ read_packed_v4_rows(cache, torch.tensor([64, 0]))
+    assert torch.isfinite(repaired).all()
+    torch.testing.assert_close(repaired, values[0].expand(32, 8, 512))
+
     from vllm.models.deepseek_v41.nvidia.diagnostics import DiagnosticProbe
 
     probe = DiagnosticProbe(stage=0, rank=0)

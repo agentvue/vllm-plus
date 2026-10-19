@@ -72,3 +72,64 @@ def test_cache_updates_preserve_values_scales_and_skipped_slots(
                 src_offset : src_offset + count
             ]
     assert torch.equal(dst_raw.cpu(), expected)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32, 65])
+@pytest.mark.parametrize("capture", [False, True])
+def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capture):
+    """Exercise real FlashInfer decode/prefill with two NaNs in reserved block 0."""
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("requires SM120 sparse MLA")
+    from vllm.models.deepseek_v41.nvidia.diagnostics import sparse_attention_reference
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferSM120Attention,
+    )
+    from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+
+    page, stride = 64, 92160
+    raw = torch.full((2, stride), 255, device="cuda", dtype=torch.uint8)
+    cache = raw.as_strided((2, page, 584), (stride, 584, 1))
+    data = raw[1, : page * 576].view(page, 576)
+    data[:, :448].copy_(
+        torch.ones(page, 448, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+    data[:, 448:].view(torch.bfloat16).fill_(1)
+    raw[1, page * 576 : page * 584].fill_(127)
+    live = cache[1:].clone()
+    q = torch.full((num_tokens, 8, 512), 1 / 64, device="cuda", dtype=torch.bfloat16)
+    indices = torch.full((num_tokens, 128), -1, device="cuda", dtype=torch.int32)
+    indices[:, :2] = torch.tensor([64, 65], device="cuda", dtype=torch.int32)
+    lengths = torch.full((num_tokens,), 2, device="cuda", dtype=torch.int32)
+    sinks = torch.full((8,), -2.0, device="cuda")
+    output = torch.empty_like(q)
+    workspace = torch.zeros(128 * 1024**2, dtype=torch.uint8, device="cuda")
+    scale = 512**-0.5
+
+    def run():
+        cache[0].zero_()
+        raw[0, 448:452].view(torch.bfloat16).fill_(float("nan"))
+        prepared = DeepseekV4FlashInferSM120Attention._as_sparse_cache(cache)
+        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=prepared,
+            workspace_buffer=workspace,
+            sparse_indices=indices,
+            out=output,
+            bmm1_scale=scale,
+            sinks=sinks,
+            kv_layout="NHD",
+            swa_topk_lens=lengths,
+        )
+
+    run()
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(3):
+            graph.replay()
+    reference = sparse_attention_reference(q, cache, indices, lengths, scale, sinks)
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output[:2].float(), reference, rtol=0.03, atol=0.02)
+    assert torch.equal(cache[1:], live)
+    assert (raw[0, page * 584 :] == 255).all()

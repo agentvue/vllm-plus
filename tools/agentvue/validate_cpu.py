@@ -909,6 +909,13 @@ def build_tests():
         is_forward_context_available=None,
         logger=MagicMock(),
     )
+    load(
+        "vllm.models.deepseek_v41.nvidia.flashinfer_sparse",
+        "vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py",
+        classes={
+            "DeepseekV4FlashInferSM120Attention": (["object"], ("_as_sparse_cache",)),
+        },
+    )
     specs.extend(
         [
             (
