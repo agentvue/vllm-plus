@@ -14,6 +14,7 @@ from vllm.models.deepseek_v4.sparse_mla import DeepseekV4SparseMLABackend
 from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLABackend as DeepseekV41SparseMLABackend,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.compressor_utils import (
     CompressedSlotMappingKernel,
@@ -34,7 +35,36 @@ from vllm.v1.kv_cache_interface import (
     compute_layer_kv_cache_shape_bytes,
 )
 from vllm.v1.worker.block_table import get_block_table_width
-from vllm.v1.worker.utils import select_common_block_size
+from vllm.v1.worker.utils import prepare_kernel_block_sizes, select_common_block_size
+
+
+@pytest.mark.parametrize("ratio,block_size", [(1, 64), (2, 128)])
+@pytest.mark.parametrize("manager_factor", [1, 2])
+def test_sm120_indexer_cache_setup_uses_compression_specific_page_size(
+    monkeypatch, ratio, block_size, manager_factor
+):
+    """Profiling and real KV setup must give SM120 indexers 64 stored rows."""
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: family == 120
+    )
+    spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=ratio,
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                kv_cache_spec=spec.copy_with_new_block_size(block_size * manager_factor)
+            )
+        ]
+    )
+    groups = [[SimpleNamespace(backend=DeepseekV41IndexerBackend, kv_cache_spec=spec)]]
+    selected = prepare_kernel_block_sizes(config, groups)
+    assert selected == [block_size]
+    assert compute_layer_kv_cache_shape_bytes(spec, 2, selected[0]) == (2, 1, 64, 132)
 
 
 @pytest.mark.parametrize("max_seqs", [1, 8, 40, 128])

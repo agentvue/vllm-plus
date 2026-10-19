@@ -409,12 +409,22 @@ def build_tests():
         get_hisparse_kv_cache_groups=lambda *args: None,
         **spec_globals,
     )
-    load(
+    multiple_of = load(
+        "vllm.v1.attention.backend",
+        "vllm/v1/attention/backend.py",
+        classes={"MultipleOf": (None, None)},
+    ).MultipleOf
+    worker_utils = load(
         "vllm.v1.worker.utils",
         "vllm/v1/worker/utils.py",
-        functions=("allocate_kv_cache",),
+        functions=(
+            "allocate_kv_cache",
+            "select_common_block_size",
+            "prepare_kernel_block_sizes",
+        ),
         create_kv_cache_views=specs_module.create_kv_cache_views,
         current_platform=SimpleNamespace(is_rocm=lambda: False),
+        MultipleOf=multiple_of,
         **spec_globals,
     )
     config_class = load(
@@ -836,8 +846,15 @@ def build_tests():
             "DeepseekV32IndexerMetadataBuilder": (
                 [],
                 ("_split_indexer_prefill_chunks",),
-            )
+            ),
+            "DeepseekV41IndexerBackend": (
+                [],
+                ("get_supported_kernel_block_sizes", "get_name"),
+            ),
         },
+        current_platform=SimpleNamespace(
+            is_device_capability_family=lambda family: family == 120
+        ),
     )
     dsv_engram = load(
         "vllm.models.deepseek_v41.nvidia.engram",
@@ -875,14 +892,40 @@ def build_tests():
         [
             (
                 "tests/v1/attention/test_indexer_deepseek_v4_slot_mapping.py",
-                ("test_indexer_gather_workspace_covers_scheduled_contexts",),
+                (
+                    "test_indexer_gather_workspace_covers_scheduled_contexts",
+                    "test_sm120_indexer_cache_setup",
+                ),
                 {
+                    "current_platform": mla_indexer.current_platform,
+                    "DeepseekV41IndexerBackend": mla_indexer.DeepseekV41IndexerBackend,
+                    "prepare_kernel_block_sizes": (
+                        worker_utils.prepare_kernel_block_sizes
+                    ),
+                    "MLAAttentionSpec": specs_module.MLAAttentionSpec,
+                    "compute_layer_kv_cache_shape_bytes": (
+                        specs_module.compute_layer_kv_cache_shape_bytes
+                    ),
                     "get_max_prefill_buffer_size": (
                         mla_indexer.get_max_prefill_buffer_size
                     ),
                     "DeepseekV32IndexerMetadataBuilder": (
                         mla_indexer.DeepseekV32IndexerMetadataBuilder
                     ),
+                },
+            ),
+            (
+                "tests/v1/worker/test_gpu_model_runner.py",
+                (
+                    "_make_mock_backend_for_kernel_block_size",
+                    "test_select_common_block_size_prefers_manager_block_size",
+                    "test_select_common_block_size_uses_largest_shared_int",
+                    "test_select_common_block_size_without_active_backends",
+                    "test_select_common_block_size_no_valid_option",
+                ),
+                {
+                    "MultipleOf": multiple_of,
+                    "select_common_block_size": worker_utils.select_common_block_size,
                 },
             ),
             (
