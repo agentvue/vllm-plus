@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV41IndexerBackend,
+    get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     ConvertReqIndexToGlobalIndexKernel,
@@ -34,6 +35,42 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.utils import select_common_block_size
+
+
+@pytest.mark.parametrize("max_seqs", [1, 8, 40, 128])
+@pytest.mark.parametrize("context_parallel", [1, 2])
+def test_indexer_gather_workspace_covers_scheduled_contexts_without_overreservation(
+    max_seqs, context_parallel
+):
+    """A single long request must not reserve forty contexts of FP8 gather rows."""
+    context = 584568
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=context),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=context_parallel,
+            decode_context_parallel_size=context_parallel,
+        ),
+    )
+    rows = get_max_prefill_buffer_size(config)
+    if context_parallel > 1:
+        assert rows == 40 * context
+    elif max_seqs == 1:
+        assert rows * 132 < 80 * 1024**2
+    elif max_seqs == 8:
+        assert rows * 132 < 600 * 1024**2
+    else:
+        assert rows == 40 * context
+    requests = min(max_seqs, 40)
+    chunks = DeepseekV32IndexerMetadataBuilder._split_indexer_prefill_chunks(
+        torch.full((requests,), context, dtype=torch.int32),
+        torch.ones(requests, dtype=torch.int32),
+        rows,
+        256 * 1024**2,
+    )
+    covered = [i for req, _ in chunks for i in range(req.start, req.stop)]
+    assert covered == list(range(requests))
+    assert all((req.stop - req.start) * context <= rows for req, _ in chunks)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

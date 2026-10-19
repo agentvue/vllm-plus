@@ -828,6 +828,17 @@ def build_tests():
         classes={"SharedCacheDependency": (None, None)},
         dataclass=dataclasses.dataclass,
     )
+    mla_indexer = load(
+        "vllm.v1.attention.backends.mla.indexer",
+        "vllm/v1/attention/backends/mla/indexer.py",
+        functions=("get_max_prefill_buffer_size",),
+        classes={
+            "DeepseekV32IndexerMetadataBuilder": (
+                [],
+                ("_split_indexer_prefill_chunks",),
+            )
+        },
+    )
     dsv_engram = load(
         "vllm.models.deepseek_v41.nvidia.engram",
         "vllm/models/deepseek_v41/nvidia/engram.py",
@@ -862,6 +873,27 @@ def build_tests():
     )
     specs.extend(
         [
+            (
+                "tests/v1/attention/test_indexer_deepseek_v4_slot_mapping.py",
+                ("test_indexer_gather_workspace_covers_scheduled_contexts",),
+                {
+                    "get_max_prefill_buffer_size": (
+                        mla_indexer.get_max_prefill_buffer_size
+                    ),
+                    "DeepseekV32IndexerMetadataBuilder": (
+                        mla_indexer.DeepseekV32IndexerMetadataBuilder
+                    ),
+                },
+            ),
+            (
+                "tests/v1/attention/test_sparse_mla_backends.py",
+                ("test_split_indexer_prefill_chunks",),
+                {
+                    "DeepseekV32IndexerMetadataBuilder": (
+                        mla_indexer.DeepseekV32IndexerMetadataBuilder
+                    )
+                },
+            ),
             (
                 "tests/kernels/test_engram.py",
                 ("test_engram_scales_also_use_registered_host_allocator",),
