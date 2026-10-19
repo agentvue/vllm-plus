@@ -19,6 +19,29 @@ from vllm.models.deepseek_v41.nvidia.engram import Engram, ParallelEngramEmbeddi
 from vllm.platforms import current_platform
 
 
+@pytest.mark.parametrize(
+    "rows,dim,dtype",
+    [(48_000_000, 8, torch.uint8), (2, 256, torch.float8_e4m3fn)],
+)
+def test_engram_scales_also_use_registered_host_allocator(
+    monkeypatch, rows, dim, dtype
+):
+    """Scale shards below 512 MiB must avoid the failing CUDA host allocator."""
+    sentinel = object()
+    allocations = []
+
+    def allocate(shape, tensor_dtype, chunk_bytes):
+        allocations.append((shape, tensor_dtype, chunk_bytes))
+        return sentinel
+
+    monkeypatch.setattr(nvidia_engram_ops.sys, "platform", "linux")
+    monkeypatch.setattr(
+        torch.ops._C, "allocate_registered_cpu_tensor", allocate, raising=False
+    )
+    assert nvidia_engram_ops.allocate_engram_cpu_tensor(rows, dim, dtype) is sentinel
+    assert allocations == [([rows, dim], dtype, 512 * 1024**2)]
+
+
 def _reference_engram_post_wkv(
     hidden_states,
     kv,

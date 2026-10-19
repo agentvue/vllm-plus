@@ -828,6 +828,11 @@ def build_tests():
         classes={"SharedCacheDependency": (None, None)},
         dataclass=dataclasses.dataclass,
     )
+    dsv_engram = load(
+        "vllm.models.deepseek_v41.nvidia.engram",
+        "vllm/models/deepseek_v41/nvidia/engram.py",
+        functions=("allocate_engram_cpu_tensor",),
+    )
     dsv_model = load(
         "vllm.models.deepseek_v41.nvidia.model",
         "vllm/models/deepseek_v41/nvidia/model.py",
@@ -857,6 +862,11 @@ def build_tests():
     )
     specs.extend(
         [
+            (
+                "tests/kernels/test_engram.py",
+                ("test_engram_scales_also_use_registered_host_allocator",),
+                {"nvidia_engram_ops": dsv_engram},
+            ),
             (
                 "tests/models/test_deepseek_v41_pipeline_parallel.py",
                 ("test_", "config", "_model"),

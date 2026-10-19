@@ -50,13 +50,12 @@ logger = init_logger(__name__)
 
 
 def allocate_engram_cpu_tensor(rows, dim, dtype):
-    """Use storage-owned chunk registration for multi-GiB Linux host tables."""
+    """Register Linux weights and scales without PyTorch's pinned allocator."""
     chunk_bytes = 512 * 1024**2
-    size = rows * dim * torch.empty(0, dtype=dtype, device="cpu").element_size()
-    if sys.platform == "linux" and size >= chunk_bytes:
+    if sys.platform == "linux":
         if not hasattr(torch.ops._C, "allocate_registered_cpu_tensor"):
             raise RuntimeError(
-                "Large Engram CPU offload requires rebuilding the vLLM CUDA "
+                "Engram CPU offload requires rebuilding the vLLM CUDA "
                 "extension with allocate_registered_cpu_tensor"
             )
         return torch.ops._C.allocate_registered_cpu_tensor(

@@ -25,6 +25,7 @@ def arguments(**overrides):
     return SimpleNamespace(
         **{
             "candidate": "tp8-pp4",
+            "placement": "balanced-engram",
             "profile": "latency",
             "model": cluster.MODEL,
             "port": 8000,
@@ -40,7 +41,7 @@ def arguments(**overrides):
 
 
 @pytest.mark.parametrize("candidate", cluster.CANDIDATES)
-def test_placement_fits_selected_cards_and_separates_host_tables(candidate):
+def test_placement_fits_selected_cards_and_splits_both_host_tables(candidate):
     ranks = cluster.placement(candidate)
     tp, partition = cluster.CANDIDATES[candidate]
     assert len(ranks) == tp * len(partition)
@@ -50,11 +51,16 @@ def test_placement_fits_selected_cards_and_separates_host_tables(candidate):
     )
     start = 0
     for stage, length in enumerate(partition):
-        for layer, rig in [(1, "rig9"), (14, "rig7")]:
+        for layer in (1, 14):
             if start <= layer < start + length:
-                assert set(ranks[stage * tp : (stage + 1) * tp]) == {rig}
+                counts = Counter(ranks[stage * tp : (stage + 1) * tp])
+                assert len(counts) == 2
+                assert set(counts.values()) == {tp // 2}
         start += length
     assert start == 40
+    tables = {1: 101377628352, 14: 101380404048}
+    sizes = cluster.engram_host_bytes(candidate, "balanced-engram", tables)
+    assert all(size < 48 * 1024**3 for size in sizes.values())
 
 
 @pytest.mark.parametrize("profile,seqs", [("latency", "1"), ("concurrency", "8")])
