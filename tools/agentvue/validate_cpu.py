@@ -353,6 +353,7 @@ def build_tests():
         },
         functions=(
             "_apply_alignment_padding",
+            "get_kv_quant_mode",
             "compute_layer_kv_cache_shape_bytes",
             "compute_layout_strides",
             "create_kv_cache_views",
@@ -910,11 +911,24 @@ def build_tests():
         logger=MagicMock(),
     )
     load(
+        "vllm.models.deepseek_v41.attention",
+        "vllm/models/deepseek_v41/attention.py",
+        classes={"DeepseekV4Attention": (["object"], ("_get_compressed_cache_spec",))},
+        current_platform=mla_indexer.current_platform,
+        MLAAttentionSpec=specs_module.MLAAttentionSpec,
+        get_kv_quant_mode=specs_module.get_kv_quant_mode,
+    )
+    load(
         "vllm.models.deepseek_v41.nvidia.flashinfer_sparse",
         "vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py",
         classes={
             "DeepseekV4FlashInferSM120Attention": (["object"], ("_as_sparse_cache",)),
+            "DeepseekV4FlashInferMLASparseBackend": (
+                ["object"],
+                ("get_supported_kernel_block_sizes",),
+            ),
         },
+        current_platform=mla_indexer.current_platform,
     )
     specs.extend(
         [
@@ -923,6 +937,7 @@ def build_tests():
                 (
                     "test_indexer_gather_workspace_covers_scheduled_contexts",
                     "test_sm120_indexer_cache_setup",
+                    "test_sm120_main_cache_and_indexer",
                 ),
                 {
                     "current_platform": mla_indexer.current_platform,
@@ -930,6 +945,7 @@ def build_tests():
                     "prepare_kernel_block_sizes": (
                         worker_utils.prepare_kernel_block_sizes
                     ),
+                    "select_common_block_size": worker_utils.select_common_block_size,
                     "MLAAttentionSpec": specs_module.MLAAttentionSpec,
                     "compute_layer_kv_cache_shape_bytes": (
                         specs_module.compute_layer_kv_cache_shape_bytes

@@ -67,6 +67,78 @@ def test_sm120_indexer_cache_setup_uses_compression_specific_page_size(
     assert compute_layer_kv_cache_shape_bytes(spec, 2, selected[0]) == (2, 1, 64, 132)
 
 
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("capability", [100, 120])
+def test_sm120_main_cache_and_indexer_keep_64_stored_rows(
+    monkeypatch, ratio, capability
+):
+    """Long prefill must not reach FlashInfer with a 128-row ratio-1 page."""
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferMLASparseBackend,
+    )
+    from vllm.v1.kv_cache_interface import (
+        KVCacheLayout,
+        KVCacheTensor,
+        create_kv_cache_views,
+    )
+
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda family: family == capability,
+    )
+    layer = SimpleNamespace(
+        kv_cache_dtype="fp8_ds_mla",
+        head_dim=512,
+        kv_cache_torch_dtype=torch.uint8,
+        compress_ratio=ratio,
+        kv_page_alignment=576,
+        compressed_bytes_per_token=584,
+    )
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=128))
+    spec = DeepseekV4Attention._get_compressed_cache_spec(layer, config)
+    block_size = 64 if capability == 120 and ratio == 1 else 128
+    assert spec.block_size == block_size
+    indexer = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=ratio,
+    )
+    groups = [
+        [
+            SimpleNamespace(
+                backend=DeepseekV4FlashInferMLASparseBackend, kv_cache_spec=spec
+            )
+        ]
+    ]
+    cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+    )
+    assert prepare_kernel_block_sizes(cache_config, groups) == [block_size]
+    assert (
+        select_common_block_size(
+            spec.block_size,
+            [DeepseekV4FlashInferMLASparseBackend, DeepseekV41IndexerBackend],
+            [spec, indexer],
+        )
+        == block_size
+    )
+    tensor = KVCacheTensor(
+        size=2 * spec.page_size_bytes,
+        layers=["attn"],
+        layer_stride=2 * spec.page_size_bytes,
+        block_stride=spec.page_size_bytes,
+    )
+    raw = torch.zeros(tensor.size, dtype=torch.int8)
+    cache = create_kv_cache_views(
+        raw, spec, 2, KVCacheLayout.BLHNC, tensor, kernel_block_size=block_size
+    )[0]
+    assert cache.shape == (2, 1, block_size // ratio, 584)
+
+
 @pytest.mark.parametrize("max_seqs", [1, 8, 40, 128])
 @pytest.mark.parametrize("context_parallel", [1, 2])
 def test_indexer_gather_workspace_covers_scheduled_contexts_without_overreservation(

@@ -1152,7 +1152,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=(
+                64
+                if current_platform.is_device_capability_family(120)
+                and self.compress_ratio == 1
+                else vllm_config.cache_config.block_size
+            ),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,

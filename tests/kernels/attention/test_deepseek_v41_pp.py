@@ -76,7 +76,10 @@ def test_cache_updates_preserve_values_scales_and_skipped_slots(
 
 @pytest.mark.parametrize("num_tokens", [1, 32, 65])
 @pytest.mark.parametrize("capture", [False, True])
-def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capture):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_sm120_masked_kv_cannot_poison_attention_from_null_page(
+    num_tokens, capture, compressed
+):
     """Exercise real FlashInfer decode/prefill with two NaNs in reserved block 0."""
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires SM120 sparse MLA")
@@ -96,9 +99,19 @@ def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capt
     data[:, 448:].view(torch.bfloat16).fill_(1)
     raw[1, page * 576 : page * 584].fill_(127)
     live = cache[1:].clone()
+    extra_raw = raw.clone() if compressed else None
+    extra_cache = (
+        extra_raw.as_strided(cache.shape, cache.stride()) if compressed else None
+    )
     q = torch.full((num_tokens, 8, 512), 1 / 64, device="cuda", dtype=torch.bfloat16)
     indices = torch.full((num_tokens, 128), -1, device="cuda", dtype=torch.int32)
     indices[:, :2] = torch.tensor([64, 65], device="cuda", dtype=torch.int32)
+    extra_indices = None
+    if compressed:
+        extra_indices = torch.full(
+            (num_tokens, 512), -1, device="cuda", dtype=torch.int32
+        )
+        extra_indices[:, :2] = indices[:, :2]
     lengths = torch.full((num_tokens,), 2, device="cuda", dtype=torch.int32)
     sinks = torch.full((8,), -2.0, device="cuda")
     output = torch.empty_like(q)
@@ -109,6 +122,13 @@ def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capt
         cache[0].zero_()
         raw[0, 448:452].view(torch.bfloat16).fill_(float("nan"))
         prepared = DeepseekV4FlashInferSM120Attention._as_sparse_cache(cache)
+        prepared_extra = None
+        if compressed:
+            extra_cache[0].zero_()
+            extra_raw[0, 448:452].view(torch.bfloat16).fill_(float("nan"))
+            prepared_extra = DeepseekV4FlashInferSM120Attention._as_sparse_cache(
+                extra_cache
+            )
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=prepared,
@@ -119,6 +139,9 @@ def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capt
             sinks=sinks,
             kv_layout="NHD",
             swa_topk_lens=lengths,
+            compressed_kv_cache=prepared_extra,
+            extra_sparse_indices=extra_indices,
+            extra_sparse_topk_lens=lengths if compressed else None,
         )
 
     run()
@@ -128,8 +151,15 @@ def test_sm120_masked_kv_cannot_poison_attention_from_null_page(num_tokens, capt
             run()
         for _ in range(3):
             graph.replay()
-    reference = sparse_attention_reference(q, cache, indices, lengths, scale, sinks)
+    reference_indices = (
+        torch.cat((indices[:, :2], extra_indices[:, :2]), -1) if compressed else indices
+    )
+    reference = sparse_attention_reference(
+        q, cache, reference_indices, lengths * (2 if compressed else 1), scale, sinks
+    )
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output[:2].float(), reference, rtol=0.03, atol=0.02)
     assert torch.equal(cache[1:], live)
+    if compressed:
+        assert torch.equal(extra_cache[1:], live)
     assert (raw[0, page * 584 :] == 255).all()
