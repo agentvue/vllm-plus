@@ -7,7 +7,9 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 SHARED_FILES = (
@@ -50,6 +52,53 @@ def file_digest(path):
     if str(path).endswith(".py"):
         data = data.replace(b"\r\n", b"\n")
     return hashlib.sha256(data).hexdigest()
+
+
+def installed_launch_environment(environment, checkout):
+    """Keep Python subprocesses on the installed package rather than the checkout."""
+    environment = dict(environment)
+    environment["PYTHONSAFEPATH"] = "1"
+    if "PYTHONPATH" in environment:
+        checkout = Path(checkout).resolve()
+        entries = [
+            str(Path(entry).resolve())
+            for entry in environment["PYTHONPATH"].split(os.pathsep)
+            if entry and Path(entry).resolve() != checkout
+        ]
+        if entries:
+            environment["PYTHONPATH"] = os.pathsep.join(entries)
+        else:
+            environment.pop("PYTHONPATH")
+    return environment
+
+
+def verify_import_resolution(executable, cwd, environment, installed_root):
+    """Check fresh-interpreter import resolution without importing vLLM or CUDA."""
+    source = (
+        "import importlib.machinery,json,sys; "
+        "spec=importlib.machinery.PathFinder.find_spec('vllm',sys.path); "
+        "print(json.dumps({'origin':spec.origin if spec else None,"
+        "'safe_path':sys.flags.safe_path}))"
+    )
+    result = subprocess.run(
+        [str(executable), "-c", source],
+        cwd=cwd,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    report = json.loads(result.stdout)
+    origin = report["origin"]
+    if (
+        origin is None
+        or Path(origin).resolve().parent != Path(installed_root).resolve()
+    ):
+        raise RuntimeError(
+            f"Python subprocess would import {origin}; expected {installed_root}"
+        )
+    return report
 
 
 def source_manifest(checkout):

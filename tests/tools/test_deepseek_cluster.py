@@ -236,3 +236,26 @@ def test_correctness_requests_capture_raw_tokens_and_stop_on_corruption(
     artifact = json.loads((tmp_path / "server.responses.json").read_text())
     assert artifact["responses"][0]["choices"][0]["token_ids"] == [1]
     assert not artifact["quality_qualified"]
+
+
+def test_checkout_discovery_is_independent_of_cwd(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    (root / "vllm").mkdir(parents=True)
+    (root / "tools/agentvue").mkdir(parents=True)
+    (root / "tools/agentvue/check_deepseek_runtime.py").write_text("")
+    monkeypatch.setattr(cluster, "__file__", str(root / "deepseek_cluster.py"))
+    monkeypatch.chdir(tmp_path)
+    assert cluster.checkout_root() == root
+    monkeypatch.setattr(cluster, "__file__", str(tmp_path / "deepseek_cluster.py"))
+    assert cluster.checkout_root(root) == root
+    with pytest.raises(RuntimeError, match="--checkout"):
+        cluster.checkout_root(tmp_path / "missing")
+
+
+def test_empty_diagnostic_report_exposes_startup_failure(tmp_path):
+    path = tmp_path / "server.log"
+    path.write_text("ModuleNotFoundError: No module named 'vllm._C_stable_libtorch'\n")
+    report = cluster.diagnostic_report(path)
+    assert report["status"] == "no_diagnostics_collected"
+    assert report["records"] == 0
+    assert report["startup_errors"]
