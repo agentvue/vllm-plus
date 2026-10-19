@@ -193,6 +193,20 @@ def test_correctness_launch_keeps_precision_and_bypasses_graphs_and_prefix_cache
     assert command[command.index("--cpu-offload-gb") + 1] == "0"
 
 
+@pytest.mark.parametrize("prefix", ["off", "on"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_serving_separately_controls_graphs_cache_and_worker_diagnostics(prefix, eager):
+    env, command = cluster.serve_command(
+        arguments(speculation="off", prefix_caching=prefix, enforce_eager=eager)
+    )
+    assert ("--enforce-eager" in command) == eager
+    assert ("--enable-prefix-caching" in command) == (prefix == "on")
+    assert ("--no-enable-prefix-caching" in command) == (prefix == "off")
+    for settings in [env, *json.loads(env["VLLM_RAY_NODE_ENV_VARS_JSON"]).values()]:
+        assert settings["VLLM_DEEPSEEK_V41_DIAGNOSTICS"] == "0"
+        assert settings["VLLM_COMPUTE_NANS_IN_LOGITS"] == "0"
+
+
 def test_diagnostic_report_detects_pp_corruption_and_missing_peer(tmp_path):
     path = tmp_path / "server.log"
     packet = dict(
