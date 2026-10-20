@@ -88,6 +88,13 @@ preceding layers. The freed GPU memory goes to the KV cache.
 An explicit `--engram-config` value takes precedence over the environment
 variable.
 
+Checkpoints declaring `quantization_config.engram_embed_quant: "mxfp4"` keep
+their Engram tables packed as two E2M1 values per byte, with one UE8M0 scale per
+32 values. The GPU lookup unpacks only requested rows directly into the BF16
+staging buffer, including for CPU-offloaded tables. A 256-element row takes
+136 bytes including scales, compared with 264 bytes for FP8. Checkpoints
+without this declaration retain the FP8 layout.
+
 To keep the tables resident on GPU instead (e.g. when host memory is
 scarce):
 

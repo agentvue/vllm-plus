@@ -355,6 +355,7 @@ def _check_table(
                 ),
                 scheduler_config=vllm_config.scheduler_config,
                 load_config=load_config,
+                model_config=SimpleNamespace(hf_config=SimpleNamespace()),
             )
             with m.context() as init_patch, torch.device("cuda"):
                 init_patch.setattr(
@@ -690,6 +691,28 @@ def test_engram_tables_too_large_for_shm_are_not_shared(monkeypatch):
     monkeypatch.setattr(engram_ops, "get_engram_dp_size", lambda: 2)
     layout = SimpleNamespace(num_embeddings=(1 << 50,), head_dim=DIM)
     assert not engram_ops.can_share_engram_tables(layout)
+
+
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_shared_capacity_uses_packed_row_width(monkeypatch, packed_fp4):
+    """A shared-memory budget sufficient only for MXFP4 must accept packed tables."""
+    monkeypatch.setattr(engram_ops.os.path, "isdir", lambda path: True)
+    monkeypatch.setattr(engram_ops, "get_engram_dp_size", lambda: 2)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "engram_embed_quant": "mxfp4" if packed_fp4 else "fp8"
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(engram_ops, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(
+        engram_ops.shutil, "disk_usage", lambda path: SimpleNamespace(total=100 * 136)
+    )
+    layout = SimpleNamespace(num_embeddings=(100,), head_dim=256)
+    assert engram_ops.can_share_engram_tables(layout) is packed_fp4
 
 
 @pytest.mark.parametrize(

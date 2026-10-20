@@ -126,6 +126,10 @@ def check_scores(score, remap, dense_short):
 
 
 def main():
+    engram = kernels(
+        "vllm/models/deepseek_v41/common/engram.py", {"_engram_lookup_kernel"}
+    )
+    check_engram_lookup(engram["_engram_lookup_kernel"])
     pp = kernels(
         "vllm/models/deepseek_v41/nvidia/pp.py",
         {"_copy_packed_rows", "copy_packed_rows"},
@@ -147,10 +151,65 @@ def main():
             indexer["candidate_scores"], indexer["_remap_candidates"], dense_short
         )
     print(
-        "Passed: 12 packed-cache updates and 4 FP8 score/remap rows "
-        "in the CPU interpreter."
+        "Passed: 24 Engram lookup cases, 12 packed-cache updates and "
+        "4 FP8 score/remap rows in the CPU interpreter."
     )
     print("GPU compilation, CUDA graphs, accuracy and performance remain unqualified.")
+
+
+def check_engram_lookup(lookup):
+    """Exercise all E2M1 codes, offset buffers, head padding and strided IDs."""
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6])
+    rows, start, heads, local_heads = 64, 17, 5, 3
+    for dim in (64, 256):
+        for packed in (False, True):
+            width = dim // 2 if packed else dim
+            raw = (torch.arange(rows * width + 1) % 256).to(torch.uint8)[1:]
+            if packed:
+                weight = raw.view(rows, width)
+                codes = torch.stack((weight & 15, weight >> 4), -1).flatten(-2).long()
+                values = lut[codes & 7] * torch.where(codes & 8 != 0, -1, 1)
+            else:
+                weight = (raw.float() % 15 - 7).to(torch.float8_e4m3fn).view(rows, dim)
+                values = weight.float()
+            scales = (torch.arange(rows * dim // 32 + 1) % 7 + 124).to(torch.uint8)
+            scales = scales[1:].view(rows, dim // 32)
+            values = (
+                values.view(rows, -1, 32)
+                * torch.exp2(scales.float() - 127).unsqueeze(-1)
+            ).flatten(1)
+            for tokens in (1, 7, 257):
+                hashes = torch.arange(tokens * 2 * heads).view(tokens, 2, heads)
+                ids = ((hashes % (rows + 2)) + start - 1).to(torch.int32)[:, 1]
+                for head_start in (0, 3):
+                    out = torch.empty(tokens, local_heads, dim, dtype=torch.bfloat16)
+                    lookup[(2,)](
+                        weight,
+                        scales,
+                        ids,
+                        out,
+                        start,
+                        start + rows,
+                        tokens * local_heads,
+                        ids.stride(0),
+                        ids.stride(1),
+                        HEAD_START=head_start,
+                        LOCAL_HEADS=local_heads,
+                        TOTAL_HEADS=heads,
+                        DIM=dim,
+                        QUANT_BLOCK=32,
+                        BLOCK_R=16,
+                        GRID=2,
+                        PACKED_FP4=packed,
+                    )
+                    expected = torch.zeros_like(out)
+                    for head in range(local_heads):
+                        if head_start + head >= heads:
+                            continue
+                        local = ids[:, head_start + head].long() - start
+                        valid = (local >= 0) & (local < rows)
+                        expected[valid, head] = values[local[valid]].to(torch.bfloat16)
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

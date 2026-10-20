@@ -130,6 +130,37 @@ def main():
                 ),
             )
         )
+    engram = load(
+        "vllm/models/deepseek_v41/common/engram.py", {"_engram_lookup_kernel"}
+    )
+    for dim in (64, 256):
+        for packed in (False, True):
+            cases.append(
+                (
+                    engram["_engram_lookup_kernel"],
+                    dict(
+                        weight="*u8" if packed else "*fp8e4nv",
+                        scales="*u8",
+                        ids="*i32",
+                        out="*bf16",
+                        vocab_start="i32",
+                        vocab_end="i32",
+                        num_rows="i32",
+                        ids_stride_t="i32",
+                        ids_stride_h="i32",
+                        GRID="i32",
+                    ),
+                    dict(
+                        HEAD_START=3,
+                        LOCAL_HEADS=3,
+                        TOTAL_HEADS=5,
+                        DIM=dim,
+                        QUANT_BLOCK=32,
+                        BLOCK_R=16,
+                        PACKED_FP4=packed,
+                    ),
+                )
+            )
     report = {
         "target": "sm120",
         "triton": triton.__version__,

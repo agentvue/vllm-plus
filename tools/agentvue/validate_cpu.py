@@ -858,10 +858,35 @@ def build_tests():
             is_device_capability_family=lambda family: family == 120
         ),
     )
+    dsv_common_engram = load(
+        "vllm.models.deepseek_v41.common.engram",
+        "vllm/models/deepseek_v41/common/engram.py",
+        functions=("engram_embedding_is_mxfp4", "_engram_head_shard_weight_loader"),
+        classes={"ParallelEngramEmbedding": (["nn.Module"], None)},
+        triton=SimpleNamespace(cdiv=lambda a, b: -(-a // b)),
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_tensor_model_parallel_rank=lambda: 0,
+        set_weight_attrs=None,
+    )
     dsv_engram = load(
         "vllm.models.deepseek_v41.nvidia.engram",
         "vllm/models/deepseek_v41/nvidia/engram.py",
-        functions=("allocate_engram_cpu_tensor",),
+        functions=("allocate_engram_cpu_tensor", "can_share_engram_tables"),
+        classes={
+            "ParallelEngramEmbedding": (["BaseParallelEngramEmbedding"], None),
+            "DPSharedEngramStorage": (None, None),
+        },
+        BaseParallelEngramEmbedding=dsv_common_engram.ParallelEngramEmbedding,
+        get_engram_dp_group=None,
+        _allocate_huge_page_storage=None,
+        get_engram_dp_size=None,
+        get_current_vllm_config_or_none=None,
+        engram_embedding_is_mxfp4=dsv_common_engram.engram_embedding_is_mxfp4,
+        SHM_PATH="/dev/shm",
+        logger=MagicMock(),
+        _engram_head_shard_weight_loader=(
+            dsv_common_engram._engram_head_shard_weight_loader
+        ),
     )
     dsv_model = load(
         "vllm.models.deepseek_v41.nvidia.model",
@@ -983,8 +1008,21 @@ def build_tests():
             ),
             (
                 "tests/kernels/test_engram.py",
-                ("test_engram_scales_also_use_registered_host_allocator",),
-                {"nvidia_engram_ops": dsv_engram},
+                (
+                    "test_engram_scales_also_use_registered_host_allocator",
+                    "test_engram_host_storage_preserves_scale_width",
+                    "test_engram_rejects_unsupported_table_format",
+                ),
+                {
+                    "nvidia_engram_ops": dsv_engram,
+                    "engram_ops": dsv_common_engram,
+                    "ParallelEngramEmbedding": dsv_engram.ParallelEngramEmbedding,
+                },
+            ),
+            (
+                "tests/distributed/test_engram_dp_shard.py",
+                ("test_engram_shared_capacity_uses_packed_row_width",),
+                {"engram_ops": dsv_engram},
             ),
             (
                 "tests/models/test_deepseek_v41_pipeline_parallel.py",

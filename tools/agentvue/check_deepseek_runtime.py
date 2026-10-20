@@ -43,6 +43,7 @@ CHECKPOINT_FILES = (
     "generation_config.json",
     "chat_template.jinja",
     "model.safetensors.index.json",
+    "engram-hybrid.json",
 )
 
 

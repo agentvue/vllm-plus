@@ -42,6 +42,55 @@ def test_engram_scales_also_use_registered_host_allocator(
     assert allocations == [([rows, dim], dtype, 512 * 1024**2)]
 
 
+@pytest.mark.parametrize("storage", ["private", "hugepage", "shared"])
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_host_storage_preserves_scale_width(monkeypatch, storage, packed_fp4):
+    """Packing weights must not halve the number of UE8M0 scale bytes."""
+    layer = ParallelEngramEmbedding.__new__(ParallelEngramEmbedding)
+    torch.nn.Module.__init__(layer)
+    layer.dim, layer.block_size, layer.part_num_embeddings = 64, 32, 5
+    layer.packed_fp4 = packed_fp4
+    layer.row_bytes = 32 if packed_fp4 else 64
+    layer.cpu_offload = True
+    layer.dp_shared_memory = storage == "shared"
+    layer.use_thp = storage == "hugepage"
+    allocations = []
+
+    def allocate_bytes(size):
+        allocations.append(size)
+        return torch.empty(size, dtype=torch.uint8)
+
+    def allocate_tensor(rows, dim, dtype):
+        allocations.append(rows * dim)
+        return torch.empty(rows, dim, dtype=dtype)
+
+    monkeypatch.setattr(
+        nvidia_engram_ops, "allocate_engram_cpu_tensor", allocate_tensor
+    )
+    monkeypatch.setattr(
+        nvidia_engram_ops, "_allocate_huge_page_storage", allocate_bytes
+    )
+    monkeypatch.setattr(nvidia_engram_ops, "get_engram_dp_group", lambda: object())
+    monkeypatch.setattr(
+        nvidia_engram_ops.DPSharedEngramStorage,
+        "_allocate",
+        lambda self, size: allocate_bytes(size),
+    )
+    weight, scales = layer._allocate_weights()
+    assert weight.shape == (5, layer.row_bytes) and scales.shape == (5, 2)
+    assert weight.dtype == (torch.uint8 if packed_fp4 else torch.float8_e4m3fn)
+    assert scales.dtype == torch.uint8
+    assert sum(allocations) == 5 * (layer.row_bytes + 2)
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "int4"])
+def test_engram_rejects_unsupported_table_format(fmt):
+    """Unknown checkpoint layouts must fail before any table allocation."""
+    config = SimpleNamespace(quantization_config={"engram_embed_quant": fmt})
+    with pytest.raises(ValueError, match="engram_embed_quant"):
+        engram_ops.engram_embedding_is_mxfp4(config)
+
+
 def _reference_engram_post_wkv(
     hidden_states,
     kv,
@@ -568,6 +617,8 @@ def _reference_lookup(weight, scale_inv, ids, start, end, block=32):
     mask = (ids < start) | (ids >= end)
     local = (ids - start).masked_fill(mask, 0).long()
     values = torch.nn.functional.embedding(local, weight)
+    if weight.dtype == torch.uint8:
+        values = _decode_e2m1(values)
     scales = torch.nn.functional.embedding(local, scale_inv)
     scales = (scales.to(torch.int32) << 23).view(torch.float32)
     values = values.float().unflatten(-1, (-1, block))
@@ -575,10 +626,19 @@ def _reference_lookup(weight, scale_inv, ids, start, end, block=32):
     return values.masked_fill(mask.unsqueeze(-1), 0)
 
 
-def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
+def _decode_e2m1(packed):
+    """Decode both nibbles through an independent E2M1 lookup table."""
+    lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=packed.device)
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).long().flatten(-2)
+    return lut[codes & 7] * torch.where(codes & 8 != 0, -1, 1)
+
+
+def _make_embedding(cpu_offload, rows=4096, dim=256, block=32, packed_fp4=False):
     layer = ParallelEngramEmbedding.__new__(ParallelEngramEmbedding)
     torch.nn.Module.__init__(layer)
     layer.dim, layer.block_size, layer.tp_size = dim, block, 1
+    layer.packed_fp4 = packed_fp4
+    layer.row_bytes = dim // 2 if packed_fp4 else dim
     layer.dp_size = 1
     layer.n_hash_cols = layer.part_n_hash_cols = 24
     layer.head_start = 0
@@ -595,12 +655,20 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
         {"device": "cpu", "pin_memory": True} if cpu_offload else {"device": "cuda"}
     )
     owned = layer.vocab_end_idx - layer.vocab_start_idx
-    layer.weight = torch.empty(owned, dim, dtype=torch.float8_e4m3fn, **kwargs)
+    layer.weight = torch.empty(
+        owned,
+        layer.row_bytes,
+        dtype=torch.uint8 if packed_fp4 else torch.float8_e4m3fn,
+        **kwargs,
+    )
     layer.weight_scale_inv = torch.empty(
         owned, dim // block, dtype=torch.uint8, **kwargs
     )
     torch.manual_seed(0)
-    layer.weight.copy_((torch.randn(owned, dim) * 4).to(torch.float8_e4m3fn))
+    if packed_fp4:
+        layer.weight.copy_(torch.randint(0, 256, layer.weight.shape, dtype=torch.uint8))
+    else:
+        layer.weight.copy_((torch.randn(owned, dim) * 4).to(torch.float8_e4m3fn))
     layer.weight_scale_inv.copy_(
         torch.randint(120, 134, (owned, dim // block), dtype=torch.uint8)
     )
@@ -627,12 +695,19 @@ def test_engram_rejects_empty_head_shards(tp_size, dp_size, n_heads, monkeypatch
 )
 @pytest.mark.parametrize("cpu_offload", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeypatch):
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_head_shards_reconstruct_checkpoint(
+    cpu_offload, tp_size, packed_fp4, monkeypatch
+):
     """Keep complete buckets and reconstruct head order, including TP padding."""
     head_sizes = (17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73)
     num_rows, dim = sum(head_sizes), 64
     torch.manual_seed(0)
-    weight = torch.randn(num_rows + 7, dim).to(torch.float8_e4m3fn)
+    weight = (
+        torch.randint(0, 256, (num_rows + 7, dim // 2), dtype=torch.uint8)
+        if packed_fp4
+        else torch.randn(num_rows + 7, dim).to(torch.float8_e4m3fn)
+    )
     scales = torch.randint(120, 134, (num_rows + 7, dim // 32), dtype=torch.uint8)
     hashes = torch.empty(7, 2, len(head_sizes), dtype=torch.int32, device="cuda")
     start = 0
@@ -654,7 +729,11 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         )
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
-                num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
+                num_rows + 7,
+                dim,
+                head_sizes,
+                cpu_offload=cpu_offload,
+                packed_fp4=packed_fp4,
             )
         layer.weight.weight_loader(layer.weight, weight)
         layer.weight_scale_inv.weight_loader(
@@ -702,9 +781,10 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-def test_engram_lookup_reuses_jit_across_token_shapes():
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_lookup_reuses_jit_across_token_shapes(packed_fp4):
     """Runtime token counts and launch grids must share one JIT variant."""
-    layer = _make_embedding(cpu_offload=False)
+    layer = _make_embedding(cpu_offload=False, packed_fp4=packed_fp4)
     kernel = engram_ops._engram_lookup_kernel
     kernel_cache = kernel.device_caches[torch.accelerator.current_device_index()][0]
     kernel_cache.clear()
@@ -730,13 +810,14 @@ def test_engram_lookup_reuses_jit_across_token_shapes():
     not current_platform.is_cuda_alike(), reason="CUDA or ROCm required"
 )
 @pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("packed_fp4", [False, True])
 @pytest.mark.parametrize("background", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 7, 256])
-def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens):
+def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens, packed_fp4):
     """The fused gather must be bit-exact with the torch dequant path it
     replaces, from HBM and from pinned host memory alike, and must contribute
     zeros for rows another TP rank owns."""
-    layer = _make_embedding(cpu_offload)
+    layer = _make_embedding(cpu_offload, packed_fp4=packed_fp4)
     cols, rows = 24, layer.part_num_embeddings
     ids = torch.randint(0, rows, (num_tokens, cols), dtype=torch.int32, device="cuda")
     expected = _reference_lookup(
@@ -753,7 +834,8 @@ def test_engram_lookup_matches_torch(cpu_offload, background, num_tokens):
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.parametrize("register_fails", [False, True])
-def test_engram_use_thp_lookup_and_fallback(monkeypatch, register_fails):
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_use_thp_lookup_and_fallback(monkeypatch, register_fails, packed_fp4):
     """Huge-page tables and their pinned fallback both give exact lookup rows."""
     monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
@@ -764,14 +846,14 @@ def test_engram_use_thp_lookup_and_fallback(monkeypatch, register_fails):
     rows, dim = 32769, 64
     with torch.device("cuda"):
         layer = ParallelEngramEmbedding(
-            rows, dim, (rows,), cpu_offload=True, use_thp=True
+            rows, dim, (rows,), cpu_offload=True, use_thp=True, packed_fp4=packed_fp4
         )
     assert layer.weight.is_pinned() and layer.weight_scale_inv.is_pinned()
     same_storage = layer.weight.untyped_storage().data_ptr() == (
         layer.weight_scale_inv.untyped_storage().data_ptr()
     )
     assert same_storage != register_fails
-    layer.weight.data.fill_(2)
+    layer.weight.data.fill_(0x44 if packed_fp4 else 2)
     layer.weight_scale_inv.data.fill_(127)
     ids = torch.tensor(
         [[0], [rows - 1], [-1], [rows]], device="cuda", dtype=torch.int32
@@ -822,7 +904,10 @@ def test_engram_shared_prefetch_stream_waits_per_layer():
 @pytest.mark.parametrize(
     "backend,cpu_offload", [("nvidia", None), ("nvidia", False), ("common", False)]
 )
-def test_engram_constructor_honors_offload(monkeypatch, backend, cpu_offload):
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_constructor_honors_offload(
+    monkeypatch, backend, cpu_offload, packed_fp4
+):
     """Default offload uses pinned storage and the given stream; False uses HBM."""
     from vllm.config import EngramConfig
 
@@ -839,6 +924,13 @@ def test_engram_constructor_honors_offload(monkeypatch, backend, cpu_offload):
         if cpu_offload is None
         else EngramConfig(cpu_offload=cpu_offload),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "engram_embed_quant": "mxfp4" if packed_fp4 else "fp8"
+                }
+            )
+        ),
     )
     offloaded = backend == "nvidia" and vllm_config.engram_config.cpu_offload
     if backend == "common":
@@ -862,7 +954,10 @@ def test_engram_constructor_honors_offload(monkeypatch, backend, cpu_offload):
         assert layer.weight.device.type == "cpu" and layer.weight.is_pinned()
     else:
         assert layer.weight.device.type == "cuda"
-    layer.weight.data.copy_(torch.randn(layer.weight.shape).to(torch.float8_e4m3fn))
+    if packed_fp4:
+        layer.weight.data.random_(0, 256)
+    else:
+        layer.weight.data.copy_(torch.randn(layer.weight.shape).to(torch.float8_e4m3fn))
     layer.weight_scale_inv.data.fill_(127)
     streams = []
     lookup = layer.lookup
@@ -901,9 +996,12 @@ def test_engram_constructor_honors_offload(monkeypatch, backend, cpu_offload):
     [(False, None), (True, None), (True, "producer"), (True, "lookup")],
 )
 @pytest.mark.parametrize("capture", ["eager", "full", "breakable"])
-def test_engram_prepared_rows_survive_graph_breaks(cpu_offload, capture, delay):
+@pytest.mark.parametrize("packed_fp4", [False, True])
+def test_engram_prepared_rows_survive_graph_breaks(
+    cpu_offload, capture, delay, packed_fp4
+):
     """Temporary lookup IDs survive allocator reuse and graph replay."""
-    _run_engram_prepared_rows(cpu_offload, capture, delay=delay)
+    _run_engram_prepared_rows(cpu_offload, capture, delay=delay, packed_fp4=packed_fp4)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
@@ -946,14 +1044,20 @@ def test_engram_prefetch_detects_missing_dependency(monkeypatch, missing_depende
 
 
 def _run_engram_prepared_rows(
-    cpu_offload, capture, tp_size=1, rank=0, use_sequence_parallel=False, delay=None
+    cpu_offload,
+    capture,
+    tp_size=1,
+    rank=0,
+    use_sequence_parallel=False,
+    delay=None,
+    packed_fp4=False,
 ):
     from vllm.compilation.breakable_cudagraph import (
         BreakableCUDAGraphCapture,
         eager_break_during_capture,
     )
 
-    layer = _make_embedding(cpu_offload)
+    layer = _make_embedding(cpu_offload, packed_fp4=packed_fp4)
     if delay == "lookup":
         lookup = layer.lookup
 

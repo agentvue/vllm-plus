@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dp_group,
     get_engram_dp_group,
@@ -36,6 +36,7 @@ from vllm.models.deepseek_v41.common.engram import (
     EngramLayout,
     _engram_head_shard_weight_loader,
     _engram_select_rows,
+    engram_embedding_is_mxfp4,
 )
 from vllm.models.deepseek_v41.common.engram import (
     Engram as BaseEngram,
@@ -162,9 +163,10 @@ def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
             "storing the offloaded tables per rank instead of sharing them."
         )
         return False
-    num_bytes = sum(layout.num_embeddings) * (
-        layout.head_dim + layout.head_dim // block_size
-    )
+    model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+    packed_fp4 = engram_embedding_is_mxfp4(getattr(model_config, "hf_config", None))
+    row_bytes = layout.head_dim // 2 if packed_fp4 else layout.head_dim
+    num_bytes = sum(layout.num_embeddings) * (row_bytes + layout.head_dim // block_size)
     if shutil.disk_usage(SHM_PATH).total < num_bytes:
         logger.warning_once(
             "Sharing Engram tables across DP replicas needs %.1f GiB of %s "
@@ -180,12 +182,20 @@ class DPSharedEngramStorage:
     """Registered host weights shared by a node-local DP group with one writer."""
 
     def __init__(
-        self, num_rows: int, dim: int, block_size: int, group: GroupCoordinator
+        self,
+        num_rows: int,
+        dim: int,
+        block_size: int,
+        group: GroupCoordinator,
+        packed_fp4: bool = False,
     ) -> None:
         self.group = group
-        weight_bytes = num_rows * dim
-        storage = self._allocate(weight_bytes + weight_bytes // block_size)
-        self.weight = storage[:weight_bytes].view(torch.float8_e4m3fn).view(-1, dim)
+        row_bytes = dim // 2 if packed_fp4 else dim
+        weight_bytes = num_rows * row_bytes
+        scale_bytes = num_rows * (dim // block_size)
+        storage = self._allocate(weight_bytes + scale_bytes)
+        dtype = torch.uint8 if packed_fp4 else torch.float8_e4m3fn
+        self.weight = storage[:weight_bytes].view(dtype).view(-1, row_bytes)
         self.weight_scale_inv = storage[weight_bytes:].view(-1, dim // block_size)
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -294,6 +304,7 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        packed_fp4: bool = False,
     ) -> None:
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
@@ -315,7 +326,7 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             raise RuntimeError("Engram CPU offload requires UVA support")
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
-        super().__init__(num_embeddings, dim, head_sizes, block_size)
+        super().__init__(num_embeddings, dim, head_sizes, block_size, packed_fp4)
         if cpu_offload:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
@@ -326,7 +337,9 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                 "%.2f GiB %s",
                 self.part_num_embeddings,
                 dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                self.part_num_embeddings
+                * (self.row_bytes + dim // block_size)
+                / 1024**3,
                 "shared across DP replicas" if dp_shared_memory else "per rank",
             )
 
@@ -340,30 +353,34 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             group = get_engram_dp_group()
             assert group is not None
             storage = DPSharedEngramStorage(
-                self.part_num_embeddings, self.dim, self.block_size, group
+                self.part_num_embeddings,
+                self.dim,
+                self.block_size,
+                group,
+                self.packed_fp4,
             )
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
         if not self.cpu_offload:
             return super()._allocate_weights()
+        dtype = torch.uint8 if self.packed_fp4 else torch.float8_e4m3fn
         if self.use_thp:
-            weight_bytes = self.part_num_embeddings * self.dim
-            packed = _allocate_huge_page_storage(
-                weight_bytes + weight_bytes // self.block_size
-            )
+            weight_bytes = self.part_num_embeddings * self.row_bytes
+            scale_bytes = self.part_num_embeddings * (self.dim // self.block_size)
+            packed = _allocate_huge_page_storage(weight_bytes + scale_bytes)
             if packed is not None:
                 self._packed = packed
                 return (
-                    packed[:weight_bytes].view(torch.float8_e4m3fn).view(-1, self.dim),
+                    packed[:weight_bytes].view(dtype).view(-1, self.row_bytes),
                     packed[weight_bytes:].view(-1, self.dim // self.block_size),
                 )
         # Model initialization may be inside a CUDA device context.
         return (
             allocate_engram_cpu_tensor(
                 self.part_num_embeddings,
-                self.dim,
-                torch.float8_e4m3fn,
+                self.row_bytes,
+                dtype,
             ),
             allocate_engram_cpu_tensor(
                 self.part_num_embeddings,
@@ -453,7 +470,8 @@ class Engram(BaseEngram):
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
@@ -462,6 +480,9 @@ class Engram(BaseEngram):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            packed_fp4=engram_embedding_is_mxfp4(
+                getattr(vllm_config.model_config, "hf_config", None)
+            ),
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
