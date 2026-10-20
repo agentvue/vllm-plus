@@ -69,6 +69,39 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def validate_dspark_expert_tensor(name, weight, config, algo):
+    """Check serialized expert layouts before padded TP loaders accept them."""
+    match = re.search(r"\.experts\.\d+\.(w[123])\.(.+)$", name)
+    if match is None:
+        raise ValueError(f"Unrecognized DSpark expert tensor: {name}")
+    projection, suffix = match.groups()
+    n, k = config.moe_intermediate_size, config.hidden_size
+    dtypes: tuple[torch.dtype, ...]
+    if projection == "w2":
+        n, k = k, n
+    if suffix == "weight":
+        shape, dtypes = (n, k // 2), (torch.int8, torch.uint8)
+    elif suffix in ("scale", "weight_scale"):
+        block = 16 if algo == "NVFP4" else 32
+        shape = (n, k // block)
+        dtypes = (
+            (torch.float8_e4m3fn,)
+            if algo == "NVFP4"
+            else (torch.uint8, torch.float8_e8m0fnu)
+        )
+    elif algo == "NVFP4" and suffix in ("weight_scale_2", "input_scale"):
+        if weight.numel() == 1 and weight.dtype == torch.float32:
+            return
+        raise ValueError(f"Invalid NVFP4 DSpark scalar scale: {name}")
+    else:
+        raise ValueError(f"Unexpected {algo} DSpark expert tensor: {name}")
+    if tuple(weight.shape) != shape or weight.dtype not in dtypes:
+        raise ValueError(
+            f"Invalid {algo} DSpark tensor {name}: expected {shape}, {dtypes}; "
+            f"got {tuple(weight.shape)}, {weight.dtype}"
+        )
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -406,6 +439,22 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         loaded_confidence_head = False
+        expert_coverage: dict[str, set[tuple[int, str]]] = {}
+        resolve_algo = getattr(self.quant_config, "get_moe_quant_algo", None)
+        expert_algos = (
+            [
+                resolve_algo(
+                    f"model.layers.{self.config.num_hidden_layers + i}.ffn.experts",
+                    hf_config=self.config,
+                )
+                for i in range(len(self.model.layers))
+            ]
+            if resolve_algo is not None
+            and getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            else None
+        )
+        if expert_algos is not None:
+            logger.info_once("DSpark expert formats: %s", tuple(expert_algos))
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -418,6 +467,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             if mapped is None:
                 continue
             name = mapped
+            if ".experts." in name and expert_algos is not None:
+                layer_idx = int(name.split(".")[2])
+                validate_dspark_expert_tensor(
+                    name, loaded_weight, self.config, expert_algos[layer_idx]
+                )
             if "confidence_head." in name:
                 loaded_confidence_head = True
 
@@ -458,6 +512,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     )
                     if success:
                         loaded_params.add(name_mapped)
+                        expert_coverage.setdefault(name_mapped, set()).add(
+                            (expert_id, shard_id)
+                        )
                         break
                 continue
 
@@ -490,6 +547,29 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
+        required = {
+            name
+            for name in params_dict
+            if name not in ("model.embed_tokens.weight", "lm_head.weight")
+            and (
+                self.model.confidence_head is not None
+                or not name.startswith("model.confidence_head.")
+            )
+        }
+        missing = required - loaded_params
+        if missing:
+            raise ValueError(
+                f"DSpark checkpoint is missing parameters: {sorted(missing)}"
+            )
+        if not use_mega_moe:
+            for name, coverage in expert_coverage.items():
+                shards = 2 if ".w13_" in name else 1
+                expected = params_dict[name].shape[0] * shards
+                if len(coverage) != expected:
+                    raise ValueError(
+                        f"Incomplete DSpark expert tensor {name}: loaded "
+                        f"{len(coverage)} expert projections, expected {expected}"
+                    )
         self.process_weights_after_loading()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params

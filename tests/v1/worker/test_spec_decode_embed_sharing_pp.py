@@ -84,6 +84,26 @@ def test_mtp_style_drafter_is_left_alone_under_pp(monkeypatch):
     assert draft_inner.embed_tokens is draft_embed
 
 
+@pytest.mark.parametrize("pp_size", [1, 2, 4])
+@pytest.mark.parametrize("target_present", [False, True])
+def test_glm_loaded_embedding_and_distinct_head_survive_sharing(
+    monkeypatch, pp_size, target_present
+):
+    from vllm.models.glm5next.common.mtp import Glm5NextMTP
+
+    monkeypatch.setattr(eagle_utils, "get_pp_group", _fake_pp(pp_size))
+    draft = object.__new__(Glm5NextMTP)
+    nn.Module.__init__(draft)
+    own_embed, own_head = _embed(fill=1), _embed(fill=3)
+    inner = _inner(own_embed)
+    target_embed = _embed(fill=2) if target_present else PPMissingLayer()
+    eagle_utils.maybe_share_target_embed(draft, inner, _inner(target_embed))
+    assert inner.embed_tokens is own_embed
+    assert not eagle_utils._should_share(
+        draft, "has_own_lm_head", own_head, _embed(fill=4)
+    )
+
+
 @pytest.mark.parametrize(
     "method,pp_size,is_last_rank,expected",
     [

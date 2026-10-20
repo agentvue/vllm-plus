@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.worker.gpu import pp_utils
@@ -234,3 +235,37 @@ def test_deferred_drafts_skip_reused_request_slot(monkeypatch):
     outputs = handler.get_prev_sampled_outputs(destination)
     assert outputs["idx_mapping"].tolist() == [3, -1]
     torch.testing.assert_close(destination, expected)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4])
+def test_pipeline_delayed_partial_acceptance_keeps_request_and_step(depth):
+    """Draft ids and acceptance counts must survive the same in-flight delay."""
+    handler = object.__new__(pp_utils.PPHandler)
+    handler.device = torch.device("cpu")
+    handler.main_stream = Mock()
+    handler.req_idx_gen_np = np.zeros(5, dtype=np.int32)
+    mapping = np.array([4, 1], dtype=np.int32)
+    samples = torch.tensor([[10, 11, 12], [20, -1, -1]])
+    drafts = torch.tensor([[30, 31], [40, 41]])
+    slot = pp_utils.PendingRecv(
+        event=Mock(),
+        sampled_tokens=samples,
+        num_sampled=torch.tensor([3, 1], dtype=torch.int32),
+        num_rejected=torch.tensor([0, 2], dtype=torch.int32),
+        idx_mapping=torch.tensor(mapping),
+        idx_mapping_np=mapping,
+        need_sampled_mask=np.ones(2, dtype=bool),
+        gen_at_receive_np=np.zeros(2, dtype=np.int32),
+        draft_tokens=drafts,
+    )
+    handler.queue = deque([None] * depth + [slot])
+    destination = torch.full((5, 2), -1, dtype=torch.int64)
+    for _ in range(depth):
+        assert handler.get_prev_sampled_outputs(destination) is None
+        assert destination.eq(-1).all()
+    result = handler.get_prev_sampled_outputs(destination)
+    assert result["idx_mapping"].tolist() == [4, 1]
+    assert result["num_sampled"].tolist() == [3, 1]
+    assert result["num_rejected"].tolist() == [0, 2]
+    torch.testing.assert_close(result["sampled_tokens"], samples)
+    torch.testing.assert_close(destination[torch.tensor(mapping)], drafts)

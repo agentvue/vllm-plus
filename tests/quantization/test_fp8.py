@@ -55,6 +55,82 @@ MODELS = [
 ]
 
 
+@pytest.mark.parametrize("order", [(0, 40, 1, 42), (42, 1, 40, 0)])
+def test_deepseek_mixed_target_and_dspark_expert_formats(order):
+    """Draft dispatch must not inherit the target's cached NVFP4 decision."""
+    from vllm.models.deepseek_v41.quant_config import resolve_expert_quant_algo
+
+    hf = SimpleNamespace(
+        num_hidden_layers=40,
+        quantization_config={
+            "moe_quant_algo": "NVFP4",
+            "quantized_layers": {"layers.0.ffn.experts": {"quant_algo": "NVFP4"}},
+            "ignore": ["*.attn.*", "mtp.*"],
+        },
+    )
+    for layer in order:
+        actual = resolve_expert_quant_algo(hf, f"model.layers.{layer}.ffn.experts")
+        assert actual == ("NVFP4" if layer < 40 else "MXFP4")
+    assert hf.quantization_config["moe_quant_algo"] == "NVFP4"
+
+
+@pytest.mark.parametrize("prefix", ["mtp.0", "model.layers.40"])
+@pytest.mark.parametrize("algo", ["NVFP4", "MXFP4"])
+def test_deepseek_explicit_draft_format_overrides_conversion_exclusion(prefix, algo):
+    from vllm.models.deepseek_v41.quant_config import resolve_expert_quant_algo
+
+    hf = SimpleNamespace(
+        num_hidden_layers=40,
+        quantization_config={
+            "moe_quant_algo": "NVFP4",
+            "exclude_modules": ["mtp.*"],
+            "quantized_layers": {"mtp.0.ffn.experts": {"quant_algo": algo}},
+        },
+    )
+    assert resolve_expert_quant_algo(hf, prefix + ".ffn.experts") == algo
+
+
+def test_deepseek_original_experts_remain_mxfp4():
+    from vllm.models.deepseek_v41.quant_config import resolve_expert_quant_algo
+
+    hf = SimpleNamespace(num_hidden_layers=40, quantization_config={})
+    assert resolve_expert_quant_algo(hf, "model.layers.0.ffn.experts") == "MXFP4"
+    assert resolve_expert_quant_algo(hf, "model.layers.40.ffn.experts") == "MXFP4"
+
+
+def test_deepseek_dispatch_keeps_nvfp4_target_and_mxfp4_draft(monkeypatch):
+    from vllm.model_executor.layers.quantization import modelopt
+    from vllm.models.deepseek_v41 import quant_config as quant
+
+    hf = SimpleNamespace(
+        num_hidden_layers=40,
+        quantization_config={
+            "moe_quant_algo": "NVFP4",
+            "ignore": ["mtp.*"],
+        },
+    )
+    monkeypatch.setattr(
+        quant,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(hf_config=hf)),
+    )
+    monkeypatch.setattr(quant, "RoutedExperts", SimpleNamespace)
+    monkeypatch.setattr(quant, "is_layer_skipped", lambda **kw: False)
+    monkeypatch.setattr(quant, "Mxfp4MoEMethod", lambda *a: "MXFP4")
+    monkeypatch.setattr(modelopt, "ModelOptNvFp4FusedMoE", lambda **kw: "NVFP4")
+    config = quant.DeepseekV4FP8Config.__new__(quant.DeepseekV4FP8Config)
+    config._resolved_expert_dtype = "fp4"
+    config._resolved_moe_quant_algo = None
+    config.weight_block_size = [32, 32]
+    config.ignored_layers = []
+    config.packed_modules_mapping = {}
+    config._get_nvfp4_config = lambda: None
+    layer = SimpleNamespace(moe_config=None)
+    assert config.get_quant_method(layer, "model.layers.0.ffn.experts") == "NVFP4"
+    assert config.get_quant_method(layer, "model.layers.40.ffn.experts") == "MXFP4"
+    assert config.get_quant_method(layer, "model.layers.1.ffn.experts") == "NVFP4"
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="DSV4.1 requires CUDA")
 @pytest.mark.parametrize("tp_rank", [0, 1])
 @pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])

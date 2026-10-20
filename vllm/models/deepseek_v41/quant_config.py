@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, cast
+
+import regex as re
 
 from vllm.config import get_current_vllm_config
 from vllm.config.quantization import QuantSpec
@@ -23,6 +26,50 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
+
+
+def resolve_expert_quant_algo(hf_config, prefix: str) -> str:
+    """Resolve checkpoint expert formats before runtime prefix remapping."""
+    config = getattr(hf_config, "text_config", hf_config)
+    quant = (
+        getattr(hf_config, "quantization_config", None)
+        or getattr(config, "quantization_config", None)
+        or {}
+    )
+    match = re.search(r"(?:^|\.)(layers|mtp)\.(\d+)\.(.+)$", prefix)
+    checkpoint_name = prefix
+    if match is not None:
+        namespace, index, rest = match.groups()
+        index = int(index)
+        target_layers = getattr(config, "num_hidden_layers", 0)
+        if namespace == "layers" and target_layers and index >= target_layers:
+            namespace, index = "mtp", index - target_layers
+        checkpoint_name = f"{namespace}.{index}.{rest}"
+
+    declarations = quant.get("quantized_layers") or {}
+    matches = [
+        key
+        for key in declarations
+        if checkpoint_name == key or fnmatchcase(checkpoint_name, key)
+    ]
+    if matches:
+        declaration = declarations[max(matches, key=len)]
+        algo = declaration["quant_algo"].upper()
+    else:
+        algo = (quant.get("moe_quant_algo") or "MXFP4").upper()
+        exclusions = [
+            *(quant.get("ignore") or []),
+            *(quant.get("exclude_modules") or []),
+        ]
+        if algo == "NVFP4" and any(
+            fnmatchcase(checkpoint_name, pattern) for pattern in exclusions
+        ):
+            # ModelOpt exclusions retain DeepSeek's serialized MXFP4 experts.
+            algo = "MXFP4"
+    if algo not in ("NVFP4", "MXFP4"):
+        raise ValueError(f"Unsupported expert quantization {algo!r} for {prefix}")
+    return algo
+
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
@@ -102,6 +149,11 @@ class DeepseekV4FP8Config(Fp8Config):
     def moe_quant_algo(self) -> str:
         self._resolve_moe_overrides()
         return self._resolved_moe_quant_algo or ""
+
+    def get_moe_quant_algo(self, prefix: str, *, hf_config=None) -> str:
+        if hf_config is None:
+            hf_config = get_current_vllm_config().model_config.hf_config
+        return resolve_expert_quant_algo(hf_config, prefix)
 
     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
         if self._nvfp4_config is None:
@@ -216,7 +268,7 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
-                if self.moe_quant_algo == "NVFP4":
+                if self.get_moe_quant_algo(prefix) == "NVFP4":
                     from vllm.model_executor.layers.quantization.modelopt import (
                         ModelOptNvFp4FusedMoE,
                     )

@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -210,6 +211,9 @@ class Glm5NextMultiTokenPredictor(nn.Module):
 
 
 class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
+    has_own_embed_tokens = True
+    has_own_lm_head = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -345,10 +349,29 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            elif name.startswith("language_model.model."):
+                name = name.replace("language_model.model.", "model.", 1)
+            if name == "model.embed_tokens.weight":
+                if name not in loaded_params:
+                    param = self.model.embed_tokens.weight
+                    param.weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
+            if name.endswith(".shared_head.head.weight") and name not in params_dict:
+                shared_head = self.model.layers[str(spec_layer)].shared_head
+                with torch.device(self.model.embed_tokens.weight.device):
+                    shared_head.head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        params_dtype=self.model.embed_tokens.weight.dtype,
+                        quant_config=self.quant_config,
+                        prefix=name.removesuffix(".weight"),
+                    )
+                params_dict.update(self.named_parameters())
 
             if _try_load_fp8_indexer_wk(
                 name,
@@ -436,6 +459,8 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             loaded_params.add(name)
 
         loaded_layers: set[int] = set()
+        if "model.embed_tokens.weight" not in loaded_params:
+            raise ValueError("MTP input embedding weights missing from checkpoint.")
         for param_name in loaded_params:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
             if spec_layer is not None:
@@ -450,3 +475,8 @@ class Glm5NextMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                     f"missing from checkpoint."
                 )
         return loaded_params
+
+    def validate_speculative_weights(self) -> None:
+        for layer in self.model.layers.values():
+            if layer.shared_head.head is None:
+                raise ValueError("MTP output head was neither loaded nor shared.")

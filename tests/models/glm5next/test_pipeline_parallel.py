@@ -139,3 +139,92 @@ def test_last_stage_mtp_accepts_hidden_state_intermediate():
         spec_step_idx=2,
     )
     torch.testing.assert_close(actual, hidden + 2)
+
+
+def _mtp_loader(monkeypatch):
+    model = object.__new__(glm_mtp.Glm5NextMTP)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_nextn_predict_layers=1,
+        n_routed_experts=1,
+        mla_nope=False,
+        vocab_size=6,
+        hidden_size=4,
+    )
+    model.num_redundant_experts = 0
+    model.quant_config = None
+    model.model = nn.Module()
+    model.model.mtp_start_layer_idx = 2
+    model.model.num_mtp_layers = 1
+    model.model.embed_tokens = nn.Embedding(6, 4)
+    model.model.embed_tokens.weight.weight_loader = (
+        lambda param, value: param.data.copy_(value)
+    )
+    model.model.embed_tokens.weight.data.fill_(float("nan"))
+    layer = nn.Module()
+    layer.enorm = nn.LayerNorm(4, bias=False)
+    layer.shared_head = nn.Module()
+    layer.shared_head.head = None
+    model.model.layers = nn.ModuleDict({"2": layer})
+    monkeypatch.setattr(
+        glm_mtp, "fused_moe_make_expert_params_mapping", lambda *a, **k: []
+    )
+    monkeypatch.setattr(glm_mtp, "_try_load_fp8_indexer_wk", lambda *a: False)
+    monkeypatch.setattr(glm_mtp, "_try_load_fp8_attn_proj", lambda *a: False)
+    monkeypatch.setattr(glm_mtp, "ParallelLMHead", lambda *a, **k: nn.Embedding(6, 4))
+    return model
+
+
+@pytest.mark.parametrize(
+    "prefix", ["model.", "model.language_model.", "language_model.model."]
+)
+@pytest.mark.parametrize("own_first", [False, True])
+def test_mtp_loads_shared_embedding_and_preserves_explicit_draft(
+    monkeypatch, prefix, own_first
+):
+    model = _mtp_loader(monkeypatch)
+    shared = (prefix + "embed_tokens.weight", torch.ones(6, 4))
+    own = (prefix + "layers.2.embed_tokens.weight", torch.full((6, 4), 2.0))
+    weights = [own, shared] if own_first else [shared, own]
+    weights.append((prefix + "layers.2.enorm.weight", torch.ones(4)))
+    model.load_weights(iter(weights))
+    torch.testing.assert_close(model.model.embed_tokens.weight, own[1])
+
+
+def test_mtp_shared_embedding_fallback_is_loaded_under_pp(monkeypatch):
+    model = _mtp_loader(monkeypatch)
+    weight = torch.arange(24.0).reshape(6, 4)
+    model.load_weights(
+        iter(
+            [
+                ("model.embed_tokens.weight", weight),
+                ("model.layers.2.enorm.weight", torch.ones(4)),
+            ]
+        )
+    )
+    torch.testing.assert_close(model.model.embed_tokens.weight, weight)
+
+
+def test_mtp_rejects_unloaded_embedding_and_head(monkeypatch):
+    model = _mtp_loader(monkeypatch)
+    with pytest.raises(ValueError, match="input embedding"):
+        model.load_weights(iter([("model.layers.2.enorm.weight", torch.ones(4))]))
+    with pytest.raises(ValueError, match="output head"):
+        model.validate_speculative_weights()
+
+
+def test_mtp_accepts_explicit_output_head(monkeypatch):
+    model = _mtp_loader(monkeypatch)
+    head = torch.full((6, 4), 3.0)
+    model.load_weights(
+        iter(
+            [
+                ("model.embed_tokens.weight", torch.ones(6, 4)),
+                ("model.layers.2.enorm.weight", torch.ones(4)),
+                ("model.layers.2.shared_head.head.weight", head),
+            ]
+        )
+    )
+    model.validate_speculative_weights()
+    torch.testing.assert_close(model.model.layers["2"].shared_head.head.weight, head)
