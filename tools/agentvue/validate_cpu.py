@@ -187,6 +187,7 @@ def build_tests():
     glm = load(
         "vllm.models.glm5next.common.model",
         "vllm/models/glm5next/common/model.py",
+        functions=("get_spec_layer_idx_from_weight_name",),
         classes={
             "Glm5NextModel": (
                 ["nn.Module", "EagleModelMixin"],
@@ -211,7 +212,61 @@ def build_tests():
     mtp = load(
         "vllm.models.glm5next.common.mtp",
         "vllm/models/glm5next/common/mtp.py",
-        classes={"Glm5NextMTP": (["nn.Module"], ("forward",))},
+        classes={"Glm5NextMTP": (["nn.Module"], None)},
+        get_spec_layer_idx_from_weight_name=glm.get_spec_layer_idx_from_weight_name,
+        default_weight_loader=lambda param, value: param.data.copy_(value),
+        maybe_remap_kv_scale_name=lambda name, params: name,
+        fused_moe_make_expert_params_mapping=None,
+        _try_load_fp8_indexer_wk=None,
+        _try_load_fp8_attn_proj=None,
+        ParallelLMHead=None,
+        **common,
+    )
+    load(
+        "vllm.models.deepseek_v41.quant_config",
+        "vllm/models/deepseek_v41/quant_config.py",
+        functions=("resolve_expert_quant_algo",),
+        classes={
+            "DeepseekV4FP8Config": (
+                [],
+                (
+                    "get_moe_quant_algo",
+                    "_resolve_moe_overrides",
+                    "moe_quant_algo",
+                    "get_quant_method",
+                    "expert_dtype",
+                ),
+            )
+        },
+        get_current_vllm_config=None,
+        RoutedExperts=None,
+        LinearBase=nn.Linear,
+        is_layer_skipped=None,
+        Mxfp4MoEMethod=None,
+        re=__import__("re"),
+        fnmatchcase=__import__("fnmatch").fnmatchcase,
+    )
+    module(
+        "vllm.model_executor.layers.quantization.modelopt"
+    ).ModelOptNvFp4FusedMoE = None
+    load(
+        "vllm.models.deepseek_v41.nvidia.dspark",
+        "vllm/models/deepseek_v41/nvidia/dspark.py",
+        functions=("validate_dspark_expert_tensor",),
+        classes={
+            "DSparkDeepseekV4ForCausalLM": (
+                ["nn.Module"],
+                (
+                    "load_weights",
+                    "_remap_dspark_name",
+                ),
+            )
+        },
+        re=__import__("re"),
+        _EXPERT_SCALE_RE=__import__("re").compile(r"\.experts\.\d+\.w[123]\.scale$"),
+        fused_moe_make_expert_params_mapping=None,
+        get_tensor_model_parallel_world_size=None,
+        get_tensor_model_parallel_rank=None,
         **common,
     )
     load(
@@ -498,6 +553,14 @@ def build_tests():
     module(
         "vllm.model_executor.models.utils"
     ).PPMissingLayer = dflash_utils.PPMissingLayer
+    eagle_utils = load(
+        "vllm.v1.worker.gpu.spec_decode.eagle.utils",
+        "vllm/v1/worker/gpu/spec_decode/eagle/utils.py",
+        functions=("_should_share", "maybe_share_target_embed"),
+        PPMissingLayer=dflash_utils.PPMissingLayer,
+        BaseLayerWithLoRA=type("LoRA", (), {}),
+        get_pp_group=None,
+    )
     quant_helpers = load(
         "vllm.model_executor.layers.quantization.utils.flashinfer_utils",
         "vllm/model_executor/layers/quantization/utils/flashinfer_utils.py",
@@ -731,7 +794,7 @@ def build_tests():
         ("tests/v1/worker/test_pp_utils.py", ("test_", "_batch"), {"pp_utils": pp}),
         (
             "tests/models/glm5next/test_pipeline_parallel.py",
-            ("test_", "_model"),
+            ("test_", "_model", "_mtp_loader"),
             {
                 "glm_model": glm,
                 "PPHandler": pp.PPHandler,
@@ -1034,8 +1097,41 @@ def build_tests():
                 },
             ),
             (
+                "tests/v1/worker/test_spec_decode_embed_sharing_pp.py",
+                (
+                    "_fake_pp",
+                    "_inner",
+                    "_embed",
+                    "test_glm_loaded",
+                    "test_drafter",
+                    "test_missing_target",
+                    "test_mtp_style",
+                ),
+                {
+                    "VOCAB": 32,
+                    "HIDDEN": 8,
+                    "PPMissingLayer": dflash_utils.PPMissingLayer,
+                    "eagle_utils": eagle_utils,
+                },
+            ),
+            (
                 "tests/v1/worker/test_dspark_utils.py",
-                ("test_pp_dspark_loads_only",),
+                (
+                    "test_pp_dspark_loads_only",
+                    "test_dspark_expert",
+                    "test_dspark_loader",
+                    "_dspark_loader",
+                ),
+                {},
+            ),
+            (
+                "tests/quantization/test_fp8.py",
+                (
+                    "test_deepseek_mixed_target",
+                    "test_deepseek_explicit_draft",
+                    "test_deepseek_original_experts",
+                    "test_deepseek_dispatch",
+                ),
                 {},
             ),
         ]
