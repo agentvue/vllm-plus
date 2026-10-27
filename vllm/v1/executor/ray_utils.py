@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
 
+import vllm.envs as envs
 import vllm.platforms
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group
@@ -68,8 +70,7 @@ try:
         rpc_rank: int
 
         def adjust_rank(self, rank_mapping: dict[int, int]) -> None:
-            """
-            Adjust the rpc_rank based on the given mapping.
+            """Adjust the rpc_rank based on the given mapping.
             It is only used during the initialization of the executor,
             to adjust the rpc_rank of workers after we create all workers.
             """
@@ -176,9 +177,6 @@ try:
                     output = output.get_output()
             return output
 
-        def override_env_vars(self, vars: dict[str, str]):
-            os.environ.update(vars)
-
         def _is_intermediate_tensors(self, output) -> bool:
             return isinstance(output, IntermediateTensors)
 
@@ -237,14 +235,10 @@ def detach_zero_copy_from_model_runner_output(output: "ModelRunnerOutput") -> No
                 token_ids_c, logprobs_c, ranks_c, cu_num_generated_tokens
             )
 
-    if output.routed_experts is not None:
-        routing_data, slot_mapping = output.routed_experts
-        routing_data_c = _copy_if_readonly(routing_data)
-        slot_mapping_c = _copy_if_readonly(slot_mapping)
-        if routing_data_c is not routing_data or slot_mapping_c is not slot_mapping:
-            output.routed_experts = type(output.routed_experts)(
-                routing_data_c, slot_mapping_c
-            )
+    aux_output = output.aux_output_connector_output
+    if aux_output is not None:
+        for request_output in aux_output.values():
+            request_output.rows = _copy_if_readonly(request_output.rows)
 
 
 class FutureWrapper(Future):
@@ -366,8 +360,7 @@ def get_bundles_for_indices(
     bundle_indices: list[int],
     world_size: int,
 ) -> list[tuple[int, str, str]]:
-    """
-    Return GPU bundle indices paired with node IDs and node IPs for
+    """Return GPU bundle indices paired with node IDs and node IPs for
     explicit bundle indices specified via VLLM_RAY_BUNDLE_INDICES.
     """
     assert len(bundle_indices) == world_size, (
@@ -391,11 +384,155 @@ def get_bundles_for_indices(
     ]
 
 
+def parse_ray_ordered_node_ips(value: str) -> list[str]:
+    """Parse an ordered comma-separated Ray node IP list."""
+    return [ip.strip() for ip in value.split(",") if ip.strip()]
+
+
+def parse_ray_node_env_vars_json(value: str) -> dict[str, dict[str, str]]:
+    """Parse a mapping from Ray node IPs to worker environment variables."""
+    if not value.strip():
+        return {}
+
+    try:
+        raw = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise ValueError("VLLM_RAY_NODE_ENV_VARS_JSON must be valid JSON.") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError("VLLM_RAY_NODE_ENV_VARS_JSON must be a JSON object.")
+
+    parsed: dict[str, dict[str, str]] = {}
+    for node_ip, node_env_vars in raw.items():
+        if not isinstance(node_ip, str) or not node_ip:
+            raise ValueError(
+                "VLLM_RAY_NODE_ENV_VARS_JSON keys must be non-empty strings."
+            )
+        if not isinstance(node_env_vars, dict):
+            raise ValueError(
+                "VLLM_RAY_NODE_ENV_VARS_JSON values must be JSON objects, "
+                f"but node {node_ip!r} has {type(node_env_vars).__name__}."
+            )
+
+        parsed_env_vars: dict[str, str] = {}
+        for key, env_value in node_env_vars.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    "VLLM_RAY_NODE_ENV_VARS_JSON variable names must be "
+                    f"non-empty strings, but node {node_ip!r} has {key!r}."
+                )
+            if not isinstance(env_value, str):
+                raise ValueError(
+                    "VLLM_RAY_NODE_ENV_VARS_JSON variable values must be "
+                    f"strings, but node {node_ip!r} variable {key!r} has "
+                    f"{type(env_value).__name__}."
+                )
+            parsed_env_vars[key] = env_value
+        parsed[node_ip] = parsed_env_vars
+
+    return parsed
+
+
+def _validate_ray_ordered_node_ips(
+    ordered_node_ips: list[str],
+    world_size: int,
+    device_str: str,
+) -> None:
+    if len(ordered_node_ips) != world_size:
+        raise ValueError(
+            "VLLM_RAY_ORDERED_NODE_IPS must have the same size as the "
+            f"world size, but got {len(ordered_node_ips)} IPs and "
+            f"world_size={world_size}."
+        )
+
+    alive_nodes_by_ip = {
+        node["NodeManagerAddress"]: node for node in ray.nodes() if node["Alive"]
+    }
+    missing_ips = sorted(set(ordered_node_ips) - set(alive_nodes_by_ip))
+    if missing_ips:
+        raise ValueError(
+            "VLLM_RAY_ORDERED_NODE_IPS contains IPs that are not alive Ray "
+            f"nodes: {missing_ips}. Alive Ray node IPs: "
+            f"{sorted(alive_nodes_by_ip)}."
+        )
+
+    requested_by_ip = Counter(ordered_node_ips)
+    resources_by_node = available_resources_per_node()
+    for node_ip, requested_count in requested_by_ip.items():
+        node_id = alive_nodes_by_ip[node_ip]["NodeID"]
+        node_resources = resources_by_node.get(node_id, {})
+        available_count = node_resources.get(device_str, 0)
+        if requested_count > available_count:
+            raise ValueError(
+                "VLLM_RAY_ORDERED_NODE_IPS requests "
+                f"{requested_count} {device_str} bundle(s) on Ray node IP "
+                f"{node_ip}, but that node only has {available_count} "
+                f"available {device_str}(s). Node resources: {node_resources}."
+            )
+
+
+def get_bundles_for_node_ips(
+    placement_group: "PlacementGroup",
+    ordered_node_ips: list[str],
+    world_size: int,
+) -> list[tuple[int, str, str]]:
+    """Return GPU bundles in the rank order specified by node IP."""
+    if len(ordered_node_ips) != world_size:
+        raise ValueError(
+            "VLLM_RAY_ORDERED_NODE_IPS must have the same size as the "
+            f"world size, but got {len(ordered_node_ips)} IPs and "
+            f"world_size={world_size}."
+        )
+
+    pg_data = placement_group_table(placement_group)
+    pg_bundle_to_node = pg_data["bundles_to_node_id"]
+    node_id_to_ip = {
+        node["NodeID"]: node["NodeManagerAddress"]
+        for node in ray.nodes()
+        if node["Alive"]
+    }
+
+    ray_device_key = current_platform.ray_device_key
+    if not ray_device_key:
+        raise ValueError(
+            f"current platform {current_platform.device_name} does not support ray."
+        )
+
+    bundle_specs = placement_group.bundle_specs
+    assert bundle_specs is not None
+    gpu_bundle_indices = [
+        bundle_idx
+        for bundle_idx, bundle in enumerate(bundle_specs)
+        if bundle.get(ray_device_key)
+    ][:world_size]
+    if len(gpu_bundle_indices) != world_size:
+        raise RuntimeError(
+            "Placement group does not contain enough device bundles for "
+            f"VLLM_RAY_ORDERED_NODE_IPS: got {len(gpu_bundle_indices)} and "
+            f"world_size={world_size}."
+        )
+
+    ordered_bundles: list[tuple[int, str, str]] = []
+    for rank, (bundle_idx, expected_ip) in enumerate(
+        zip(gpu_bundle_indices, ordered_node_ips)
+    ):
+        node_id = pg_bundle_to_node[bundle_idx]
+        actual_ip = node_id_to_ip[node_id]
+        if actual_ip != expected_ip:
+            raise RuntimeError(
+                "VLLM_RAY_ORDERED_NODE_IPS placement mismatch for "
+                f"rank {rank}: bundle {bundle_idx} was placed on "
+                f"{actual_ip}, expected {expected_ip}."
+            )
+        ordered_bundles.append((bundle_idx, node_id, actual_ip))
+
+    return ordered_bundles
+
+
 def get_bundles_sorted_by_node(
     placement_group: "PlacementGroup",
 ) -> list[tuple[int, str, str]]:
-    """
-    Return GPU bundle indices paired with node IDs and node IPs,
+    """Return GPU bundle indices paired with node IDs and node IPs,
     sorted driver-first.
 
     This utility has to be invoked from the driver node.
@@ -536,6 +673,7 @@ def initialize_ray_cluster(
             on the current (driver) node and pin the first PG bundle to it.
             Set to False for executors like RayExecutorV2 where all GPU work
             is delegated to remote Ray actors.
+
     """
     assert_ray_available()
     from vllm.platforms import current_platform
@@ -543,6 +681,9 @@ def initialize_ray_cluster(
     # Disable Ray usage stats collection
     if os.environ.get("RAY_USAGE_STATS_ENABLED", "0") != "1":
         os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+
+    if ray_address is None and envs.VLLM_RAY_ORDERED_NODE_IPS:
+        ray_address = os.environ.get("RAY_ADDRESS", "auto")
 
     # Prevalidate GPU requirements before Ray processing
     if current_platform.is_cuda() and parallel_config.world_size > 1:
@@ -630,6 +771,19 @@ def initialize_ray_cluster(
             {device_str: 1.0} for _ in range(parallel_config.world_size)
         ]
 
+        ordered_node_ips = parse_ray_ordered_node_ips(envs.VLLM_RAY_ORDERED_NODE_IPS)
+        if ordered_node_ips:
+            _validate_ray_ordered_node_ips(
+                ordered_node_ips, parallel_config.world_size, device_str
+            )
+            for bundle, node_ip in zip(placement_group_specs, ordered_node_ips):
+                bundle[f"node:{node_ip}"] = 0.001
+            logger.info(
+                "VLLM_RAY_ORDERED_NODE_IPS is set; pinning Ray worker "
+                "bundles by rank to node IPs: %s",
+                ordered_node_ips,
+            )
+
         # vLLM engine is also a worker to execute model with an accelerator,
         # so it requires to have the device in a current node. Check if
         # the current node has at least one device.
@@ -639,6 +793,12 @@ def initialize_ray_cluster(
         # TODO (jeffreywang): require_gpu_on_driver should be always False
         # after deprecating RayDistributedExecutor.
         if require_gpu_on_driver:
+            if ordered_node_ips and ordered_node_ips[0] != current_ip:
+                raise ValueError(
+                    "When require_gpu_on_driver=True, the first entry in "
+                    "VLLM_RAY_ORDERED_NODE_IPS must be the driver node IP "
+                    f"{current_ip}, but got {ordered_node_ips[0]}."
+                )
             if current_node_resource.get(device_str, 0) < 1:
                 raise ValueError(
                     f"Current node has no {device_str} available. "
@@ -663,29 +823,3 @@ def initialize_ray_cluster(
     )
     # Set the placement group in the parallel config
     parallel_config.placement_group = current_placement_group
-
-
-def get_num_tpu_nodes() -> int:
-    from ray._private.accelerators import TPUAcceleratorManager
-
-    cluster_resources = ray.cluster_resources()
-    total_tpus = int(cluster_resources["TPU"])
-    tpus_per_node = TPUAcceleratorManager.get_current_node_num_accelerators()
-    assert total_tpus % tpus_per_node == 0
-    return total_tpus // tpus_per_node
-
-
-def get_num_nodes_in_placement_group() -> int:
-    pg_table = ray.util.placement_group_table()
-    current_pg = ray.util.get_current_placement_group()
-    num_nodes = 0
-
-    if current_pg:
-        nodes_in_pg = set()
-        for pg_key, pg in pg_table.items():
-            if pg_key == current_pg.id.hex():
-                for _, node in pg["bundles_to_node_id"].items():
-                    nodes_in_pg.add(node)
-        num_nodes = len(nodes_in_pg)
-
-    return num_nodes

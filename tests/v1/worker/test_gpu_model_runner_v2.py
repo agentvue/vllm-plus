@@ -1,20 +1,218 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+@pytest.mark.parametrize("requires_tokens", [False, True])
+@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("dummy_run", [False, True])
+def test_pipeline_forward_preserves_required_raw_tokens(
+    monkeypatch, requires_tokens, mode, dummy_run
+):
+    """PLE must see current tokens even when its layer is on a later stage."""
+    tokens = torch.tensor([20, 21, 22])
+    hidden = torch.arange(24).reshape(3, 8)
+    query_starts = torch.tensor([0, 2, 3])
+    context = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    inputs = SimpleNamespace(
+        input_ids=tokens,
+        positions=torch.arange(3),
+        num_tokens=3,
+        num_tokens_after_padding=3,
+        idx_mapping=torch.tensor([1, 0]),
+        req_ids=["second", "first"],
+        is_padding=torch.zeros(3, dtype=torch.bool),
+    )
+    desc = SimpleNamespace(
+        num_tokens=3,
+        num_reqs=2,
+        cg_mode=mode,
+        num_ubatches=1,
+        max_query_len=None,
+        num_active_loras=0,
+    )
+    runner = Mock()
+    runner.gather_batch_req_state.return_value = (
+        SimpleNamespace(num_tokens=3, has_prefill=True),
+        1,
+    )
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.ubatch_runner = None
+    runner.pcp_manager = None
+    runner.dcp_size = 1
+    runner.uses_inputs_embeds = False
+    runner.is_first_pp_rank = False
+    runner.aux_output_connector = None
+    runner.observability_config.cudagraph_metrics = False
+    runner.block_tables.block_tables = []
+    runner.attn_groups = []
+    runner.prepare_inputs.return_value = inputs
+    runner.prepare_attn.return_value = ({}, {})
+    runner.input_buffers = inputs
+    runner.intermediate_tensors = IntermediateTensors({"hidden_states": hidden.clone()})
+    runner.model_state.prepare_inputs.return_value = {
+        "query_start_loc": query_starts,
+        "ngram_context": context,
+    }
+    runner.model = Mock(
+        requires_raw_input_tokens=requires_tokens,
+        side_effect=RuntimeError("model forward reached"),
+    )
+    runner.cudagraph_manager.run_pw_graph.side_effect = lambda model, kwargs: model(
+        **kwargs
+    )
+    monkeypatch.setattr(
+        model_runner_module, "dispatch_cg_and_sync_dp", lambda *a, **k: (desc, None)
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "InputBatch",
+        SimpleNamespace(make_dummy=lambda *a, **k: inputs),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "set_forward_context",
+        lambda *a, **k: contextlib.nullcontext(),
+    )
+    forward_context = SimpleNamespace(additional_kwargs={})
+    monkeypatch.setattr(
+        model_runner_module, "get_forward_context", lambda: forward_context
+    )
+    monkeypatch.setattr(
+        model_runner_module, "build_slot_mappings_by_layer", lambda *a: {}
+    )
+    scheduler = SimpleNamespace(
+        num_scheduled_tokens={"second": 2, "first": 1}, total_num_scheduled_tokens=3
+    )
+    with pytest.raises(RuntimeError, match="model forward reached"):
+        GPUModelRunner.execute_model(
+            runner,
+            scheduler,
+            IntermediateTensors({"hidden_states": hidden}),
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=dummy_run,
+        )
+
+    kwargs = runner.model.call_args.kwargs
+    assert forward_context.additional_kwargs["is_dummy_run"] == dummy_run
+    assert kwargs["input_ids"] is (tokens if requires_tokens else None)
+    assert kwargs["inputs_embeds"] is None
+    assert kwargs["query_start_loc"] is query_starts
+    assert kwargs["ngram_context"] is context
+    torch.testing.assert_close(kwargs["intermediate_tensors"]["hidden_states"], hidden)
+
+
+def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.max_model_len = 262144
+    runner.is_encoder_decoder = False
+    runner.dcp_size = 1
+    runner.dcp_rank = 0
+    runner.cp_interleave = 1
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
+    parallel_config = SimpleNamespace(
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+    )
+    runner.parallel_config = parallel_config
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+    )
+    runner.jit_warmup_registry = JitWarmupRegistry(runner.vllm_config)
+    runner.model_state = SimpleNamespace(
+        get_additional_cg_support=lambda: (),
+        num_new_sampled_tokens_per_step=1,
+    )
+    runner.speculator = None
+    runner.req_states = []
+    runner.input_buffers = SimpleNamespace(query_start_loc=None)
+    runner.vocab_size = 1
+    runner.max_num_reqs = 1
+    runner.max_num_tokens = 2
+    runner.device = torch.device("cuda")
+
+    raw_spec = CircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    compressed_spec = FullAttentionSpec(
+        block_size=262144,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["raw"],
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=8,
+                    kv_cache_specs={"raw": raw_spec},
+                ),
+            ),
+            KVCacheGroupSpec(layer_names=["compressed"], kv_cache_spec=compressed_spec),
+        ],
+    )
+
+    class FakeAttnCGSupport:
+        def narrow(self, *args):
+            return self
+
+    attn_cg_support = FakeAttnCGSupport()
+    monkeypatch.setattr(
+        model_runner_module,
+        "init_attn_backend",
+        lambda *args, **kwargs: ([], attn_cg_support, [8, 262144]),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "maybe_create_adaptive_verification_manager",
+        lambda **kwargs: None,
+    )
+
+    captured = {}
+
+    class BlockTablesCaptured(Exception):
+        pass
+
+    def capture_block_tables(**kwargs):
+        captured.update(kwargs)
+        raise BlockTablesCaptured
+
+    monkeypatch.setattr(model_runner_module, "BlockTables", capture_block_tables)
+
+    with pytest.raises(BlockTablesCaptured):
+        runner.initialize_kv_cache(kv_cache_config)
+
+    assert captured["max_num_blocks_per_group"] == [1, 1]
+    assert captured["slot_mapping_enabled"] == [False, True]
 
 
 @pytest.mark.parametrize(
@@ -31,7 +229,6 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
     expected: int,
 ):
     """Mamba/GDN block-table rows index global positions, unlike DCP KV."""
-
     max_model_len = 1_048_576
     attention_block_size = 1_536
     mamba_block_size = 16
@@ -121,3 +318,85 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+def _make_capture_runner(captured: bool) -> GPUModelRunner:
+    """Minimal V2 runner for capture_model: fakes everything except the
+    cudagraph_manager's needs_capture decision."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.cudagraph_manager = SimpleNamespace(
+        needs_capture=lambda: captured,
+        capture=lambda *args, **kwargs: None,
+    )
+    runner.lora_config = None
+    runner.maybe_setup_dummy_loras = lambda _cfg: contextlib.nullcontext()
+    runner.speculator = None
+    runner.adaptive_verification = None
+    runner.model = None
+    runner.input_buffers = None
+    runner.pcp_manager = None
+    runner.intermediate_tensors = None
+    runner.block_tables = None
+    runner.attn_groups = None
+    runner.kv_cache_config = None
+    runner.use_aux_hidden_state_outputs = False
+    runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
+    return runner
+
+
+def test_capture_model_locks_workspace_after_capture(monkeypatch):
+    """A workspace resize after capture frees the buffer the captured graphs
+    baked in, so capture_model must lock the workspace before returning
+    (https://github.com/vllm-project/vllm/issues/55336)."""
+    runner = _make_capture_runner(captured=True)
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    runner.capture_model()
+
+    assert lock_calls == ["lock"]
+
+
+def test_capture_model_skips_lock_when_nothing_captured(monkeypatch):
+    """With no graphs to capture (e.g. enforce_eager) there is nothing baked
+    into the workspace, so the early return must not lock it."""
+    runner = _make_capture_runner(captured=False)
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    assert runner.capture_model() == 0
+    assert lock_calls == []
+
+
+def test_capture_model_profile_only_skips_lock(monkeypatch):
+    """The memory-profiling capture pass runs before kernel warmup and the
+    real capture; locking there would stop the warmup from growing the
+    workspace to its scheduler-realistic size."""
+    runner = _make_capture_runner(captured=True)
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+    lock_calls = []
+    monkeypatch.setattr(
+        model_runner_module, "lock_workspace", lambda: lock_calls.append("lock")
+    )
+
+    runner.capture_model(profile_only=True)
+
+    assert lock_calls == []

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
 from tests.kernels.quantization.nvfp4_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
+    convert_swizzled_to_linear,
     dequantize_nvfp4_to_dtype,
 )
 from tests.kernels.utils import torch_moe
@@ -22,8 +25,12 @@ from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
     CutlassExpertsFp4,
 )
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     make_moe_prepare_and_finalize_no_dp_ep,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    prepare_nvfp4_moe_layer_for_fi_or_cutlass,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -34,6 +41,8 @@ if not current_platform.has_device_capability(100):
     )
 
 MNK_FACTORS = [
+    (2, 80, 128),  # Qwen TP8: prepare padded projections before running GEMMs.
+    (2, 160, 128),  # Qwen TP4.
     (2, 1024, 1024),
     (2, 1024, 1536),
     (2, 3072, 1024),
@@ -84,6 +93,40 @@ def test_cutlass_fp4_moe_no_graph(
         assert w1_blockscale is not None
         assert w2_blockscale is not None
 
+        reference_weights = (w1_q, w1_blockscale, w2_q, w2_blockscale)
+        moe_config = make_dummy_moe_config()
+        if n % 64:
+            raw13 = torch.stack(
+                [
+                    convert_swizzled_to_linear(scale, 2 * n, k, 16)
+                    for scale in w1_blockscale
+                ]
+            )
+            raw2 = torch.stack(
+                [
+                    convert_swizzled_to_linear(scale, k, n, 16)[:, : n // 16]
+                    for scale in w2_blockscale
+                ]
+            )
+            layer = SimpleNamespace(
+                activation=mk.MoEActivation.SILU, moe_config=moe_config
+            )
+            w1_q, w1_blockscale, _, _, w2_q, w2_blockscale, _, _ = (
+                prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+                    NvFp4MoeBackend.VLLM_CUTLASS,
+                    layer,
+                    w1_q,
+                    raw13,
+                    1 / w1_gs,
+                    a1_gs[:, None].repeat(1, 2),
+                    w2_q,
+                    raw2,
+                    1 / w2_gs,
+                    a2_gs,
+                    True,
+                )
+            )
+
         quant_config = nvfp4_moe_quant_config(
             g1_alphas=(1 / w1_gs),
             g2_alphas=(1 / w2_gs),
@@ -92,8 +135,6 @@ def test_cutlass_fp4_moe_no_graph(
             w1_scale=w1_blockscale,
             w2_scale=w2_blockscale,
         )
-        moe_config = make_dummy_moe_config()
-
         kernel = mk.FusedMoEKernel(
             maybe_make_prepare_finalize(
                 moe=moe_config,
@@ -120,6 +161,7 @@ def test_cutlass_fp4_moe_no_graph(
         )
 
         # Reference check:
+        w1_q, w1_blockscale, w2_q, w2_blockscale = reference_weights
         a_global_scale = (
             (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a.flatten(), dim=-1)
         ).to(torch.float32)

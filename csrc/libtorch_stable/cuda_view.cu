@@ -8,7 +8,46 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <limits>
+#include <memory>
 #include <optional>
+#include <vector>
+
+#include "registered_host_memory.h"
+
+#if defined(__linux__) && !defined(USE_ROCM)
+torch::stable::Tensor allocate_registered_cpu_tensor(
+    const std::vector<int64_t>& shape, torch::headeronly::ScalarType dtype,
+    int64_t chunk_bytes) {
+  STD_TORCH_CHECK(chunk_bytes > 0, "chunk_bytes must be positive");
+  int64_t elements = 1;
+  for (int64_t size : shape) {
+    STD_TORCH_CHECK(size >= 0, "Negative PLE tensor dimension");
+    STD_TORCH_CHECK(
+        size == 0 || elements <= std::numeric_limits<int64_t>::max() / size,
+        "PLE tensor size overflow");
+    elements *= size;
+  }
+  const torch::stable::Device cpu_dev(torch::headeronly::DeviceType::CPU);
+  auto empty = torch::stable::empty(std::vector<int64_t>{0}, dtype,
+                                    std::nullopt, cpu_dev);
+  size_t element_size = empty.element_size();
+  STD_TORCH_CHECK(
+      elements > 0 && static_cast<uint64_t>(elements) <=
+                          std::numeric_limits<int64_t>::max() / element_size,
+      "Empty or overflowing PLE allocation");
+  auto owner = vllm::RegisteredHostMemory::allocate(elements * element_size,
+                                                    chunk_bytes);
+  std::vector<int64_t> strides(shape.size());
+  int64_t stride = 1;
+  for (size_t dim = shape.size(); dim-- > 0;) {
+    strides[dim] = stride;
+    stride *= shape[dim];
+  }
+  return torch::stable::from_blob(owner->data(), shape, strides, cpu_dev, dtype,
+                                  [owner](void*) {});
+}
+#endif
 
 // This function assumes that `cpu_tensor` is a CPU tensor,
 // and that UVA (Unified Virtual Addressing) is enabled.
@@ -30,7 +69,17 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
       torch::stable::detail::from(std::nullopt)};
   TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(
       "aten::is_pinned", "", is_pinned_stack.data(), TORCH_ABI_VERSION));
-  if (torch::stable::detail::to<bool>(is_pinned_stack[0])) {
+  bool is_pinned = torch::stable::detail::to<bool>(is_pinned_stack[0]);
+#if defined(__linux__) && !defined(USE_ROCM)
+  if (auto owner =
+          vllm::find_registered_host_memory(cpu_tensor.mutable_data_ptr())) {
+    STD_TORCH_CHECK(is_pinned,
+                    "Registered PLE storage is not pinned; "
+                    "a full-table copy is forbidden");
+    owner->track_current_device();
+  }
+#endif
+  if (is_pinned) {
     // If CPU tensor is pinned, directly get the device pointer.
     void* host_ptr = const_cast<void*>(cpu_tensor.mutable_data_ptr());
     void* device_ptr = nullptr;

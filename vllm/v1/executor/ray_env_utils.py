@@ -31,3 +31,33 @@ def update_runtime_env_for_worker_import(runtime_env: dict) -> dict:
             env_vars = runtime_env.setdefault("env_vars", {})
             env_vars[env_var] = os.environ[env_var]
     return runtime_env
+
+
+NODE_LOCAL_PATH_ENV_VARS = (
+    "CUTE_DSL_LIBS",
+    "CUTE_EXPERIMENTAL_DSL_LIBS",
+    "TVM_LIBRARY_PATH",
+    "TVM_IMPORT_PYTHON_PATH",
+    "TL_CUTLASS_PATH",
+    "TL_COMPOSABLE_KERNEL_PATH",
+    "TL_TEMPLATE_PATH",
+)
+
+
+def sanitize_node_local_path_env_vars() -> list[str]:
+    """Remove path entries inherited from another Ray node."""
+    sanitized: list[str] = []
+    for name in NODE_LOCAL_PATH_ENV_VARS:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        paths = [path for path in value.split(os.pathsep) if path]
+        local_paths = [path for path in paths if os.path.exists(path)]
+        if local_paths == paths:
+            continue
+        sanitized.append(name)
+        if local_paths:
+            os.environ[name] = os.pathsep.join(local_paths)
+        else:
+            os.environ.pop(name, None)
+    return sanitized

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Integration tests for RayExecutorV2 at the executor level.
+"""Integration tests for RayExecutorV2 at the executor level.
 Validates executor initialization, placement group support, RPC calls,
 and distributed execution with various TP/PP configurations.
 """
@@ -299,7 +298,6 @@ def test_ray_v2_run_refs_stored_for_monitoring(executor):
 @pytest.mark.parametrize("tp_size, pp_size", [(2, 1), (2, 2)])
 def test_ray_v2_single_node_generation(tp_size, pp_size):
     """End-to-end LLM generation with RayExecutorV2."""
-
     llm = LLM(
         model=MODEL,
         tensor_parallel_size=tp_size,
@@ -407,3 +405,31 @@ def test_ray_v2_single_node_generation_with_pg(tp_size, pp_size):
         llm.llm_engine.model_executor.shutdown()
         del llm
         gc.collect()
+
+
+def test_per_node_runtime_env_isolated_from_other_actors():
+    base = {"env_vars": {"NCCL_NET": "IB"}, "pip": ["example"]}
+    first = RayExecutorV2._build_actor_runtime_env(base, {"NCCL_IB_HCA": "mlx5_0"})
+    second = RayExecutorV2._build_actor_runtime_env(base, {"NCCL_IB_HCA": "mlx5_1"})
+    first["pip"].append("node-local")
+    assert base == {"env_vars": {"NCCL_NET": "IB"}, "pip": ["example"]}
+    assert second == {
+        "env_vars": {"NCCL_NET": "IB", "NCCL_IB_HCA": "mlx5_1"},
+        "pip": ["example"],
+    }
+
+
+def test_driver_local_reader_ranks_need_not_be_a_prefix():
+    assignments = [
+        {"rank": rank, "node_id": node}
+        for rank, node in enumerate(["remote", "driver", "remote", "driver"])
+    ]
+    assert RayExecutorV2._get_driver_local_reader_ranks(assignments, "driver") == [1, 3]
+
+
+def test_node_environment_requires_every_placed_node():
+    assignments = [{"node_ip": "a"}, {"node_ip": "b"}, {"node_ip": "a"}]
+    with pytest.raises(ValueError, match="does not include.*"):
+        RayExecutorV2._validate_node_env_vars(assignments, {"a": {"NCCL_NET": "IB"}})
+    RayExecutorV2._validate_node_env_vars(assignments, {"a": {}, "b": {}})
+    RayExecutorV2._validate_node_env_vars(assignments, {})

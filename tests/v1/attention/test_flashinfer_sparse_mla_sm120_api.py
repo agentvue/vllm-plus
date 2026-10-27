@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -92,3 +93,52 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+def test_sm120_topk_keeps_live_kpool_tail():
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+        FlashInferMLASparseSM120Impl,
+    )
+
+    impl = object.__new__(FlashInferMLASparseSM120Impl)
+    impl.sparse_mla_top_k = 4
+    impl.index_kpool = 4
+    impl._topk_columns = torch.arange(4).unsqueeze(0)
+    indices = torch.tensor([[1, 2, 3, 4, 9, 10, -1], [1, 2, 3, 4, -1, -1, -1]])
+    assert impl._fit_topk_indices(indices).tolist() == [[1, 2, 9, 10], [1, 2, 3, 4]]
+
+
+@pytest.mark.parametrize("num_heads", [4, 9, 128])
+def test_sm120_nope_query_pads_abi_and_crops_head_output(monkeypatch, num_heads):
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
+        FlashInferMLASparseSM120Impl,
+    )
+
+    impl = object.__new__(FlashInferMLASparseSM120Impl)
+    impl.qk_rope_head_dim = 0
+    impl.qk_nope_head_dim = 128
+    impl.kv_lora_rank = 512
+    impl.scale = 1.0
+    impl.kv_scale_format = "arbitrary_fp32"
+    impl._workspace_buffer = torch.zeros(1, dtype=torch.uint8)
+    q = torch.ones(2, num_heads, 512)
+    indices = torch.tensor([[1, 2, -1, -1], [1, 2, 3, -1]], dtype=torch.int32)
+
+    def kernel(**kw):
+        query = kw["query"]
+        assert query.shape == (2, 1, max(8, 1 << (num_heads - 1).bit_length()), 576)
+        assert torch.count_nonzero(query[..., 512:]) == 0
+        assert kw["qk_rope_head_dim"] == 64
+        assert kw["seq_lens"].tolist() == [2, 3]
+        kw["out"].fill_(7)
+        return kw["out"]
+
+    monkeypatch.setattr(
+        fi_utils,
+        "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
+        kernel,
+        raising=False,
+    )
+    output = impl._run_mqa_kernel(q, torch.zeros(1), indices)
+    assert output.shape == (2, num_heads, 512)
+    assert torch.all(output == 7)

@@ -14,6 +14,7 @@ import contextlib
 import gc
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,11 +22,66 @@ import torch
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
+
+
+@pytest.mark.parametrize("requires_tokens", [False, True])
+def test_pipeline_capture_preserves_required_raw_tokens(monkeypatch, requires_tokens):
+    """Capture must bind PLE to the token buffer that replay updates."""
+    tokens = torch.tensor([20, 21, 22])
+    hidden = torch.ones(3, 8)
+    inputs = SimpleNamespace(
+        input_ids=tokens,
+        positions=torch.arange(3),
+        is_padding=torch.zeros(3, dtype=torch.bool),
+    )
+    state = SimpleNamespace(
+        model_config=SimpleNamespace(requires_raw_input_tokens=requires_tokens),
+        prepare_dummy_inputs=lambda *a: {},
+    )
+    manager = cgu.ModelCudaGraphManager.__new__(cgu.ModelCudaGraphManager)
+    manager.use_breakable_cg = False
+    manager.cudagraph_mode = CUDAGraphMode.FULL
+    manager.max_num_reqs = 8
+    manager.dp_size = 1
+    manager.is_first_pp_rank = False
+    manager.is_last_pp_rank = True
+    manager.vllm_config = SimpleNamespace()
+    manager.hidden_states = None
+    model = Mock(return_value=hidden)
+    desc = cgu.BatchExecutionDescriptor(CUDAGraphMode.FULL, 3, 2)
+
+    def capture(_manager, create_forward, _description):
+        create_forward(desc, False)(CUDAGraphMode.FULL)
+
+    monkeypatch.setattr(cgu.CudaGraphManager, "capture", capture)
+    monkeypatch.setattr(cgu, "prepare_inputs_to_capture", lambda *a, **k: (None, {}))
+    monkeypatch.setattr(
+        cgu, "set_forward_context", lambda *a, **k: contextlib.nullcontext()
+    )
+    manager.capture(
+        model,
+        state,
+        inputs,
+        IntermediateTensors({"hidden_states": hidden}),
+        Mock(),
+        [],
+        Mock(),
+    )
+    kwargs = model.call_args.kwargs
+    assert kwargs["inputs_embeds"] is None
+    if requires_tokens:
+        assert kwargs["input_ids"].data_ptr() == tokens.data_ptr()
+        tokens[0] = 42
+        assert kwargs["input_ids"][0] == 42
+    else:
+        assert kwargs["input_ids"] is None
+    torch.testing.assert_close(kwargs["intermediate_tensors"]["hidden_states"], hidden)
 
 
 class _FakeCudaGraphManager:
@@ -67,7 +123,8 @@ def _make_profiling_runner(
     events: list[str] = []
     runner.events = events
 
-    def _capture_model() -> int:
+    def _capture_model(*, profile_only: bool = False) -> int:
+        assert profile_only
         events.append("capture")
         # Simulate the manager's per-FULL-graph memory sampling.
         samples = runner.cudagraph_manager._capture_mem_samples
@@ -183,7 +240,7 @@ def test_profile_cudagraph_memory_tears_down_on_capture_error(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL)
 
-    def _boom() -> int:
+    def _boom(*, profile_only: bool = False) -> int:
         runner.events.append("capture")
         raise RuntimeError("capture failed")
 
@@ -204,7 +261,7 @@ def test_profile_cudagraph_memory_restores_compilation_counters(monkeypatch):
     _patch_module(monkeypatch)
     runner = _make_profiling_runner(CUDAGraphMode.FULL)
 
-    def _capture_model() -> int:
+    def _capture_model(*, profile_only: bool = False) -> int:
         compilation_counter.num_cudagraph_captured += 5
         compilation_counter.num_gpu_runner_capture_triggers += 1
         return 1 << 30
@@ -288,9 +345,9 @@ def test_profile_cudagraph_memory_redirects_wrapper_pools(monkeypatch):
     try:
         capture_model = runner.capture_model
 
-        def _capture_model() -> int:
+        def _capture_model(*, profile_only: bool = False) -> int:
             wrapper.pool_during_capture = wrapper.graph_pool
-            return capture_model()
+            return capture_model(profile_only=profile_only)
 
         runner.capture_model = _capture_model
 
@@ -328,9 +385,9 @@ def test_profile_cudagraph_memory_swaps_and_drops_speculator_managers(monkeypatc
     pools_seen: list[Any] = []
     capture_model = runner.capture_model
 
-    def _capture_model() -> int:
+    def _capture_model(*, profile_only: bool = False) -> int:
         pools_seen.append(runner.speculator.cudagraph_manager.pool)
-        return capture_model()
+        return capture_model(profile_only=profile_only)
 
     runner.capture_model = _capture_model
 
@@ -379,7 +436,7 @@ def test_profile_cudagraph_memory_frees_throwaway_pool(monkeypatch):
         manager.pool = cgu.current_platform.get_global_graph_pool()
         r.speculator = SimpleNamespace(cudagraph_manager=manager)
 
-    def _capture_model() -> int:
+    def _capture_model(*, profile_only: bool = False) -> int:
         for owner in (
             runner.cudagraph_manager,
             runner.speculator.cudagraph_manager,
