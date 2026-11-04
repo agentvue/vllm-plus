@@ -1,0 +1,267 @@
+diff --git a/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py b/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
+index 3f5d574e..2bdd76cf 100644
+--- a/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
++++ b/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
+@@ -20,7 +20,7 @@ All per-step inputs live in model-owned buffers at fixed addresses, which the
+ model state (``model_state.py``) fills before each step, so a decode step
+ replays as one FULL CUDA graph with no host work inside; steps with prompt
+ rows replay the backbone, tower and sampling as PIECEWISE graphs.
+-Pipeline-parallel execution uses eager forwards and samples on the final rank.
++Pipeline-parallel execution captures decode forwards and samples on the final rank.
+ """
+ 
+ from __future__ import annotations
+@@ -169,23 +169,21 @@ class FishOmniBuffers:
+ 
+ 
+ def _reject_unsupported_fish_parallel(vllm_config: VllmConfig) -> None:
+-    """Keep PP on the eager, non-speculative CUDA path with one tensor rank."""
++    """Keep PP on the non-speculative CUDA path with one tensor rank."""
+     parallel_config = vllm_config.parallel_config
+     if parallel_config.pipeline_parallel_size != 1:
+         if (
+             not current_platform.is_cuda()
+             or parallel_config.tensor_parallel_size != 1
+             or parallel_config.data_parallel_size != 1
+-            or not vllm_config.model_config.enforce_eager
+-            or vllm_config.scheduler_config.async_scheduling
+             or vllm_config.speculative_config is not None
+             or parallel_config.enable_expert_parallel
+             or vllm_config.cache_config.enable_prefix_caching
+             or parallel_config.decode_context_parallel_size != 1
+         ):
+             raise NotImplementedError(
+-                "fish_omni PP requires CUDA, TP=1, DP=1, eager execution, "
+-                "synchronous scheduling, and no speculation, EP, or prefix caching"
++                "fish_omni PP requires CUDA, TP=1, DP=1, DCP=1, "
++                "and no speculation, EP, or prefix caching"
+             )
+     if getattr(parallel_config, "prefill_context_parallel_size", 1) != 1:
+         raise NotImplementedError("fish_omni does not support prefill context parallelism")
+@@ -232,8 +230,8 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Suppo
+         self.model = Qwen3_5Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+         if not self.is_first_pp_rank:
+             self.model.embed_tokens = PPMissingLayer()
+-        # PP uses the core GDN implementation and its rank-local recurrent state.
+-        if current_platform.is_cuda_alike() and not self.use_pp:
++        # The optimized GDN implementation operates on each rank's local layers.
++        if current_platform.is_cuda_alike():
+             if vllm_config.speculative_config is None:
+                 # vLLM routes GDN decode through the fused-norm packed wrapper by
+                 # default (VLLM_GDN_DECODE_KERNEL=cuda). Without speculative decoding
+@@ -317,6 +315,10 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Suppo
+             self.buffers.noise = self.sampler.noise(scheduler_config.max_num_seqs, device)
+         # Requests of the step, set by the model state (None: dummy runs).
+         self.num_sample_rows: int | None = None
++        reference_device = getattr(config, "fish_omni_reference_device", "cuda")
++        if reference_device not in ("cuda", "cpu"):
++            raise ValueError("fish_omni_reference_device must be 'cuda' or 'cpu'")
++        self.reference_device = device if reference_device == "cuda" else torch.device("cpu")
+         self._speaker_cache = get_speaker_cache()
+         self._tokenizer = None
+ 
+@@ -631,8 +633,8 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Suppo
+             layer.finalize_weights()
+         # Load the reference-audio encoder now, so the first voice-clone request
+         # does not pay for it.
+-        if not self.use_pp:
+-            _load_dac_codec(self.model_path, device=self.lm_head.device, dtype=torch.float32)
++        if self.is_first_pp_rank:
++            _load_dac_codec(self.model_path, device=self.reference_device, dtype=torch.float32)
+         return loaded
+ 
+     def _tower_param_name(self, name: str) -> tuple[str, str] | None:
+diff --git a/vllm_omni/model_executor/models/fish_omni/kernels.py b/vllm_omni/model_executor/models/fish_omni/kernels.py
+index 9dce1af3..5151db7e 100644
+--- a/vllm_omni/model_executor/models/fish_omni/kernels.py
++++ b/vllm_omni/model_executor/models/fish_omni/kernels.py
+@@ -16,6 +16,53 @@ import torch
+ from vllm.triton_utils import tl, triton
+ 
+ 
++@triton.jit(do_not_specialize_on_alignment=["slots_ptr", "frames_ptr", "num_sampled_ptr"])
++def _consume_pp_frames_kernel(
++    slots_ptr,
++    frames_ptr,
++    num_sampled_ptr,
++    slot_frames_ptr,
++    history_ptr,
++    generated_ptr,
++    WIDTH: tl.constexpr,
++    MAX_FRAMES: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    slot = tl.load(slots_ptr + row).to(tl.int64)
++    valid = (slot >= 0) & (tl.load(num_sampled_ptr + row) > 0)
++    if valid:
++        count = tl.load(generated_ptr + slot).to(tl.int64)
++        index = tl.minimum(count, MAX_FRAMES - 1)
++        offsets = tl.arange(0, BLOCK)
++        values = tl.load(frames_ptr + row * WIDTH + offsets, offsets < WIDTH, other=0)
++        tl.store(slot_frames_ptr + slot * WIDTH + offsets, values, offsets < WIDTH)
++        tl.store(
++            history_ptr + (slot * MAX_FRAMES + index) * (WIDTH - 1) + offsets - 1,
++            values,
++            (offsets > 0) & (offsets < WIDTH),
++        )
++        tl.store(generated_ptr + slot, count + 1)
++
++
++def consume_pp_frames_(slots, frames, num_sampled, slot_frames, history, generated) -> None:
++    """Update unique live slots and their code history without dynamic indexing."""
++    if slots.numel() == 0:
++        return
++    _consume_pp_frames_kernel[(slots.numel(),)](
++        slots,
++        frames,
++        num_sampled,
++        slot_frames,
++        history,
++        generated,
++        WIDTH=frames.shape[1],
++        MAX_FRAMES=history.shape[1],
++        BLOCK=triton.next_power_of_2(frames.shape[1]),
++        num_warps=1,
++    )
++
++
+ @triton.jit
+ def _gemma_norm_row(x, w_ptr, offs, mask, n: tl.constexpr, eps):
+     var = tl.sum(x * x, axis=0) / n
+diff --git a/vllm_omni/model_executor/models/fish_omni/model_state.py b/vllm_omni/model_executor/models/fish_omni/model_state.py
+index 6d9a07ba..ad2a9317 100644
+--- a/vllm_omni/model_executor/models/fish_omni/model_state.py
++++ b/vllm_omni/model_executor/models/fish_omni/model_state.py
+@@ -35,6 +35,8 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
+ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+ 
++from .kernels import consume_pp_frames_
++
+ logger = init_logger(__name__)
+ 
+ _MASK64 = (1 << 64) - 1
+@@ -135,6 +137,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+         self._last_decode_key: tuple[int, ...] | None = None
+         if not is_uva_available():
+             logger.warning("fish_omni: UVA is unavailable; per-step uploads use staged copies")
++        if self.use_pp and self.pp_group.is_first_rank:
++            # Compile both the normal int32 slot mapping and masked int64
++            # mappings before startup enables vLLM's runtime JIT monitor.
++            counts = torch.zeros(self.max_num_seqs, dtype=torch.int32, device=device)
++            for dtype in (torch.int32, torch.int64):
++                slots = torch.zeros(self.max_num_seqs, dtype=dtype, device=device)
++                self.consume_pp_frames(slots, self.buffers.sampled_frames, counts)
+ 
+     # ------------------------------------------------------------------
+     # Requests
+@@ -151,13 +160,10 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+         """Apply delayed feedback only to live slots which actually sampled a frame."""
+         if not self.pp_group.is_first_rank:
+             return
+-        valid = (slots >= 0) & (num_sampled > 0)
+-        slots, frames = slots[valid].long(), frames[valid]
+         buffers = self.buffers
+-        buffers.slot_frames.index_copy_(0, slots, frames)
+-        counts = buffers.slot_generated[slots]
+-        buffers.slot_history[slots, counts.clamp(max=buffers.slot_history.shape[1] - 1)] = frames[:, 1:].to(torch.int16)
+-        buffers.slot_generated[slots] = counts + 1
++        consume_pp_frames_(
++            slots, frames, num_sampled, buffers.slot_frames, buffers.slot_history, buffers.slot_generated
++        )
+ 
+     def sampled_pp_frames(self, input_batch) -> torch.Tensor:
+         return self.buffers.sampled_frames[: input_batch.num_reqs]
+@@ -173,7 +179,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
+         else:
+             rows = self.model.build_frames(
+-                self._request_info(req_index), torch.device("cpu") if self.use_pp else self.device
++                self._request_info(req_index), self.model.reference_device
+             )
+         if rows.shape[0] != len(prompt_ids):
+             raise ValueError(
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_encoder.py b/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
+index 855517d6..04feac66 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
+@@ -56,9 +56,10 @@ def _load_dac_codec(
+     if "generator" in state_dict:
+         state_dict = state_dict["generator"]
+     codec.load_state_dict(state_dict, strict=False)
+-    # Encoder path only uses encoder + quantizer.forward(); prune the
+-    # decoder before moving to device to avoid unnecessary GPU allocation.
++    # Indices-only encoding needs no waveform or quantized-feature reconstruction.
+     codec.decoder = None
++    codec.quantizer.post_module = None
++    codec.quantizer.upsample = None
+     codec = codec.to(device=device, dtype=dtype)
+     codec.eval()
+ 
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py b/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
+index 4bc8483d..7314c9ab 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
+@@ -320,8 +320,7 @@ class DAC(nn.Module):
+             audio_lengths = torch.LongTensor([length + right_pad]).to(audio_data.device)
+ 
+         z = self.encoder(audio_data)
+-        vq_results = self.quantizer(z, n_quantizers, **kwargs)
+-        indices = vq_results.codes
++        indices = self.quantizer.encode(z, n_quantizers, **kwargs)
+         indices_lens = torch.ceil(audio_lengths / self.frame_length).long()
+         return indices, indices_lens
+ 
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py b/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
+index 25b0a89e..cb76ab99 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
+@@ -164,6 +164,13 @@ class DownsampleResidualVectorQuantize(nn.Module):
+ 
+         return results
+ 
++    def encode(self, z: torch.Tensor, n_quantizers: int | None = None, **kwargs) -> torch.Tensor:
++        """Return codebook indices without reconstructing the quantized features."""
++        z = self.pre_module(self.downsample(z))
++        semantic_z, semantic_codes, *_ = self.semantic_quantizer(z)
++        _, codes, *_ = self.quantizer(z - semantic_z, n_quantizers=n_quantizers)
++        return torch.cat([semantic_codes, codes], dim=1)
++
+     def decode(self, indices: torch.Tensor):
+         new_indices = torch.zeros_like(indices)
+         new_indices[:, 0] = torch.clamp(indices[:, 0], max=self.semantic_quantizer.codebook_size - 1)
+diff --git a/vllm_omni/worker_v2/omni_model_runner.py b/vllm_omni/worker_v2/omni_model_runner.py
+index ff19aedc..6a64c7b1 100644
+--- a/vllm_omni/worker_v2/omni_model_runner.py
++++ b/vllm_omni/worker_v2/omni_model_runner.py
+@@ -231,11 +231,9 @@ class OmniGPUModelRunner(GPUModelRunner):
+                 current_platform.is_cuda()
+                 and self.model_config.hf_config.model_type == "fish_omni"
+                 and parallel_config.tensor_parallel_size == 1
+-                and self.model_config.enforce_eager
+-                and not self.scheduler_config.async_scheduling
+                 and self.vllm_config.speculative_config is None
+             ):
+-                raise NotImplementedError("Omni V2 PP is supported only for eager CUDA fish_omni with TP=1")
++                raise NotImplementedError("Omni V2 PP is supported only for CUDA fish_omni with TP=1")
+         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
+             raise NotImplementedError(
+                 "Omni Model Runner V2 does not support prefill context parallelism; "
+@@ -482,6 +480,16 @@ class OmniGPUModelRunner(GPUModelRunner):
+         else:
+             result = super().capture_model(profile_only=profile_only)
+ 
++        if self.pp_handler is not None and not self.model_config.enforce_eager and not profile_only:
++            manager = self.cudagraph_manager
++            sizes = manager.captured_token_counts() if manager is not None else []
++            if manager is None or manager.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL or not sizes:
++                raise RuntimeError(
++                    "Drama 3 PP did not capture FULL decode CUDA graphs. Select a compatible "
++                    "attention backend or explicitly enforce eager execution for debugging."
++                )
++            logger.info("Drama 3 PP on %s: FULL decode CUDA graphs captured for token counts %s", self.device, sizes)
++
+         # The MTP runner is a CUDAGraphWrapper, so during profiling upstream
+         # has swapped it to the throwaway pool and clears it afterwards. Report
+         # its pool with the rest in both passes.

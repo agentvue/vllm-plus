@@ -1,0 +1,806 @@
+diff --git a/vllm_omni/config/stage_config.py b/vllm_omni/config/stage_config.py
+index 14762d51..b37df6bc 100644
+--- a/vllm_omni/config/stage_config.py
++++ b/vllm_omni/config/stage_config.py
+@@ -515,7 +515,7 @@ class StageDeployConfig:
+     pipeline live here (e.g. ``max_num_seqs`` on thinker vs talker,
+     ``devices`` for GPU placement). Pipeline-wide settings
+     (``trust_remote_code``, ``distributed_executor_backend``, ``dtype``,
+-    ``quantization``, prefix/chunked prefill, DP/PP sizes) are declared at
++    ``quantization``, prefix/chunked prefill, DP size) are declared at
+     the top level of ``DeployConfig`` and propagated to every stage.
+     """
+ 
+@@ -543,6 +543,7 @@ class StageDeployConfig:
+     # === Generic stage engine fields ===
+     # Parallelism, scheduler, and memory-capacity controls.
+     tensor_parallel_size: int | None = None
++    pipeline_parallel_size: int | None = None
+     enable_expert_parallel: bool | None = None
+     gpu_memory_utilization: float | None = None
+     max_num_seqs: int | None = None
+diff --git a/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py b/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
+index 72c1ce7d..2bdd76cf 100644
+--- a/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
++++ b/vllm_omni/model_executor/models/fish_omni/fish_omni_model.py
+@@ -20,6 +20,7 @@ All per-step inputs live in model-owned buffers at fixed addresses, which the
+ model state (``model_state.py``) fills before each step, so a decode step
+ replays as one FULL CUDA graph with no host work inside; steps with prompt
+ rows replay the backbone, tower and sampling as PIECEWISE graphs.
++Pipeline-parallel execution captures decode forwards and samples on the final rank.
+ """
+ 
+ from __future__ import annotations
+@@ -34,12 +35,14 @@ from torch import nn
+ from transformers import AutoTokenizer
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CUDAGraphMode, VllmConfig
++from vllm.distributed import get_pp_group
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.logger import init_logger
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
++from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsPP
+ from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase, Qwen3_5Model
+-from vllm.model_executor.models.utils import maybe_prefix
++from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
++from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ 
+ from vllm_omni.model_executor.models.fish_speech.dac_encoder import (
+@@ -165,12 +168,35 @@ class FishOmniBuffers:
+         self.noise: torch.Tensor
+ 
+ 
++def _reject_unsupported_fish_parallel(vllm_config: VllmConfig) -> None:
++    """Keep PP on the non-speculative CUDA path with one tensor rank."""
++    parallel_config = vllm_config.parallel_config
++    if parallel_config.pipeline_parallel_size != 1:
++        if (
++            not current_platform.is_cuda()
++            or parallel_config.tensor_parallel_size != 1
++            or parallel_config.data_parallel_size != 1
++            or vllm_config.speculative_config is not None
++            or parallel_config.enable_expert_parallel
++            or vllm_config.cache_config.enable_prefix_caching
++            or parallel_config.decode_context_parallel_size != 1
++        ):
++            raise NotImplementedError(
++                "fish_omni PP requires CUDA, TP=1, DP=1, DCP=1, "
++                "and no speculation, EP, or prefix caching"
++            )
++    if getattr(parallel_config, "prefill_context_parallel_size", 1) != 1:
++        raise NotImplementedError("fish_omni does not support prefill context parallelism")
++    if parallel_config.tensor_parallel_size != 1:
++        raise NotImplementedError("fish_omni requires TP=1")
++
++
+ # The tower and frame sampling compile with the backbone (its own decorator
+ # inlines), so mixed steps replay them in PIECEWISE graphs.
+ @support_torch_compile(
+     dynamic_arg_dims={"input_ids": 0, "positions": -1, "intermediate_tensors": 0, "inputs_embeds": 0},
+ )
+-class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
++class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, SupportsPP):
+     """Qwen3.5 MoE backbone + Drama 3 codebook tower on Model Runner V2."""
+ 
+     have_multimodal_outputs = True
+@@ -180,11 +206,10 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+         config: FishOmniConfig = vllm_config.model_config.hf_config  # type: ignore[assignment]
+-        if (
+-            vllm_config.parallel_config.tensor_parallel_size != 1
+-            or vllm_config.parallel_config.pipeline_parallel_size != 1
+-        ):
+-            raise NotImplementedError("fish_omni runs with one tensor and pipeline rank")
++        _reject_unsupported_fish_parallel(vllm_config)
++        self.is_first_pp_rank = get_pp_group().is_first_rank
++        self.is_last_pp_rank = get_pp_group().is_last_rank
++        self.use_pp = get_pp_group().world_size > 1
+         self.vllm_config = vllm_config
+         self.config = config
+         self.model_path = vllm_config.model_config.model
+@@ -203,35 +228,48 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+         hidden_size = text_config.hidden_size
+ 
+         self.model = Qwen3_5Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+-        if vllm_config.speculative_config is None:
+-            # vLLM routes GDN decode through the fused-norm packed wrapper by
+-            # default (VLLM_GDN_DECODE_KERNEL=cuda). Without speculative decoding
+-            # it never reaches its MTP kernel and only adds copies and an
+-            # unfusable gated norm around the standard path (vllm-project/vllm#59735):
+-            # RTF 0.520 -> 0.512 at 128 streams with the standard path.
+-            for module in self.model.modules():
+-                if getattr(module, "enable_fused_gdn_decode", False):
+-                    module.enable_fused_gdn_decode = False
+-        # Steps with prefills: packed decode kernel, FlashInfer on the state
+-        # pool in place, outputs written straight into the buffer.
+-        from .gdn import install_drama3_gdn
+-
+-        install_drama3_gdn(self.model)
++        if not self.is_first_pp_rank:
++            self.model.embed_tokens = PPMissingLayer()
++        # The optimized GDN implementation operates on each rank's local layers.
++        if current_platform.is_cuda_alike():
++            if vllm_config.speculative_config is None:
++                # vLLM routes GDN decode through the fused-norm packed wrapper by
++                # default (VLLM_GDN_DECODE_KERNEL=cuda). Without speculative decoding
++                # it never reaches its MTP kernel and only adds copies and an
++                # unfusable gated norm around the standard path (vllm-project/vllm#59735):
++                # RTF 0.520 -> 0.512 at 128 streams with the standard path.
++                for module in self.model.modules():
++                    if getattr(module, "enable_fused_gdn_decode", False):
++                        module.enable_fused_gdn_decode = False
++            # Steps with prefills: packed decode kernel, FlashInfer on the state
++            # pool in place, outputs written straight into the buffer.
++            from .gdn import install_drama3_gdn
++
++            install_drama3_gdn(self.model)
+ 
+         # Only end-of-speech and the semantic band are ever sampled: keep those
+         # lm_head rows, which cuts the per-frame head read from 1 GB to 16 MB.
+         candidate_ids = main_candidate_ids(self.eos_token_id, self.semantic_begin_id, self.semantic_end_id)
+         self.register_buffer("candidate_ids", torch.tensor(candidate_ids, dtype=torch.int64), persistent=False)
+-        self.lm_head = nn.Parameter(torch.empty(len(candidate_ids), hidden_size), requires_grad=False)
++        self.register_parameter(
++            "lm_head",
++            nn.Parameter(torch.empty(len(candidate_ids), hidden_size), requires_grad=False)
++            if self.is_last_pp_rank
++            else None,
++        )
+ 
+-        self.codebook_embeddings = nn.Embedding(self.codebook_size * self.num_codebooks, hidden_size)
++        self.codebook_embeddings = (
++            nn.Embedding(self.codebook_size * self.num_codebooks, hidden_size)
++            if self.is_first_pp_rank or self.is_last_pp_rank
++            else PPMissingLayer()
++        )
+         self.register_buffer(
+             "codebook_offsets",
+             torch.arange(self.num_codebooks, dtype=torch.int64) * self.codebook_size,
+             persistent=False,
+         )
+         max_position = vllm_config.model_config.max_model_len + 1
+-        self.tower_rotary = TowerRotary(decoder_config, max_position)
++        self.tower_rotary = TowerRotary(decoder_config, max_position) if self.is_last_pp_rank else None
+         self.num_shared_layers = int(decoder_config.shared_enrichment_layers)
+         num_tower_layers = self.num_shared_layers + self.num_codebooks - 1
+         # Every layer but the first (which also adds the input frame's other
+@@ -244,10 +282,11 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+                 prefix=maybe_prefix(prefix, f"audio_decoder.layers.{index}"),
+                 code_table=index > 0,
+             )
+-            for index in range(num_tower_layers)
++            for index in range(num_tower_layers if self.is_last_pp_rank else 0)
+         )
+         self.codebook_heads = nn.ModuleList(
+-            nn.Linear(hidden_size, self.codebook_size, bias=False) for _ in range(self.num_codebooks - 1)
++            nn.Linear(hidden_size, self.codebook_size, bias=False)
++            for _ in range(self.num_codebooks - 1 if self.is_last_pp_rank else 0)
+         )
+ 
+         scheduler_config = vllm_config.scheduler_config
+@@ -262,19 +301,36 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+             device=device,
+         )
+         self.max_top_k = max_top_k(config, self.codebook_size)
+-        self.sampler = FusedFrameSampler(
+-            max_top_k=self.max_top_k,
+-            num_codebooks=self.num_codebooks,
+-            max_rows=scheduler_config.max_num_seqs,
+-            device=device,
++        self.sampler = (
++            FusedFrameSampler(
++                max_top_k=self.max_top_k,
++                num_codebooks=self.num_codebooks,
++                max_rows=scheduler_config.max_num_seqs,
++                device=device,
++            )
++            if self.is_last_pp_rank
++            else None
+         )
+-        self.buffers.noise = self.sampler.noise(scheduler_config.max_num_seqs, device)
++        if self.sampler is not None:
++            self.buffers.noise = self.sampler.noise(scheduler_config.max_num_seqs, device)
+         # Requests of the step, set by the model state (None: dummy runs).
+         self.num_sample_rows: int | None = None
+-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
++        reference_device = getattr(config, "fish_omni_reference_device", "cuda")
++        if reference_device not in ("cuda", "cpu"):
++            raise ValueError("fish_omni_reference_device must be 'cuda' or 'cpu'")
++        self.reference_device = device if reference_device == "cuda" else torch.device("cpu")
+         self._speaker_cache = get_speaker_cache()
+         self._tokenizer = None
+ 
++    def make_empty_intermediate_tensors(
++        self, batch_size: int, dtype: torch.dtype, device: torch.device
++    ) -> IntermediateTensors:
++        tensors = self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
++        for key in ("fish_frames", "fish_labels"):
++            tensors[key] = torch.zeros((batch_size, self.frame_width), dtype=torch.int64, device=device)
++        tensors["fish_prompt_ras"] = torch.zeros((batch_size, RAS_WINDOW_FRAMES), dtype=torch.int64, device=device)
++        return tensors
++
+     # ------------------------------------------------------------------
+     # vLLM hybrid-model contract (delegated to the Qwen3.5 backbone).
+     # ------------------------------------------------------------------
+@@ -411,7 +467,7 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+         **_: Any,
+-    ) -> torch.Tensor:
++    ) -> torch.Tensor | IntermediateTensors:
+         buffers = self.buffers
+         num_tokens = positions.shape[0]
+         # A FULL graph replays the sample rows of its capture, so they are a
+@@ -424,14 +480,30 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+             num_samples = min(num_tokens, buffers.max_num_seqs)
+             if self.num_sample_rows is not None and not _full_cudagraph():
+                 num_samples = min(num_samples, self.num_sample_rows)
+-        frames = torch.where(
+-            buffers.token_from_slot[:num_tokens].unsqueeze(-1),
+-            buffers.slot_frames[buffers.token_slots[:num_tokens]],
+-            buffers.frames[:num_tokens],
+-        )
+-        labels = buffers.labels[:num_tokens]
+-
+-        hidden_states = self.model(None, positions, intermediate_tensors, self.backbone_embeddings(frames))
++        if self.is_first_pp_rank:
++            frames = torch.where(
++                buffers.token_from_slot[:num_tokens].unsqueeze(-1),
++                buffers.slot_frames[buffers.token_slots[:num_tokens]],
++                buffers.frames[:num_tokens],
++            )
++            labels = buffers.labels[:num_tokens]
++            prompt_ras = buffers.slot_ras[buffers.token_slots[:num_tokens]]
++        else:
++            assert intermediate_tensors is not None
++            frames = intermediate_tensors["fish_frames"]
++            labels = intermediate_tensors["fish_labels"]
++            prompt_ras = intermediate_tensors["fish_prompt_ras"]
++
++        embeds = self.backbone_embeddings(frames) if self.is_first_pp_rank else None
++        hidden_states = self.model(None, positions, intermediate_tensors, embeds)
++        if not self.is_last_pp_rank:
++            assert isinstance(hidden_states, IntermediateTensors)
++            hidden_states["fish_frames"] = frames
++            hidden_states["fish_labels"] = labels
++            hidden_states["fish_prompt_ras"] = prompt_ras
++            return hidden_states
++        assert isinstance(hidden_states, torch.Tensor)
++        assert self.lm_head is not None and self.sampler is not None
+ 
+         sample_rows = buffers.sample_rows[:num_samples]
+         sample_valid = buffers.sample_valid[:num_samples]
+@@ -440,6 +512,11 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+         top_k = buffers.slot_top_k[slots]
+         top_p = buffers.slot_top_p[slots]
+         ras_window = buffers.slot_ras[slots]
++        if self.use_pp:
++            # Placeholder prompt IDs on the final rank do not encode reference
++            # semantics. Seed RAS from the first rank on the final prefill row.
++            is_prompt = ~buffers.token_from_slot[sample_rows]
++            ras_window = torch.where(is_prompt.unsqueeze(-1), prompt_ras[sample_rows], ras_window)
+ 
+         sampler = self.sampler
+         noise = buffers.noise[:num_samples]
+@@ -507,6 +584,7 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+ 
+     def compute_logits(self, hidden_states: torch.Tensor, *_: Any, **__: Any) -> torch.Tensor:
+         """Full-vocabulary logits; only vLLM's warmup and dummy sampler runs use them."""
++        assert self.lm_head is not None
+         logits = hidden_states.new_full((hidden_states.shape[0], self.text_config.vocab_size), float("-inf"))
+         logits[:, self.candidate_ids] = (hidden_states @ self.lm_head.t()).to(logits.dtype)
+         return logits
+@@ -525,13 +603,16 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+                 if name.startswith(BACKBONE_PREFIX):
+                     yield name[len(BACKBONE_PREFIX) :], tensor
+                 elif name == "lm_head.weight":
+-                    self.lm_head.data.copy_(tensor.index_select(0, self.candidate_ids.to(tensor.device)))
+-                    loaded.add("lm_head")
++                    if self.lm_head is not None:
++                        self.lm_head.data.copy_(tensor.index_select(0, self.candidate_ids.to(tensor.device)))
++                        loaded.add("lm_head")
+                 else:
+                     target = self._tower_param_name(name)
+                     if target is None:
+                         raise ValueError(f"fish_omni: unexpected checkpoint key {name!r}")
+                     param_name, shard = target
++                    if param_name not in params and not self.is_last_pp_rank:
++                        continue
+                     param = params[param_name]
+                     if shard == "gate":
+                         param.data[:intermediate].copy_(tensor)
+@@ -552,7 +633,8 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+             layer.finalize_weights()
+         # Load the reference-audio encoder now, so the first voice-clone request
+         # does not pay for it.
+-        _load_dac_codec(self.model_path, device=self.lm_head.device, dtype=torch.float32)
++        if self.is_first_pp_rank:
++            _load_dac_codec(self.model_path, device=self.reference_device, dtype=torch.float32)
+         return loaded
+ 
+     def _tower_param_name(self, name: str) -> tuple[str, str] | None:
+diff --git a/vllm_omni/model_executor/models/fish_omni/kernels.py b/vllm_omni/model_executor/models/fish_omni/kernels.py
+index 9dce1af3..5151db7e 100644
+--- a/vllm_omni/model_executor/models/fish_omni/kernels.py
++++ b/vllm_omni/model_executor/models/fish_omni/kernels.py
+@@ -16,6 +16,53 @@ import torch
+ from vllm.triton_utils import tl, triton
+ 
+ 
++@triton.jit(do_not_specialize_on_alignment=["slots_ptr", "frames_ptr", "num_sampled_ptr"])
++def _consume_pp_frames_kernel(
++    slots_ptr,
++    frames_ptr,
++    num_sampled_ptr,
++    slot_frames_ptr,
++    history_ptr,
++    generated_ptr,
++    WIDTH: tl.constexpr,
++    MAX_FRAMES: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    slot = tl.load(slots_ptr + row).to(tl.int64)
++    valid = (slot >= 0) & (tl.load(num_sampled_ptr + row) > 0)
++    if valid:
++        count = tl.load(generated_ptr + slot).to(tl.int64)
++        index = tl.minimum(count, MAX_FRAMES - 1)
++        offsets = tl.arange(0, BLOCK)
++        values = tl.load(frames_ptr + row * WIDTH + offsets, offsets < WIDTH, other=0)
++        tl.store(slot_frames_ptr + slot * WIDTH + offsets, values, offsets < WIDTH)
++        tl.store(
++            history_ptr + (slot * MAX_FRAMES + index) * (WIDTH - 1) + offsets - 1,
++            values,
++            (offsets > 0) & (offsets < WIDTH),
++        )
++        tl.store(generated_ptr + slot, count + 1)
++
++
++def consume_pp_frames_(slots, frames, num_sampled, slot_frames, history, generated) -> None:
++    """Update unique live slots and their code history without dynamic indexing."""
++    if slots.numel() == 0:
++        return
++    _consume_pp_frames_kernel[(slots.numel(),)](
++        slots,
++        frames,
++        num_sampled,
++        slot_frames,
++        history,
++        generated,
++        WIDTH=frames.shape[1],
++        MAX_FRAMES=history.shape[1],
++        BLOCK=triton.next_power_of_2(frames.shape[1]),
++        num_warps=1,
++    )
++
++
+ @triton.jit
+ def _gemma_norm_row(x, w_ptr, offs, mask, n: tl.constexpr, eps):
+     var = tl.sum(x * x, axis=0) / n
+diff --git a/vllm_omni/model_executor/models/fish_omni/model_state.py b/vllm_omni/model_executor/models/fish_omni/model_state.py
+index f412b106..ad2a9317 100644
+--- a/vllm_omni/model_executor/models/fish_omni/model_state.py
++++ b/vllm_omni/model_executor/models/fish_omni/model_state.py
+@@ -24,6 +24,7 @@ from typing import Any
+ 
+ import numpy as np
+ import torch
++from vllm.distributed import get_pp_group
+ from vllm.logger import init_logger
+ from vllm.utils.platform_utils import is_uva_available
+ from vllm.v1.worker.gpu import buffer_utils
+@@ -34,6 +35,8 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
+ from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+ 
++from .kernels import consume_pp_frames_
++
+ logger = init_logger(__name__)
+ 
+ _MASK64 = (1 << 64) - 1
+@@ -97,6 +100,9 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+     def __init__(self, vllm_config, model, encoder_cache, device):
+         super().__init__(vllm_config, model, encoder_cache, device)
+         self.buffers = model.buffers
++        self.pp_group = get_pp_group()
++        self.use_pp = self.pp_group.world_size > 1
++        self.is_last_pp_rank = self.pp_group.is_last_rank
+         self.max_num_seqs = self.scheduler_config.max_num_seqs
+         self.frame_width = model.frame_width
+         self.prompts: dict[int, np.ndarray] = {}
+@@ -131,6 +137,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+         self._last_decode_key: tuple[int, ...] | None = None
+         if not is_uva_available():
+             logger.warning("fish_omni: UVA is unavailable; per-step uploads use staged copies")
++        if self.use_pp and self.pp_group.is_first_rank:
++            # Compile both the normal int32 slot mapping and masked int64
++            # mappings before startup enables vLLM's runtime JIT monitor.
++            counts = torch.zeros(self.max_num_seqs, dtype=torch.int32, device=device)
++            for dtype in (torch.int32, torch.int64):
++                slots = torch.zeros(self.max_num_seqs, dtype=dtype, device=device)
++                self.consume_pp_frames(slots, self.buffers.sampled_frames, counts)
+ 
+     # ------------------------------------------------------------------
+     # Requests
+@@ -143,17 +156,31 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+             info = {**extra, **info}
+         return info
+ 
++    def consume_pp_frames(self, slots, frames, num_sampled) -> None:
++        """Apply delayed feedback only to live slots which actually sampled a frame."""
++        if not self.pp_group.is_first_rank:
++            return
++        buffers = self.buffers
++        consume_pp_frames_(
++            slots, frames, num_sampled, buffers.slot_frames, buffers.slot_history, buffers.slot_generated
++        )
++
++    def sampled_pp_frames(self, input_batch) -> torch.Tensor:
++        return self.buffers.sampled_frames[: input_batch.num_reqs]
++
+     def add_request(self, req_index: int, new_req_data) -> None:
+         super().add_request(req_index, new_req_data)
+         req_id = str(new_req_data.req_id)
+         prompt_ids = list(new_req_data.prompt_token_ids or [])
+         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
+-        if req_id.startswith("_warmup_"):
+-            # Warmup requests: text rows with zero codes.
++        if req_id.startswith("_warmup_") or (self.use_pp and not self.pp_group.is_first_rank):
++            # Downstream PP ranks receive the actual frame rows with activations.
+             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
+             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
+         else:
+-            rows = self.model.build_frames(self._request_info(req_index), self.device)
++            rows = self.model.build_frames(
++                self._request_info(req_index), self.model.reference_device
++            )
+         if rows.shape[0] != len(prompt_ids):
+             raise ValueError(
+                 f"fish_omni prompt has {rows.shape[0]} rows but request {req_id} reserved {len(prompt_ids)} "
+@@ -165,9 +192,12 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+         history = None
+         if generated > 0:
+             # A preempted request resumes: its generated frames become prompt rows.
+-            if suspended is None:
+-                raise RuntimeError(f"fish_omni request {req_id} resumes without the codes of its generated frames")
+-            history = suspended.codes(generated)
++            if self.use_pp and not (self.pp_group.is_first_rank or self.is_last_pp_rank):
++                history = torch.zeros((generated, self.model.num_codebooks), dtype=torch.int64)
++            else:
++                if suspended is None:
++                    raise RuntimeError(f"fish_omni request {req_id} resumes without generated codes")
++                history = suspended.codes(generated)
+             main = torch.tensor(token_ids[len(prompt_ids) :], dtype=torch.int64).unsqueeze(-1)
+             rows = torch.cat((rows, torch.cat((main, history), dim=-1)))
+             logger.info("fish_omni: resuming preempted request %s after %d generated frames", req_id, generated)
+@@ -210,6 +240,8 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+     def on_request_preempted(self, req_id: str, req_index: int) -> None:
+         """Copy the request's generated codes to the host before its slot is reused."""
+         super().on_request_preempted(req_id, req_index)
++        if self.use_pp and not (self.pp_group.is_first_rank or self.is_last_pp_rank):
++            return
+         buffers = self.buffers
+         history = buffers.slot_history[req_index]
+         count = buffers.slot_generated[req_index : req_index + 1]
+@@ -278,7 +310,8 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
+         valid = last_positions >= prompt_len - 1
+         self._valid_rows = valid.tolist()
+         # A sampling row draws the request's frame number last_position + 1 - prompt rows.
+-        self._draw_noise(input_batch.req_ids[:num_reqs], last_positions + 1 - self.base_prompt_len[slots], valid)
++        if self.is_last_pp_rank:
++            self._draw_noise(input_batch.req_ids[:num_reqs], last_positions + 1 - self.base_prompt_len[slots], valid)
+ 
+         if uniform and not np.any(computed < prompt_len):
+             # Pure decode: every row reads its slot's newest frame and samples.
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_encoder.py b/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
+index 855517d6..04feac66 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_encoder.py
+@@ -56,9 +56,10 @@ def _load_dac_codec(
+     if "generator" in state_dict:
+         state_dict = state_dict["generator"]
+     codec.load_state_dict(state_dict, strict=False)
+-    # Encoder path only uses encoder + quantizer.forward(); prune the
+-    # decoder before moving to device to avoid unnecessary GPU allocation.
++    # Indices-only encoding needs no waveform or quantized-feature reconstruction.
+     codec.decoder = None
++    codec.quantizer.post_module = None
++    codec.quantizer.upsample = None
+     codec = codec.to(device=device, dtype=dtype)
+     codec.eval()
+ 
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py b/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
+index 4bc8483d..7314c9ab 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_modules/codec.py
+@@ -320,8 +320,7 @@ class DAC(nn.Module):
+             audio_lengths = torch.LongTensor([length + right_pad]).to(audio_data.device)
+ 
+         z = self.encoder(audio_data)
+-        vq_results = self.quantizer(z, n_quantizers, **kwargs)
+-        indices = vq_results.codes
++        indices = self.quantizer.encode(z, n_quantizers, **kwargs)
+         indices_lens = torch.ceil(audio_lengths / self.frame_length).long()
+         return indices, indices_lens
+ 
+diff --git a/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py b/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
+index 25b0a89e..cb76ab99 100644
+--- a/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
++++ b/vllm_omni/model_executor/models/fish_speech/dac_modules/rvq.py
+@@ -164,6 +164,13 @@ class DownsampleResidualVectorQuantize(nn.Module):
+ 
+         return results
+ 
++    def encode(self, z: torch.Tensor, n_quantizers: int | None = None, **kwargs) -> torch.Tensor:
++        """Return codebook indices without reconstructing the quantized features."""
++        z = self.pre_module(self.downsample(z))
++        semantic_z, semantic_codes, *_ = self.semantic_quantizer(z)
++        _, codes, *_ = self.quantizer(z - semantic_z, n_quantizers=n_quantizers)
++        return torch.cat([semantic_codes, codes], dim=1)
++
+     def decode(self, indices: torch.Tensor):
+         new_indices = torch.zeros_like(indices)
+         new_indices[:, 0] = torch.clamp(indices[:, 0], max=self.semantic_quantizer.codebook_size - 1)
+diff --git a/vllm_omni/worker_v2/omni_ar_model_runner.py b/vllm_omni/worker_v2/omni_ar_model_runner.py
+index 1340b0cd..5b0ddbc5 100644
+--- a/vllm_omni/worker_v2/omni_ar_model_runner.py
++++ b/vllm_omni/worker_v2/omni_ar_model_runner.py
+@@ -27,6 +27,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+ from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ 
+ from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
+ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+@@ -148,7 +149,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
+             sample_determined is not None
+             and grammar_output is None
+             and self.batch_sharder is None
+-            and self.pp_handler is None
++            and (self.pp_handler is None or self.model_config.hf_config.model_type == "fish_omni")
+             and input_batch.num_draft_tokens == 0
+             and input_batch.num_reqs > 0
+         ):
+@@ -167,6 +168,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
+ 
+         if self.execute_model_state is None:
+             return None
++        if not self.is_last_pp_rank:
++            return GPUModelRunner.sample_tokens(self, grammar_output)
+ 
+         input_batch = self.execute_model_state.input_batch
+         hidden_states = self.execute_model_state.hidden_states
+@@ -244,6 +247,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
+                 num_sampled,
+                 num_rejected,
+                 input_batch,
++                sampled_aux=self.model_state.sampled_pp_frames(input_batch),
+             )
+ 
+         # --- Omni: prompt logprobs ---
+diff --git a/vllm_omni/worker_v2/omni_model_runner.py b/vllm_omni/worker_v2/omni_model_runner.py
+index 61fa277d..6a64c7b1 100644
+--- a/vllm_omni/worker_v2/omni_model_runner.py
++++ b/vllm_omni/worker_v2/omni_model_runner.py
+@@ -17,7 +17,9 @@ from vllm.forward_context import (
+     set_forward_context,
+ )
+ from vllm.logger import init_logger
++from vllm.platforms import current_platform
+ from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.kv_cache_interface import MambaSpec
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.input_batch import set_dummy_context
+ from vllm.v1.worker.gpu.lora_utils import get_num_active_loras_for_dispatch
+@@ -225,10 +227,13 @@ class OmniGPUModelRunner(GPUModelRunner):
+     def _validate_parallel_support(self) -> None:
+         parallel_config = self.vllm_config.parallel_config
+         if parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Omni Model Runner V2 does not support pipeline parallel; "
+-                "use model_runner: v1 when pipeline_parallel_size > 1"
+-            )
++            if not (
++                current_platform.is_cuda()
++                and self.model_config.hf_config.model_type == "fish_omni"
++                and parallel_config.tensor_parallel_size == 1
++                and self.vllm_config.speculative_config is None
++            ):
++                raise NotImplementedError("Omni V2 PP is supported only for CUDA fish_omni with TP=1")
+         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
+             raise NotImplementedError(
+                 "Omni Model Runner V2 does not support prefill context parallelism; "
+@@ -327,7 +332,11 @@ class OmniGPUModelRunner(GPUModelRunner):
+         parallel = getattr(getattr(self, "vllm_config", None), "parallel_config", None)
+         # Multi-rank executors already consume outputs asynchronously and choose
+         # the replying rank themselves. Preserve that ownership contract.
+-        return getattr(parallel, "tensor_parallel_size", 1) == 1 and getattr(self, "_omni_data_plane", None) is not None
++        return (
++            self.is_last_pp_rank
++            and getattr(parallel, "tensor_parallel_size", 1) == 1
++            and getattr(self, "_omni_data_plane", None) is not None
++        )
+ 
+     def _materialize_native_output(self, output: Any) -> Any:
+         from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
+@@ -390,6 +399,8 @@ class OmniGPUModelRunner(GPUModelRunner):
+         self._last_aux_output = None
+         self._last_multimodal_outputs = None
+         self._configure_cudagraph_output_contract()
++        if self.pp_handler is not None:
++            self.pp_handler.configure_sampled_aux(self.model.frame_width, self.model_state.consume_pp_frames)
+ 
+         # Preprocess models own embedding buffers; encoder_runner sizing would
+         # mismatch unless the model builds its preprocess on the encoder output.
+@@ -469,6 +480,16 @@ class OmniGPUModelRunner(GPUModelRunner):
+         else:
+             result = super().capture_model(profile_only=profile_only)
+ 
++        if self.pp_handler is not None and not self.model_config.enforce_eager and not profile_only:
++            manager = self.cudagraph_manager
++            sizes = manager.captured_token_counts() if manager is not None else []
++            if manager is None or manager.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL or not sizes:
++                raise RuntimeError(
++                    "Drama 3 PP did not capture FULL decode CUDA graphs. Select a compatible "
++                    "attention backend or explicitly enforce eager execution for debugging."
++                )
++            logger.info("Drama 3 PP on %s: FULL decode CUDA graphs captured for token counts %s", self.device, sizes)
++
+         # The MTP runner is a CUDAGraphWrapper, so during profiling upstream
+         # has swapped it to the throwaway pool and clears it afterwards. Report
+         # its pool with the rest in both passes.
+@@ -538,6 +559,9 @@ class OmniGPUModelRunner(GPUModelRunner):
+             max_query_len=max_query_len,
+             need_eager=use_eager,
+             num_active_loras=num_active_loras,
++            parallel_config=self.parallel_config,
++            allow_ubatching=False,
++            uniform_decode=uniform_tok_count == self.decode_query_len,
+         )
+ 
+     @torch.inference_mode()
+@@ -555,6 +579,7 @@ class OmniGPUModelRunner(GPUModelRunner):
+     ) -> Any:
+         if not dummy_run:
+             self._prepare_native_data_plane(scheduler_output)
++            self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+             self.free_states(scheduler_output)
+             self.add_requests(scheduler_output)
+@@ -578,6 +603,8 @@ class OmniGPUModelRunner(GPUModelRunner):
+         batch_req_state, uniform_tok_count = self.gather_batch_req_state(scheduler_output, dummy_run)
+         if batch_req_state is not None:
+             num_toks = batch_req_state.num_tokens
++            if batch_req_state.has_prefill:
++                max_query_len = None
+         num_active_loras = 0
+         if self.lora_config:
+             req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+@@ -653,7 +680,7 @@ class OmniGPUModelRunner(GPUModelRunner):
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
+             self.model_state.preprocess_state(
+                 input_batch,
+-                block_tables,
++                tuple(table.gpu for table in self.block_tables.block_tables),
+                 self.kv_cache_config,
+                 self.req_states.num_computed_tokens.gpu,
+             )
+@@ -686,6 +713,7 @@ class OmniGPUModelRunner(GPUModelRunner):
+                         context_len,
+                         self.kv_cache_config.num_blocks,
+                         self.max_model_len,
++                        input_block_tables=block_tables,
+                     )
+             else:
+                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
+@@ -705,12 +733,18 @@ class OmniGPUModelRunner(GPUModelRunner):
+             assert slot_mappings is not None
+             slot_mappings_by_layer = build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config)
+             assert block_tables is not None
++            attn_groups = self.attn_groups
++            if dummy_run and is_profile:
++                attn_groups = [
++                    [group for group in groups if not isinstance(group.kv_cache_spec, MambaSpec)]
++                    for groups in attn_groups
++                ]
+             attn_metadata = self.model_state.prepare_attn(
+                 input_batch,
+                 CUDAGraphMode.FULL if runner_assisted_full_attn else batch_desc.cg_mode,
+                 block_tables,
+                 slot_mappings,
+-                self.attn_groups,
++                attn_groups,
+                 self.kv_cache_config,
+                 for_capture=(dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL) or runner_assisted_capture,
+             )
+@@ -728,6 +762,18 @@ class OmniGPUModelRunner(GPUModelRunner):
+             **self.model_state.prepare_inputs(input_batch, self.req_states),
+         }
+         self._add_legacy_forward_inputs(model_inputs, input_batch)
++        if not self.is_first_pp_rank:
++            model_inputs["input_ids"] = None
++            model_inputs["inputs_embeds"] = None
++            assert intermediate_tensors is not None
++            assert self.intermediate_tensors is not None
++            n = input_batch.num_tokens_after_padding
++            model_inputs["intermediate_tensors"] = IntermediateTensors(
++                {
++                    key: value[:n] if dummy_run else value[:n].copy_(intermediate_tensors[key][:n])
++                    for key, value in self.intermediate_tensors.tensors.items()
++                }
++            )
+         # ★ PRE-FORWARD: per-request preprocess + batched MTP.
+         # Runs for ALL graph modes (FULL, PIECEWISE, NONE).
+         # For FULL graph: OmniModelState provides a static inputs_embeds
+@@ -743,13 +789,19 @@ class OmniGPUModelRunner(GPUModelRunner):
+             )
+ 
+         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
++        connector_kwargs = dict(
++            scheduler_output=scheduler_output,
++            request_state_indices=input_batch.idx_mapping,
++            request_ids=input_batch.req_ids,
++            num_tokens=input_batch.num_tokens,
++        )
+ 
+         # --- Model forward ---
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # FULL graph replay.  Preprocess already wrote to the static
+             # inputs_embeds buffer above.
+             assert self.cudagraph_manager is not None
+-            self.kv_connector.pre_forward(scheduler_output)
++            self.kv_connector.pre_forward(**connector_kwargs, attn_metadata=attn_metadata)
+             replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+             self._last_multimodal_outputs = None
+             hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
+@@ -777,7 +829,7 @@ class OmniGPUModelRunner(GPUModelRunner):
+                     skip_compiled=skip_compiled,
+                     is_padding=input_batch.is_padding,
+                 ):
+-                    self.kv_connector.pre_forward(scheduler_output)
++                    self.kv_connector.pre_forward(**connector_kwargs)
+                     if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                         assert self.cudagraph_manager is not None
+                         model_output = self.cudagraph_manager.run_pw_graph(
+@@ -803,6 +855,12 @@ class OmniGPUModelRunner(GPUModelRunner):
+                     self.model._last_captured_layers = self._last_aux_output
+             else:
+                 hidden_states = model_output
++        self.kv_connector.finish_forward()
++        output_intermediate_tensors = None
++        if not self.is_last_pp_rank:
++            assert isinstance(hidden_states, IntermediateTensors)
++            output_intermediate_tensors = hidden_states
++            hidden_states = None
+         if not dummy_run and isinstance(hidden_states, torch.Tensor):
+             self.model_state.run_postprocess(hidden_states, input_batch)
+ 
+@@ -817,7 +875,8 @@ class OmniGPUModelRunner(GPUModelRunner):
+             ec_connector_output=ec_connector_output,
+             cudagraph_stats=None,
+         )
+-
++        if not self.is_last_pp_rank:
++            return output_intermediate_tensors
+         assert isinstance(hidden_states, torch.Tensor)
+         return None
+ 
+@@ -869,6 +928,14 @@ class OmniGPUModelRunner(GPUModelRunner):
+         if finished and callable(finish_state):
+             finish_state(finished)
+         preempted = scheduler_output.preempted_req_ids
++        if preempted and self.pp_handler is not None:
++            self.pp_handler.flush_sampled_aux(
++                [
++                    self.req_states.req_id_to_index[req_id]
++                    for req_id in sorted(preempted - finished)
++                    if req_id in self.req_states.req_id_to_index
++                ]
++            )
+         suspend_state = getattr(self.model_state, "on_request_preempted", None)
+         if preempted and callable(suspend_state):
+             for req_id in preempted - finished:

@@ -3,6 +3,7 @@
 """Pipeline Parallelism utils for V2 Model Runner."""
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,6 +34,8 @@ class PendingRecv:
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+    sampled_aux: torch.Tensor | None = None  # [num_reqs, sampled_aux_width]
+    sampled_aux_applied: np.ndarray | None = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -95,6 +98,53 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+        self.sampled_aux_width = 0
+        self.consume_sampled_aux: (
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None
+        ) = None
+
+    def configure_sampled_aux(
+        self,
+        width: int,
+        consumer: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None],
+    ) -> None:
+        """Configure an int64 payload alongside sampled tokens on every PP rank.
+
+        The consumer receives slot indices (including -1 for freed requests),
+        payload rows, and sample counts after the receive event completes.
+        """
+        if width <= 0:
+            raise ValueError("The sampled PP payload width must be positive")
+        if self.num_speculative_steps:
+            raise ValueError("Sampled PP payloads do not support speculative decoding")
+        self.sampled_aux_width = width
+        self.consume_sampled_aux = consumer
+
+    def flush_sampled_aux(self, req_indices: list[int]) -> None:
+        """Preserve in-flight auxiliary history before preempted slots are freed."""
+        if self.consume_sampled_aux is None or not req_indices:
+            return
+        for slot in self.queue:
+            if slot is None or slot.sampled_aux is None:
+                continue
+            live = (
+                np.isin(slot.idx_mapping_np, req_indices)
+                & slot.need_sampled_mask
+                & (self.req_idx_gen_np[slot.idx_mapping_np] == slot.gen_at_receive_np)
+            )
+            if slot.sampled_aux_applied is not None:
+                live &= ~slot.sampled_aux_applied
+            if not live.any():
+                continue
+            self.main_stream.wait_event(slot.event)
+            indices = async_tensor_h2d(
+                np.where(live, slot.idx_mapping_np, -1), device=self.device
+            )
+            self.consume_sampled_aux(indices, slot.sampled_aux, slot.num_sampled)
+            if slot.sampled_aux_applied is None:
+                slot.sampled_aux_applied = live
+            else:
+                slot.sampled_aux_applied |= live
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -150,6 +200,19 @@ class PPHandler:
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
+        if slot.sampled_aux is not None:
+            assert self.consume_sampled_aux is not None
+            aux_indices = idx_mapping
+            if slot.sampled_aux_applied is not None:
+                aux_indices = async_tensor_h2d(
+                    np.where(
+                        exclude_mask | slot.sampled_aux_applied,
+                        -1,
+                        slot.idx_mapping_np,
+                    ),
+                    device=self.device,
+                )
+            self.consume_sampled_aux(aux_indices, slot.sampled_aux, slot.num_sampled)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping
@@ -212,6 +275,17 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            sampled_aux = None
+            if self.sampled_aux_width:
+                sampled_aux = torch.empty(
+                    num_reqs,
+                    self.sampled_aux_width,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    sampled_aux, src=self.last_rank, group=self.broadcast_group
+                )
             draft_tokens = None
             if self.num_speculative_steps > 0:
                 draft_tokens = torch.empty(
@@ -231,6 +305,8 @@ class PPHandler:
             combined.record_stream(self.main_stream)
             if draft_tokens is not None:
                 draft_tokens.record_stream(self.main_stream)
+            if sampled_aux is not None:
+                sampled_aux.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -241,6 +317,7 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
             draft_tokens,
+            sampled_aux,
         )
         return bool(need_sampled_mask.all())
 
@@ -250,6 +327,7 @@ class PPHandler:
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         input_batch: InputBatch,
+        sampled_aux: torch.Tensor | None = None,
     ) -> None:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
@@ -257,6 +335,18 @@ class PPHandler:
             return
 
         assert sampled_token_ids.dtype == torch.int64
+        if self.sampled_aux_width:
+            if sampled_aux is None or sampled_aux.shape != (
+                input_batch.num_reqs,
+                self.sampled_aux_width,
+            ):
+                raise ValueError("Missing or incorrectly shaped sampled PP payload")
+            if sampled_aux.dtype != torch.int64 or sampled_aux.device != self.device:
+                raise ValueError("Sampled PP payload must be int64 on the PP device")
+            # Snapshot on the producer stream before the next forward can reuse it.
+            sampled_aux = sampled_aux.clone()
+        elif sampled_aux is not None:
+            raise ValueError("Sampled PP payload was not configured on every rank")
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
@@ -276,5 +366,10 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            if sampled_aux is not None:
+                torch.distributed.broadcast(
+                    sampled_aux, src=self.last_rank, group=self.broadcast_group
+                )
+                sampled_aux.record_stream(self.broadcast_stream)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
