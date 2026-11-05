@@ -4,6 +4,24 @@
 
 set -euo pipefail
 
+if [[ ${1:-} != --model-path || -z ${2:-} ]]; then
+    echo "Usage: bash tools/drama3/launch.sh --model-path /path/to/model [serve options]" >&2
+    exit 2
+fi
+model_path=$2
+shift 2
+if [[ ! -d "$model_path" ]]; then
+    echo "Model directory not found: $model_path" >&2
+    exit 2
+fi
+model_path=$(cd -- "$model_path" && pwd -P)
+for required_file in config.json codec.pth; do
+    if [[ ! -f "$model_path/$required_file" ]]; then
+        echo "Required model file not found: $model_path/$required_file" >&2
+        exit 2
+    fi
+done
+
 task_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_dir=$(cd -- "$task_dir/../.." && pwd -P)
 source "$task_dir/environment.sh"
@@ -31,14 +49,12 @@ if [[ ! -f "$deploy_config" ]]; then
     exit 1
 fi
 deploy_config="$(cd -- "$(dirname -- "$deploy_config")" && pwd -P)/$(basename -- "$deploy_config")"
-model=${DRAMA3_MODEL:-fishaudio/drama-3}
-if [[ -d "$model" ]]; then
-    model=$(cd -- "$model" && pwd -P)
-fi
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 cd "$repo_dir/.cache/drama3"
 "$runtime_python" "$task_dir/installed_runtime.py" check "$repo_dir"
 
-exec "$runtime_python" -m vllm.entrypoints.cli.main serve "$model" \
+exec "$runtime_python" -m vllm.entrypoints.cli.main serve "$model_path" \
     --omni --deploy-config "$deploy_config" \
     "$@"

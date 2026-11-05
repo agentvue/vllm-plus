@@ -63,4 +63,4 @@ constraints_file="$repo_dir/.cache/drama3/runtime-constraints.txt"
         --constraint "$constraints_file" "$companion_dir"
     "$runtime_python" "$task_dir/installed_runtime.py" apply "$repo_dir"
 )
-echo "Installed pinned companion. Launch with: bash tools/drama3/launch.sh"
+echo "Installed pinned companion. Launch with: bash tools/drama3/launch.sh --model-path /path/to/model"
